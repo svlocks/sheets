@@ -112,6 +112,12 @@ type jsonlRevision struct {
 	Revision domain.Revision `json:"revision"`
 }
 
+type jsonlPage struct {
+	Type      string          `json:"type"`
+	Statement int             `json:"statement"`
+	Page      domain.PageInfo `json:"page"`
+}
+
 func renderJSONL(w io.Writer, batch app.BatchResult) error {
 	for statement, result := range batch.Results {
 		columns := result.Columns
@@ -137,6 +143,11 @@ func renderJSONL(w io.Writer, batch app.BatchResult) error {
 		}
 		if result.Summary.Changed() {
 			if err := writeJSONLine(w, jsonlSummary{Type: "summary", Statement: statement, Summary: result.Summary}); err != nil {
+				return err
+			}
+		}
+		if result.Page != nil && result.Page.Next != "" {
+			if err := writeJSONLine(w, jsonlPage{Type: "page", Statement: statement, Page: *result.Page}); err != nil {
 				return err
 			}
 		}
@@ -185,6 +196,11 @@ func renderTable(w io.Writer, batch app.BatchResult) error {
 			}
 			if result.Summary.Changed() {
 				if err := renderSummary(w, result.Summary); err != nil {
+					return err
+				}
+			}
+			if result.Page != nil && result.Page.Next != "" {
+				if _, err := fmt.Fprintf(w, "Next: %s\n", result.Page.Next); err != nil {
 					return err
 				}
 			}

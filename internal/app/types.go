@@ -45,9 +45,10 @@ type BatchResult struct {
 // Result is a rectangular Cypher result plus execution statistics. Columns and
 // row values use matching indexes so column ordering is deterministic.
 type Result struct {
-	Columns []string `json:"columns,omitempty"`
-	Rows    [][]any  `json:"rows,omitempty"`
-	Summary Summary  `json:"summary"`
+	Columns []string         `json:"columns,omitempty"`
+	Rows    [][]any          `json:"rows,omitempty"`
+	Summary Summary          `json:"summary"`
+	Page    *domain.PageInfo `json:"page,omitempty"`
 }
 
 // Summary describes the observable effects of one statement.

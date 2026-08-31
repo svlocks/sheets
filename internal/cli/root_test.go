@@ -1,0 +1,169 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/svlocks/sheets/internal/app"
+	"github.com/svlocks/sheets/internal/project"
+)
+
+func runCommand(t *testing.T, stdin string, args ...string) (string, string, error) {
+	t.Helper()
+	command := New(Options{})
+	var stdout, stderr bytes.Buffer
+	command.SetOut(&stdout)
+	command.SetErr(&stderr)
+	command.SetIn(strings.NewReader(stdin))
+	command.SetArgs(args)
+	err := command.ExecuteContext(context.Background())
+	return stdout.String(), stderr.String(), err
+}
+
+func initializeProject(t *testing.T) string {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), "workspace")
+	stdout, _, err := runCommand(t, "", "init", "--quiet", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout != "" {
+		t.Fatalf("quiet init output = %q", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(root, project.MetadataDirName, project.DatabaseFileName)); err != nil {
+		t.Fatalf("database missing: %v", err)
+	}
+	return root
+}
+
+func TestInitRootAndNestedDiscovery(t *testing.T) {
+	root := initializeProject(t)
+	nested := filepath.Join(root, "src", "module")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := runCommand(t, "", "-C", nested, "root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, _ := filepath.EvalSymlinks(root)
+	if got := strings.TrimSpace(stdout); got != canonical {
+		t.Fatalf("root = %q, want %q", got, canonical)
+	}
+
+	stdout, _, err = runCommand(t, "", "-C", nested, "root", "--database")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.TrimSpace(stdout), filepath.Join(canonical, ".sheets", "sheets.db"); got != want {
+		t.Fatalf("database = %q, want %q", got, want)
+	}
+}
+
+func TestExecAndQueryJSON(t *testing.T) {
+	root := initializeProject(t)
+	stdout, _, err := runCommand(t, "", "-C", root, "exec", "--output", "json",
+		"--param", `title="Integrate SDK"`,
+		"CREATE (n:Task {title:$title}) RETURN n.title AS title")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created app.BatchResult
+	if err := json.Unmarshal([]byte(stdout), &created); err != nil {
+		t.Fatalf("decode output: %v\n%s", err, stdout)
+	}
+	if created.Revision == nil || *created.Revision != 1 || created.Results[0].Rows[0][0] != "Integrate SDK" {
+		t.Fatalf("created = %#v", created)
+	}
+
+	stdout, _, err = runCommand(t, "", "-C", root, "query", "--output", "json",
+		"MATCH (n:Task) RETURN n.title AS title")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var queried app.BatchResult
+	if err := json.Unmarshal([]byte(stdout), &queried); err != nil {
+		t.Fatal(err)
+	}
+	if got := queried.Results[0].Rows; len(got) != 1 || got[0][0] != "Integrate SDK" {
+		t.Fatalf("query rows = %#v", got)
+	}
+}
+
+func TestExecFileIsOneAtomicRevision(t *testing.T) {
+	root := initializeProject(t)
+	file := filepath.Join(t.TempDir(), "batch.cypher")
+	if err := os.WriteFile(file, []byte("CREATE (:Task {title:'one'}); CREATE (:Task {title:'two'});"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := runCommand(t, "", "-C", root, "exec", "--file", file, "--output", "json", "--actor", "test-agent", "--message", "seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var batch app.BatchResult
+	if err := json.Unmarshal([]byte(stdout), &batch); err != nil {
+		t.Fatal(err)
+	}
+	if batch.Revision == nil || *batch.Revision != 1 || len(batch.Results) != 2 {
+		t.Fatalf("batch = %#v", batch)
+	}
+
+	history, _, err := runCommand(t, "", "-C", root, "history", "--output", "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(history, "test-agent") || !strings.Contains(history, "seed") {
+		t.Fatalf("history = %s", history)
+	}
+}
+
+func TestQueryRejectsMutationAndExecRejectsHistoricalWrite(t *testing.T) {
+	root := initializeProject(t)
+	_, _, err := runCommand(t, "", "-C", root, "query", "CREATE (:Task)")
+	if err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("query mutation error = %v", err)
+	}
+	_, _, err = runCommand(t, "", "-C", root, "exec", "--at-revision", "0", "CREATE (:Task)")
+	if err == nil || !strings.Contains(err.Error(), "historical") {
+		t.Fatalf("historical mutation error = %v", err)
+	}
+}
+
+func TestQueryReadsCypherAndParametersFromFiles(t *testing.T) {
+	root := initializeProject(t)
+	directory := t.TempDir()
+	queryPath := filepath.Join(directory, "query.cypher")
+	paramsPath := filepath.Join(directory, "params.json")
+	if err := os.WriteFile(queryPath, []byte("RETURN $nested.count AS count"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paramsPath, []byte(`{"nested":{"count":7}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := runCommand(t, "", "-C", root, "query", "--file", queryPath, "--params", "@"+paramsPath, "--output", "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout, "7") {
+		t.Fatalf("output = %s", stdout)
+	}
+}
+
+func TestStatusReportsGraphCounts(t *testing.T) {
+	root := initializeProject(t)
+	if _, _, err := runCommand(t, "", "-C", root, "exec", "CREATE (:Task)-[:BLOCKS]->(:Task)"); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := runCommand(t, "", "-C", root, "status", "--output", "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout, `"revision"`) || !strings.Contains(stdout, `"relationships"`) {
+		t.Fatalf("status = %s", stdout)
+	}
+}
