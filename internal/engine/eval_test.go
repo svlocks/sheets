@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"math"
 	"reflect"
 	"testing"
 
@@ -55,6 +56,7 @@ func TestEvaluatorArithmeticAndNullLogic(t *testing.T) {
 		{"integer arithmetic", binary(literal(int64(6)), "*", literal(int64(7))), int64(42)},
 		{"float arithmetic", binary(literal(int64(3)), "/", literal(int64(2))), 1.5},
 		{"numeric equality", binary(literal(int64(3)), "=", literal(float64(3))), true},
+		{"large integer inequality", binary(literal(int64(math.MaxInt64)), "=", literal(int64(math.MaxInt64-1))), false},
 		{"null equality", binary(literal(nil), "=", literal(nil)), nil},
 		{"null and false", binary(literal(nil), "AND", literal(false)), false},
 		{"null or true", binary(literal(nil), "OR", literal(true)), true},
@@ -70,6 +72,19 @@ func TestEvaluatorArithmeticAndNullLogic(t *testing.T) {
 				t.Fatalf("value = %#v (%T), want %#v (%T)", got, got, test.want, test.want)
 			}
 		})
+	}
+}
+
+func TestEvaluatorRejectsIntegerOverflow(t *testing.T) {
+	for _, expression := range []cypher.Expression{
+		binary(literal(int64(math.MaxInt64)), "+", literal(int64(1))),
+		binary(literal(int64(math.MinInt64)), "-", literal(int64(1))),
+		binary(literal(int64(math.MaxInt64)), "*", literal(int64(2))),
+		&cypher.UnaryExpression{Span: testSpan, Operator: "-", Expression: literal(int64(math.MinInt64))},
+	} {
+		if _, err := newEvaluator(nil).expression(expression, nil); err == nil {
+			t.Fatalf("overflow expression %#v succeeded", expression)
+		}
 	}
 }
 

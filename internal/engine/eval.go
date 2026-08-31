@@ -145,8 +145,14 @@ func (e evaluator) unary(expression *cypher.UnaryExpression, values row) (any, e
 	case "-":
 		switch value := value.(type) {
 		case int:
+			if int64(value) == math.MinInt64 {
+				return nil, evalError(expression, "integer overflow")
+			}
 			return -int64(value), nil
 		case int64:
+			if value == math.MinInt64 {
+				return nil, evalError(expression, "integer overflow")
+			}
 			return -value, nil
 		case float64:
 			return -value, nil
@@ -327,15 +333,28 @@ func numericBinary(expression cypher.Expression, operator string, left, right an
 		return nil, evalError(expression, "division by zero")
 	}
 	if leftInteger && rightInteger && operator != "/" && operator != "^" {
-		l, r := int64(leftFloat), int64(rightFloat)
+		l, _ := integer(left)
+		r, _ := integer(right)
 		switch operator {
 		case "+":
+			if r > 0 && l > math.MaxInt64-r || r < 0 && l < math.MinInt64-r {
+				return nil, evalError(expression, "integer overflow")
+			}
 			return l + r, nil
 		case "-":
+			if r < 0 && l > math.MaxInt64+r || r > 0 && l < math.MinInt64+r {
+				return nil, evalError(expression, "integer overflow")
+			}
 			return l - r, nil
 		case "*":
+			if l != 0 && (l == math.MinInt64 && r == -1 || r == math.MinInt64 && l == -1 || l*r/r != l) {
+				return nil, evalError(expression, "integer overflow")
+			}
 			return l * r, nil
 		case "%":
+			if l == math.MinInt64 && r == -1 {
+				return int64(0), nil
+			}
 			return l % r, nil
 		}
 	}
@@ -809,18 +828,28 @@ func asList(value any) ([]any, bool) {
 }
 
 func equalValues(left, right any) bool {
-	leftNumber, _, leftOK := number(left)
-	rightNumber, _, rightOK := number(right)
+	leftNumber, leftInteger, leftOK := number(left)
+	rightNumber, rightInteger, rightOK := number(right)
 	if leftOK && rightOK {
+		if leftInteger && rightInteger {
+			leftExact, _ := integer(left)
+			rightExact, _ := integer(right)
+			return leftExact == rightExact
+		}
 		return leftNumber == rightNumber
 	}
 	return reflect.DeepEqual(left, right)
 }
 
 func compareValues(left, right any) (int, bool) {
-	leftNumber, _, leftOK := number(left)
-	rightNumber, _, rightOK := number(right)
+	leftNumber, leftInteger, leftOK := number(left)
+	rightNumber, rightInteger, rightOK := number(right)
 	if leftOK && rightOK {
+		if leftInteger && rightInteger {
+			leftExact, _ := integer(left)
+			rightExact, _ := integer(right)
+			return compare(leftExact, rightExact), true
+		}
 		return compare(leftNumber, rightNumber), true
 	}
 	switch left := left.(type) {
@@ -906,11 +935,33 @@ func number(value any) (float64, bool, bool) {
 }
 
 func integer(value any) (int64, bool) {
-	number, isInteger, ok := number(value)
-	if !ok || !isInteger || number > math.MaxInt64 || number < math.MinInt64 {
-		return 0, false
+	switch value := value.(type) {
+	case int:
+		return int64(value), true
+	case int8:
+		return int64(value), true
+	case int16:
+		return int64(value), true
+	case int32:
+		return int64(value), true
+	case int64:
+		return value, true
+	case uint:
+		if uint64(value) <= math.MaxInt64 {
+			return int64(value), true
+		}
+	case uint8:
+		return int64(value), true
+	case uint16:
+		return int64(value), true
+	case uint32:
+		return int64(value), true
+	case uint64:
+		if value <= math.MaxInt64 {
+			return int64(value), true
+		}
 	}
-	return int64(number), true
+	return 0, false
 }
 
 func isNumber(value any) bool {
@@ -941,6 +992,12 @@ func convertValue(expression cypher.Expression, name string, value any) (any, er
 		case float64:
 			return strconv.FormatFloat(value, 'g', -1, 64), nil
 		default:
+			if integer, ok := integer(value); ok {
+				return strconv.FormatInt(integer, 10), nil
+			}
+			if number, _, ok := number(value); ok {
+				return strconv.FormatFloat(number, 'g', -1, 64), nil
+			}
 			return nil, nil
 		}
 	case "tointeger":
@@ -957,6 +1014,9 @@ func convertValue(expression cypher.Expression, name string, value any) (any, er
 			}
 			return int64(0), nil
 		default:
+			if integer, ok := integer(value); ok {
+				return integer, nil
+			}
 			number, _, ok := number(value)
 			if !ok || number > math.MaxInt64 || number < math.MinInt64 {
 				return nil, nil
@@ -1066,7 +1126,7 @@ func cloneRow(source row) row {
 	return result
 }
 
-func compare[T ~int | ~float64](left, right T) int {
+func compare[T ~int | ~int64 | ~float64](left, right T) int {
 	if left < right {
 		return -1
 	}
