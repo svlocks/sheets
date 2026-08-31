@@ -124,6 +124,23 @@ func TestExpressionsAndProcedureCalls(t *testing.T) {
 	}
 }
 
+func FuzzParseNeverPanics(f *testing.F) {
+	for _, source := range []string{
+		"MATCH (n:Task)-[:CHILD*0..]->(m) RETURN n, m",
+		"CREATE (n {title:$title}) SET n.status = 'ready' RETURN n",
+		"CALL db.labels() YIELD label RETURN label",
+		"RETURN [x IN $values WHERE x <> null | x * 2]",
+		"MATCH (n) WHERE EXISTS { MATCH (n)-[:BLOCKED_BY]->() } RETURN n",
+		"'unterminated",
+		"\x00\xff",
+	} {
+		f.Add(source)
+	}
+	f.Fuzz(func(t *testing.T, source string) {
+		_, _ = Parse(source)
+	})
+}
+
 func TestCallAndExistsSubqueriesAndPatterns(t *testing.T) {
 	source := `CALL {
   MATCH (a)-[:KNOWS]->(b)

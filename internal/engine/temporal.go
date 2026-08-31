@@ -3,6 +3,7 @@ package engine
 import (
 	"crypto/rand"
 	"fmt"
+	"math/big"
 	"regexp"
 	"strconv"
 	"strings"
@@ -88,7 +89,7 @@ func durationValue(expression cypher.Expression, arguments []any) (any, error) {
 		return value, nil
 	}
 	matches := isoDuration.FindStringSubmatch(strings.ToUpper(text))
-	if matches == nil {
+	if matches == nil || matches[2]+matches[3]+matches[4]+matches[5] == "" {
 		return nil, evalError(expression, "invalid duration %q", text)
 	}
 	parseInteger := func(raw string) (int64, error) {
@@ -109,15 +110,30 @@ func durationValue(expression cypher.Expression, arguments []any) (any, error) {
 	if err != nil {
 		return nil, evalError(expression, "invalid duration %q", text)
 	}
-	seconds := float64(0)
+	total := int64(0)
+	addInteger := func(value int64, unit time.Duration) bool {
+		if value > (int64(^uint64(0)>>1)-total)/int64(unit) {
+			return false
+		}
+		total += value * int64(unit)
+		return true
+	}
+	if !addInteger(days, 24*time.Hour) || !addInteger(hours, time.Hour) || !addInteger(minutes, time.Minute) {
+		return nil, evalError(expression, "duration %q exceeds the supported range", text)
+	}
 	if matches[5] != "" {
-		seconds, err = strconv.ParseFloat(matches[5], 64)
-		if err != nil {
+		seconds, ok := new(big.Rat).SetString(matches[5])
+		if !ok {
 			return nil, evalError(expression, "invalid duration %q", text)
 		}
+		nanoseconds := new(big.Rat).Mul(seconds, big.NewRat(int64(time.Second), 1))
+		wholeNanoseconds := new(big.Int).Quo(nanoseconds.Num(), nanoseconds.Denom())
+		if !wholeNanoseconds.IsInt64() || wholeNanoseconds.Int64() > int64(^uint64(0)>>1)-total {
+			return nil, evalError(expression, "duration %q exceeds the supported range", text)
+		}
+		total += wholeNanoseconds.Int64()
 	}
-	value := time.Duration(days)*24*time.Hour + time.Duration(hours)*time.Hour +
-		time.Duration(minutes)*time.Minute + time.Duration(seconds*float64(time.Second))
+	value := time.Duration(total)
 	if matches[1] != "" {
 		value = -value
 	}

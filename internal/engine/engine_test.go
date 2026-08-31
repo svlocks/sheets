@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -253,6 +254,25 @@ RETURN n.created AS created, n.estimate AS estimate, n.obsolete AS obsolete`, ni
 	}
 	if row[1] != 90*time.Minute || row[2] != nil {
 		t.Fatalf("temporal row = %#v", row)
+	}
+}
+
+func TestEngineRejectsDurationOverflow(t *testing.T) {
+	engine, _ := testEngine(t)
+	for _, query := range []string{
+		"RETURN duration('P999999999999999999D')",
+		"RETURN duration('PT999999999999999999S')",
+	} {
+		_, err := engine.Execute(context.Background(), app.ExecuteRequest{Query: query})
+		if err == nil || !strings.Contains(err.Error(), "exceeds the supported range") {
+			t.Fatalf("expected duration range error for %s, got %v", query, err)
+		}
+	}
+	for _, query := range []string{"RETURN duration('P')", "RETURN duration('PT')"} {
+		_, err := engine.Execute(context.Background(), app.ExecuteRequest{Query: query})
+		if err == nil || !strings.Contains(err.Error(), "invalid duration") {
+			t.Fatalf("expected invalid duration error for %s, got %v", query, err)
+		}
 	}
 }
 
