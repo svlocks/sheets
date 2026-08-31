@@ -11,13 +11,13 @@ the August 2026 implementation pass:
 
 | Workload | Time/op | Allocation/op |
 |---|---:|---:|
-| Warm indexed point match, 1,000-node graph | 0.106 ms | 17.8 KB |
-| Warm four-level hierarchy traversal, 1,000 nodes | 0.130 ms | 51.9 KB |
-| Warm indexed point match, 10,000-node graph | 1.23 ms | 162 KB |
-| Cold full snapshot + point match, 1,000 nodes | 6.75 ms | 5.59 MB |
-| Cold full snapshot + point match, 10,000 nodes | 69.2 ms | 58.8 MB |
-| SQLite atomic batch creating 25 nodes | 0.74 ms | 166 KB |
-| Historical list at revision 500 (500 nodes) | 0.89 ms | 569 KB |
+| Warm indexed point match, 1,000-node graph | 0.103 ms | 16.8 KB |
+| Warm four-level hierarchy traversal, 1,000 nodes | 0.129 ms | 49.9 KB |
+| Warm indexed point match, 10,000-node graph | 1.16 ms | 90.5 KB |
+| Cold full snapshot + point match, 1,000 nodes | 6.86 ms | 5.58 MB |
+| Cold full snapshot + point match, 10,000 nodes | 70.0 ms | 58.8 MB |
+| SQLite atomic batch creating 25 nodes | 0.740 ms | 165 KB |
+| Historical list at revision 500 (500 nodes) | 0.882 ms | 569 KB |
 
 “Warm” means the long-running engine (notably the TUI or several operations in
 one process) has cached the current revision. Every request still checks the
@@ -35,4 +35,3 @@ the race suite and `go vet` inside `golang:1.25-bookworm`, then builds a static
 binary into a distroless image. Benchmark numbers are evidence, not a stable
 service-level guarantee; hardware, filesystem, graph shape, and property size
 matter.
-

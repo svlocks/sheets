@@ -52,12 +52,20 @@ func benchmarkEngine(b *testing.B, nodes int) *Engine {
 	return executor
 }
 
-func BenchmarkQueryPointMatch1K(b *testing.B) {
+func primeQuery(b *testing.B, executor *Engine, request app.ExecuteRequest) {
+	b.Helper()
+	if _, err := executor.Execute(context.Background(), request); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func BenchmarkQueryWarmPointMatch1K(b *testing.B) {
 	executor := benchmarkEngine(b, 1_000)
 	request := app.ExecuteRequest{
 		Query:  "MATCH (n:Task {title:$title}) RETURN elementId(n), n.status",
 		Params: map[string]any{"title": "task-000999"},
 	}
+	primeQuery(b, executor, request)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
@@ -67,12 +75,13 @@ func BenchmarkQueryPointMatch1K(b *testing.B) {
 	}
 }
 
-func BenchmarkQueryPointMatch10K(b *testing.B) {
+func BenchmarkQueryWarmPointMatch10K(b *testing.B) {
 	executor := benchmarkEngine(b, 10_000)
 	request := app.ExecuteRequest{
 		Query:  "MATCH (n:Task {title:$title}) RETURN elementId(n), n.status",
 		Params: map[string]any{"title": "task-009999"},
 	}
+	primeQuery(b, executor, request)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
@@ -118,12 +127,13 @@ func BenchmarkQueryColdSnapshot10K(b *testing.B) {
 	}
 }
 
-func BenchmarkQueryHierarchyTraversal1K(b *testing.B) {
+func BenchmarkQueryWarmHierarchyTraversal1K(b *testing.B) {
 	executor := benchmarkEngine(b, 1_000)
 	request := app.ExecuteRequest{
 		Query:  "MATCH (root:Task {title:$title})-[:CHILD*1..4]->(descendant) RETURN count(descendant)",
 		Params: map[string]any{"title": "task-000000"},
 	}
+	primeQuery(b, executor, request)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
