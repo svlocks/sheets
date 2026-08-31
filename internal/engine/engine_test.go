@@ -292,12 +292,20 @@ func TestEngineCacheObservesOtherProcessesAndProtectsSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer firstStore.Close()
+	defer func() {
+		if err := firstStore.Close(); err != nil {
+			t.Errorf("close first store: %v", err)
+		}
+	}()
 	secondStore, err := store.Open(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer secondStore.Close()
+	defer func() {
+		if err := secondStore.Close(); err != nil {
+			t.Errorf("close second store: %v", err)
+		}
+	}()
 	first, _ := New(firstStore)
 	second, _ := New(secondStore)
 	execute(t, first, "CREATE (:Task {title:'one'})", nil)

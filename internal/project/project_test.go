@@ -133,14 +133,14 @@ func TestDiscoverDatabaseOnlyLayout(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	found, err := Discover(root)
+	found, discoverErr := Discover(root)
 	canonicalRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := projectAt(canonicalRoot)
-	if err != nil || found != want {
-		t.Fatalf("Discover DB-only = %#v, %v; want %#v", found, err, want)
+	if discoverErr != nil || found != want {
+		t.Fatalf("Discover DB-only = %#v, %v; want %#v", found, discoverErr, want)
 	}
 }
 

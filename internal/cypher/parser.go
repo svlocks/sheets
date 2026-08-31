@@ -409,7 +409,7 @@ func (p *syntaxParser) parseMerge() (Clause, error) {
 	clause := &MergeClause{Pattern: pattern}
 	for p.matchKeyword("ON") {
 		actionStart := p.previous().span.Start
-		kind := OnCreate
+		var kind MergeActionKind
 		if p.matchKeyword("CREATE") {
 			kind = OnCreate
 		} else if p.matchKeyword("MATCH") {

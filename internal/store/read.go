@@ -143,7 +143,7 @@ func (s *Store) ListRevisions(ctx context.Context, page domain.Page) ([]domain.R
 	if err != nil {
 		return nil, domain.PageInfo{}, fmt.Errorf("list revisions: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	infos := make([]domain.RevisionInfo, 0, limit+1)
 	for rows.Next() {
 		var raw, ns int64
@@ -157,6 +157,9 @@ func (s *Store) ListRevisions(ctx context.Context, page domain.Page) ([]domain.R
 	}
 	if err := rows.Err(); err != nil {
 		return nil, domain.PageInfo{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, domain.PageInfo{}, fmt.Errorf("close revision rows: %w", err)
 	}
 	var pageInfo domain.PageInfo
 	if len(infos) > limit {
@@ -222,7 +225,7 @@ func (tx *WriteTx) ListNodes() ([]domain.Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list transaction nodes: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var nodes []domain.Node
 	for rows.Next() {
 		node, err := scanNode(rows)
@@ -231,7 +234,13 @@ func (tx *WriteTx) ListNodes() ([]domain.Node, error) {
 		}
 		nodes = append(nodes, node)
 	}
-	return nodes, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close transaction node rows: %w", err)
+	}
+	return nodes, nil
 }
 
 // ListEdges returns all current edges visible inside the write transaction.
@@ -246,7 +255,7 @@ func (tx *WriteTx) ListEdges() ([]domain.Edge, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list transaction edges: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var edges []domain.Edge
 	for rows.Next() {
 		edge, err := scanEdge(rows)
@@ -255,7 +264,13 @@ func (tx *WriteTx) ListEdges() ([]domain.Edge, error) {
 		}
 		edges = append(edges, edge)
 	}
-	return edges, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close transaction edge rows: %w", err)
+	}
+	return edges, nil
 }
 
 func listNodes(ctx context.Context, db queryer, revision domain.Revision, filter NodeFilter, page domain.Page) ([]domain.Node, domain.PageInfo, error) {
@@ -275,7 +290,7 @@ func listNodes(ctx context.Context, db queryer, revision domain.Revision, filter
 	if err != nil {
 		return nil, domain.PageInfo{}, fmt.Errorf("list nodes: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	wanted := normalizeLabels(filter.Labels)
 	nodes := make([]domain.Node, 0, limit+1)
 	for rows.Next() {
@@ -292,6 +307,9 @@ func listNodes(ctx context.Context, db queryer, revision domain.Revision, filter
 	}
 	if err := rows.Err(); err != nil {
 		return nil, domain.PageInfo{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, domain.PageInfo{}, fmt.Errorf("close node rows: %w", err)
 	}
 	var pageInfo domain.PageInfo
 	if len(nodes) > limit {
@@ -327,7 +345,7 @@ func listEdges(ctx context.Context, db queryer, revision domain.Revision, filter
 	if err != nil {
 		return nil, domain.PageInfo{}, fmt.Errorf("list edges: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	types := append([]string(nil), filter.Types...)
 	slices.Sort(types)
 	edges := make([]domain.Edge, 0, limit+1)
@@ -345,6 +363,9 @@ func listEdges(ctx context.Context, db queryer, revision domain.Revision, filter
 	}
 	if err := rows.Err(); err != nil {
 		return nil, domain.PageInfo{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, domain.PageInfo{}, fmt.Errorf("close edge rows: %w", err)
 	}
 	var pageInfo domain.PageInfo
 	if len(edges) > limit {

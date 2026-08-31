@@ -148,7 +148,7 @@ func randomToken() string {
 	return hex.EncodeToString(b[:])
 }
 
-func (s *Store) initialize(ctx context.Context) error {
+func (s *Store) initialize(ctx context.Context) (err error) {
 	if err := s.db.PingContext(ctx); err != nil {
 		return fmt.Errorf("open sqlite: %w", err)
 	}
@@ -164,7 +164,7 @@ func (s *Store) initialize(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("acquire migration connection: %w", err)
 	}
-	defer conn.Close()
+	defer func() { err = errors.Join(err, conn.Close()) }()
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return fmt.Errorf("begin migration: %w", err)
 	}
@@ -228,11 +228,14 @@ func validateSchema(ctx context.Context, conn *sql.Conn) error {
 	if err != nil {
 		return fmt.Errorf("validate database foreign keys: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	if rows.Next() {
 		return errors.New("validate database foreign keys: existing violation")
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return rows.Close()
 }
 
 // Close closes the connection pool. It is safe to call more than once.

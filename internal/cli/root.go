@@ -150,7 +150,7 @@ func (e *commandEnvironment) queryCommand(readOnly bool) *cobra.Command {
 		Use:   use,
 		Short: short,
 		Args:  cobra.ArbitraryArgs,
-		RunE: func(command *cobra.Command, args []string) error {
+		RunE: func(command *cobra.Command, args []string) (runErr error) {
 			query, err := flags.loadQuery(args, command.InOrStdin())
 			if err != nil {
 				return err
@@ -171,7 +171,7 @@ func (e *commandEnvironment) queryCommand(readOnly bool) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer database.Close()
+			defer func() { runErr = errors.Join(runErr, database.Close()) }()
 			batch, err := executor.Execute(command.Context(), app.ExecuteRequest{
 				Query: query, Params: params, Snapshot: snapshot, ReadOnly: readOnly,
 				Actor: flags.actor, Message: flags.message,
@@ -252,12 +252,12 @@ func (e *commandEnvironment) historyCommand() *cobra.Command {
 		Use:   "history",
 		Short: "List committed graph revisions",
 		Args:  cobra.NoArgs,
-		RunE: func(command *cobra.Command, _ []string) error {
+		RunE: func(command *cobra.Command, _ []string) (runErr error) {
 			_, database, _, err := e.open(command.Context())
 			if err != nil {
 				return err
 			}
-			defer database.Close()
+			defer func() { runErr = errors.Join(runErr, database.Close()) }()
 			revisions, page, err := database.ListRevisions(command.Context(), domain.Page{Limit: limit, After: after})
 			if err != nil {
 				return err
@@ -290,12 +290,12 @@ func (e *commandEnvironment) statusCommand() *cobra.Command {
 		Use:   "status",
 		Short: "Show project and current graph statistics",
 		Args:  cobra.NoArgs,
-		RunE: func(command *cobra.Command, _ []string) error {
+		RunE: func(command *cobra.Command, _ []string) (runErr error) {
 			found, database, executor, err := e.open(command.Context())
 			if err != nil {
 				return err
 			}
-			defer database.Close()
+			defer func() { runErr = errors.Join(runErr, database.Close()) }()
 			snapshot, err := executor.Snapshot(command.Context(), domain.Snapshot{})
 			if err != nil {
 				return err
@@ -323,7 +323,7 @@ func (e *commandEnvironment) tuiCommand() *cobra.Command {
 		Aliases: []string{"ui"},
 		Short:   "Open the interactive workspace",
 		Args:    cobra.NoArgs,
-		RunE: func(command *cobra.Command, _ []string) error {
+		RunE: func(command *cobra.Command, _ []string) (runErr error) {
 			if e.tui == nil {
 				return errors.New("this build does not include the terminal UI")
 			}
@@ -331,7 +331,7 @@ func (e *commandEnvironment) tuiCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer database.Close()
+			defer func() { runErr = errors.Join(runErr, database.Close()) }()
 			return e.tui(command.Context(), found, executor, TUIOptions{NoColor: noColor})
 		},
 	}

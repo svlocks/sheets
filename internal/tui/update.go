@@ -385,11 +385,12 @@ func (m *Model) handleQueryKey(msg tea.KeyPressMsg) tea.Cmd {
 		}
 	}
 	var cmd tea.Cmd
-	if m.queryFocus == focusParams {
+	switch m.queryFocus {
+	case focusParams:
 		m.params, cmd = m.params.Update(msg)
-	} else if m.queryFocus == focusQuery {
+	case focusQuery:
 		m.query, cmd = m.query.Update(msg)
-	} else {
+	default:
 		switch key {
 		case "up", "k":
 			m.resultY = max(0, m.resultY-1)
@@ -530,9 +531,10 @@ func (m *Model) cycleQueryFocus(delta int) {
 	m.query.Blur()
 	m.params.Blur()
 	m.queryFocus = focusArea((int(m.queryFocus) + delta + 3) % 3)
-	if m.queryFocus == focusQuery {
+	switch m.queryFocus {
+	case focusQuery:
 		_ = m.query.Focus()
-	} else if m.queryFocus == focusParams {
+	case focusParams:
 		_ = m.params.Focus()
 	}
 }

@@ -86,7 +86,7 @@ func (s *Store) Write(ctx context.Context, meta RevisionMeta, fn func(*WriteTx) 
 	if err != nil {
 		return result, fmt.Errorf("acquire write connection: %w", err)
 	}
-	defer conn.Close()
+	defer func() { err = errors.Join(err, conn.Close()) }()
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return result, fmt.Errorf("begin write: %w", err)
 	}
@@ -332,13 +332,15 @@ func (tx *WriteTx) DeleteNode(id domain.EntityID) error {
 	for rows.Next() {
 		edge, scanErr := scanEdge(rows)
 		if scanErr != nil {
-			rows.Close()
-			return scanErr
+			return errors.Join(scanErr, rows.Close())
 		}
 		incident = append(incident, edge)
 	}
+	if err := rows.Err(); err != nil {
+		return errors.Join(err, rows.Close())
+	}
 	if err := rows.Close(); err != nil {
-		return err
+		return fmt.Errorf("close incident edge rows: %w", err)
 	}
 	for _, edge := range incident {
 		if err := tx.closeEdge(edge, revision); err != nil {
@@ -598,8 +600,7 @@ func (tx *WriteTx) childPathExists(start, goal, exclude domain.EntityID) (bool, 
 		for rows.Next() {
 			var raw string
 			if err := rows.Scan(&raw); err != nil {
-				rows.Close()
-				return false, err
+				return false, errors.Join(err, rows.Close())
 			}
 			id := domain.EntityID(raw)
 			if id == goal {
@@ -611,8 +612,11 @@ func (tx *WriteTx) childPathExists(start, goal, exclude domain.EntityID) (bool, 
 				queue = append(queue, id)
 			}
 		}
+		if err := rows.Err(); err != nil {
+			return false, errors.Join(err, rows.Close())
+		}
 		if err := rows.Close(); err != nil {
-			return false, err
+			return false, fmt.Errorf("close CHILD traversal rows: %w", err)
 		}
 		if found {
 			return true, nil

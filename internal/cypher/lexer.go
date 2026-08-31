@@ -124,7 +124,7 @@ func (l *lexer) skipSpaceAndComments() {
 			start := l.position()
 			l.advanceRune()
 			l.advanceRune()
-			for l.offset < len(l.source) && !(l.peekN(0) == '*' && l.peekN(1) == '/') {
+			for l.offset < len(l.source) && (l.peekN(0) != '*' || l.peekN(1) != '/') {
 				l.advanceRune()
 			}
 			if l.offset >= len(l.source) {
