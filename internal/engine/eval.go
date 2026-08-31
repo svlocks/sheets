@@ -22,6 +22,7 @@ type row map[string]any
 type evaluator struct {
 	params map[string]any
 	now    func() time.Time
+	group  []row
 }
 
 func newEvaluator(params map[string]any) evaluator {
@@ -608,7 +609,10 @@ func (e evaluator) reduceExpression(expression *cypher.ReduceExpression, values 
 func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (any, error) {
 	name := strings.ToLower(expression.Name.String())
 	if isAggregate(name) {
-		return nil, evalError(expression, "aggregate function %s is not valid in this expression context", name)
+		if e.group == nil {
+			return nil, evalError(expression, "aggregate function %s is not valid in this expression context", name)
+		}
+		return e.aggregate(expression, values)
 	}
 	arguments := make([]any, len(expression.Arguments))
 	for index, argument := range expression.Arguments {
