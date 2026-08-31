@@ -11,6 +11,15 @@ make bench      # storage and Cypher benchmarks
 make build      # bin/sheets, without installing it
 ```
 
+CI also runs the repository's pinned GolangCI-Lint standard suite from its
+container image. To reproduce that gate locally without installing another
+tool:
+
+```sh
+docker run --rm -v "$PWD:/app" -w /app \
+  golangci/golangci-lint:v2.13.2 golangci-lint run
+```
+
 `make container-test` uses the running Docker-compatible engine (OrbStack is
 supported) to run the Linux race and vet stages. The final Docker target is a
 static, distroless image; it is an optional distribution format, not a daemon.
@@ -33,4 +42,3 @@ GoReleaser builds static `darwin`, `linux`, and `windows` archives for amd64
 and arm64, injects version/commit/date metadata, and writes checksums. CI never
 publishes from an ordinary branch build. This repository intentionally does not
 install a development binary into the host system.
-

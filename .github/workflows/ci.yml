@@ -33,6 +33,17 @@ jobs:
           cache: true
       - run: go test -race ./...
 
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: >-
+          docker run --rm
+          -v "$PWD:/app"
+          -w /app
+          golangci/golangci-lint:v2.13.2
+          golangci-lint run
+
   container:
     runs-on: ubuntu-latest
     steps:
@@ -43,4 +54,3 @@ jobs:
           context: .
           target: test
           push: false
-
