@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM golang:1.24-bookworm AS source
+FROM golang:1.25-bookworm AS source
 WORKDIR /src
 COPY go.mod go.sum* ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
@@ -27,4 +27,3 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 COPY --from=build /out/sheets /usr/local/bin/sheets
 ENTRYPOINT ["/usr/local/bin/sheets"]
-
