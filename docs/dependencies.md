@@ -28,8 +28,9 @@ Alternatives considered:
 - Badger-backed graph engines take an exclusive directory lock and therefore
   do not meet the daemonless multi-process contract.
 
-Selected: [`google/uuid`](https://pkg.go.dev/github.com/google/uuid) for UUIDv7
-generation and validation. IDs remain ordinary strings at package boundaries.
+UUIDv7 entity identifiers are generated directly from `crypto/rand` and the
+standard UUID bit layout. The small implementation is tested at the storage
+boundary and keeps IDs ordinary strings across package boundaries.
 
 ## Graph language
 
@@ -40,10 +41,13 @@ syntax and semantics. A parser dependency or generated parser is isolated
 inside `internal/cypher`; storage and frontends never depend on parser-specific
 types.
 
-Cypher plans execute directly against indexed SQLite version tables. This is
-more implementation work than loading snapshots into an in-memory graph, but
-it avoids graph-size-dependent startup and makes historical predicates and
-limits effective before materialization.
+The executor materializes one exact revision into an immutable in-memory graph
+and builds label/property indexes over it. Long-running processes cache that
+snapshot behind a cheap database-revision check; one-shot processes take the
+predictable cold-load path. SQLite remains the concurrency and history
+authority, while this split keeps graph traversal code straightforward and
+makes repeated interactive queries fast. Historical revision predicates are
+applied by SQLite before versions are decoded.
 
 ## Command line
 
@@ -52,7 +56,7 @@ Selected:
 - [`Cobra`](https://github.com/spf13/cobra) for command/flag parsing,
   completions, and a stable library API.
 - [`Fang`](https://github.com/charmbracelet/fang) for styled help, errors,
-  version reporting, completions, and generated manual pages.
+  version reporting, and shell completion integration.
 
 There is no configuration framework. Sheets has only a few process-scoped
 flags, so explicit Cobra flags and standard-library environment handling are
@@ -65,11 +69,14 @@ Selected from Charm's v2 ecosystem:
 - [`Bubble Tea`](https://github.com/charmbracelet/bubbletea) for the Elm-style
   update loop and terminal lifecycle;
 - [`Bubbles`](https://github.com/charmbracelet/bubbles) for text input,
-  viewport, table, list, spinner, and key-binding components;
+  textarea, and key-binding components;
 - [`Lip Gloss`](https://github.com/charmbracelet/lipgloss) for responsive
   layout and adaptive color;
-- [`Huh`](https://github.com/charmbracelet/huh) for mutation forms; and
 - [`Glamour`](https://github.com/charmbracelet/glamour) for Markdown bodies.
+
+Mutation forms are composed directly from Bubbles controls so they share the
+TUI's state machine, validation, focus handling, and asynchronous execution
+path without adding a second form runtime.
 
 The TUI polls only the current revision number while idle. It does not add a
 filesystem watcher, background service, or private data-access path.
@@ -84,4 +91,3 @@ filesystem watcher, background service, or private data-access path.
   authority.
 - No migration framework at runtime: ordered SQL migrations are embedded and
   applied in the same connection that validates the schema version.
-

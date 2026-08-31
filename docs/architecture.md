@@ -50,7 +50,9 @@ independent processes to read concurrently.
 - `internal/domain`: graph and revision value types shared across layers.
 - `internal/project`: initialization and nearest-project discovery.
 - `internal/store`: SQLite schema, temporal persistence, and transactions.
-- `internal/cypher`: parser, semantic analysis, plans, and execution.
+- `internal/cypher`: lexer, parser, and syntax tree.
+- `internal/engine`: semantic evaluation, graph execution, and snapshot
+  indexes.
 - `internal/app`: use cases shared by all frontends.
 - `internal/cli`: command-line frontend and stable JSON contracts.
 - `internal/tui`: Charm-based interactive frontend.
@@ -72,11 +74,12 @@ allowing agents to pass structured values without quoting them into queries.
 
 ## Performance principles
 
-- Prepared statements and set-oriented SQL are preferred on hot paths.
+- Prepared statements and set-oriented SQL are preferred on storage hot paths.
 - Current-state indexes are partial where that materially reduces index size.
+- Exact revision snapshots are immutable, revision-checked, and indexed in
+  memory for repeated graph matching and traversal.
 - Listing and traversal APIs are paginated and streamable.
 - Startup performs no network access and opens no background service.
 - TUI refresh uses the maximum revision as a cheap invalidation token.
 - Benchmarks cover point lookup, hierarchy traversal, historical reads, bulk
   atomic writes, and concurrent readers with a writer.
-
