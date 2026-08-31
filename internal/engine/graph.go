@@ -20,26 +20,31 @@ type GraphSnapshot struct {
 }
 
 type memoryGraph struct {
-	revision domain.Revision
-	nodes    map[domain.EntityID]*domain.Node
-	edges    map[domain.EntityID]*domain.Edge
-	outgoing map[domain.EntityID][]*domain.Edge
-	incoming map[domain.EntityID][]*domain.Edge
-	writer   *store.WriteTx
+	revision   domain.Revision
+	nodes      map[domain.EntityID]*domain.Node
+	edges      map[domain.EntityID]*domain.Edge
+	outgoing   map[domain.EntityID][]*domain.Edge
+	incoming   map[domain.EntityID][]*domain.Edge
+	labels     map[string]map[domain.EntityID]*domain.Node
+	properties map[string]map[string]map[domain.EntityID]*domain.Node
+	writer     *store.WriteTx
 }
 
 func newMemoryGraph(revision domain.Revision, nodes []domain.Node, edges []domain.Edge, writer *store.WriteTx) *memoryGraph {
 	graph := &memoryGraph{
-		revision: revision,
-		nodes:    make(map[domain.EntityID]*domain.Node, len(nodes)),
-		edges:    make(map[domain.EntityID]*domain.Edge, len(edges)),
-		outgoing: make(map[domain.EntityID][]*domain.Edge),
-		incoming: make(map[domain.EntityID][]*domain.Edge),
-		writer:   writer,
+		revision:   revision,
+		nodes:      make(map[domain.EntityID]*domain.Node, len(nodes)),
+		edges:      make(map[domain.EntityID]*domain.Edge, len(edges)),
+		outgoing:   make(map[domain.EntityID][]*domain.Edge),
+		incoming:   make(map[domain.EntityID][]*domain.Edge),
+		labels:     make(map[string]map[domain.EntityID]*domain.Node),
+		properties: make(map[string]map[string]map[domain.EntityID]*domain.Node),
+		writer:     writer,
 	}
 	for index := range nodes {
 		node := nodes[index]
 		graph.nodes[node.ID] = &node
+		graph.indexNode(&node)
 	}
 	for index := range edges {
 		edge := edges[index]
@@ -69,7 +74,7 @@ func (g *memoryGraph) nodeValues() []domain.Node {
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	nodes := make([]domain.Node, len(ids))
 	for index, id := range ids {
-		nodes[index] = *g.nodes[id]
+		nodes[index] = freezeValue(g.nodes[id]).(domain.Node)
 	}
 	return nodes
 }
@@ -82,7 +87,7 @@ func (g *memoryGraph) edgeValues() []domain.Edge {
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	edges := make([]domain.Edge, len(ids))
 	for index, id := range ids {
-		edges[index] = *g.edges[id]
+		edges[index] = freezeValue(g.edges[id]).(domain.Edge)
 	}
 	return edges
 }
@@ -106,6 +111,7 @@ func (g *memoryGraph) createNode(input store.NodeInput) (*domain.Node, error) {
 	}
 	node := created
 	g.nodes[node.ID] = &node
+	g.indexNode(&node)
 	g.revision = g.writer.CurrentRevision()
 	return &node, nil
 }
@@ -118,13 +124,20 @@ func (g *memoryGraph) updateNode(id domain.EntityID, update store.NodeUpdate) (*
 	if !exists {
 		return nil, false, fmt.Errorf("%w: node %s", domain.ErrNotFound, id)
 	}
+	before := *current
 	updated, err := g.writer.UpdateNode(id, update)
 	if err != nil {
 		return nil, false, err
 	}
 	changed := current.ValidFrom != updated.ValidFrom || current.Body != updated.Body ||
 		!equalStringSlices(current.Labels, updated.Labels) || !equalValues(current.Properties, updated.Properties)
-	*current = updated
+	if changed {
+		g.unindexNode(&before)
+		*current = updated
+		g.indexNode(current)
+	} else {
+		*current = updated
+	}
 	g.revision = g.writer.CurrentRevision()
 	return current, changed, nil
 }
@@ -147,12 +160,62 @@ func (g *memoryGraph) deleteNode(id domain.EntityID) ([]domain.EntityID, error) 
 	if err := g.writer.DeleteNode(id); err != nil {
 		return nil, err
 	}
+	g.unindexNode(g.nodes[id])
 	delete(g.nodes, id)
 	for _, edgeID := range incident {
 		g.removeEdge(edgeID)
 	}
 	g.revision = g.writer.CurrentRevision()
 	return incident, nil
+}
+
+func (g *memoryGraph) indexNode(node *domain.Node) {
+	for _, label := range node.Labels {
+		if g.labels[label] == nil {
+			g.labels[label] = make(map[domain.EntityID]*domain.Node)
+		}
+		g.labels[label][node.ID] = node
+	}
+	for key, value := range node.Properties {
+		g.indexNodeProperty(node, key, value)
+	}
+	g.indexNodeProperty(node, "body", node.Body)
+}
+
+func (g *memoryGraph) indexNodeProperty(node *domain.Node, key string, value any) {
+	if value == nil {
+		return
+	}
+	if g.properties[key] == nil {
+		g.properties[key] = make(map[string]map[domain.EntityID]*domain.Node)
+	}
+	encoded := valueKey(value)
+	if g.properties[key][encoded] == nil {
+		g.properties[key][encoded] = make(map[domain.EntityID]*domain.Node)
+	}
+	g.properties[key][encoded][node.ID] = node
+}
+
+func (g *memoryGraph) unindexNode(node *domain.Node) {
+	if node == nil {
+		return
+	}
+	for _, label := range node.Labels {
+		delete(g.labels[label], node.ID)
+	}
+	for key, value := range node.Properties {
+		g.unindexNodeProperty(node.ID, key, value)
+	}
+	g.unindexNodeProperty(node.ID, "body", node.Body)
+}
+
+func (g *memoryGraph) unindexNodeProperty(id domain.EntityID, key string, value any) {
+	values := g.properties[key]
+	if values == nil || value == nil {
+		return
+	}
+	encoded := valueKey(value)
+	delete(values[encoded], id)
 }
 
 func (g *memoryGraph) createEdge(input store.EdgeInput) (*domain.Edge, error) {
@@ -263,11 +326,12 @@ func loadSnapshot(ctx context.Context, source *store.Store, snapshot domain.Snap
 	if err != nil {
 		return nil, err
 	}
-	nodes, err := allNodes(ctx, source, snapshot)
+	resolved := domain.Snapshot{Revision: &revision}
+	nodes, err := allNodes(ctx, source, resolved)
 	if err != nil {
 		return nil, err
 	}
-	edges, err := allEdges(ctx, source, snapshot)
+	edges, err := allEdges(ctx, source, resolved)
 	if err != nil {
 		return nil, err
 	}

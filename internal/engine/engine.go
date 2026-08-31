@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/cypher"
@@ -14,7 +15,9 @@ import (
 
 // Engine parses and atomically executes Cypher against one Store.
 type Engine struct {
-	store *store.Store
+	store   *store.Store
+	cacheMu sync.RWMutex
+	cache   *memoryGraph
 }
 
 // New creates a graph execution engine. The caller retains ownership of the
@@ -52,7 +55,7 @@ func (e *Engine) Execute(ctx context.Context, request app.ExecuteRequest) (app.B
 	}
 
 	if !mutates {
-		graph, err := loadSnapshot(ctx, e.store, request.Snapshot)
+		graph, err := e.loadGraph(ctx, request.Snapshot)
 		if err != nil {
 			return app.BatchResult{}, err
 		}
@@ -60,14 +63,16 @@ func (e *Engine) Execute(ctx context.Context, request app.ExecuteRequest) (app.B
 	}
 
 	var batch app.BatchResult
+	var committedGraph *memoryGraph
 	writeResult, err := e.store.Write(ctx, store.RevisionMeta{
 		Actor: request.Actor, Message: request.Message,
 	}, func(transaction *store.WriteTx) error {
-		graph, err := loadWriteGraph(transaction)
+		graph, err := e.loadWriteGraph(transaction)
 		if err != nil {
 			return err
 		}
 		batch, err = executeDocument(ctx, document, graph, request.Params)
+		committedGraph = graph
 		return err
 	})
 	if err != nil {
@@ -76,6 +81,10 @@ func (e *Engine) Execute(ctx context.Context, request app.ExecuteRequest) (app.B
 	if writeResult.Changed {
 		revision := writeResult.Revision
 		batch.Revision = &revision
+	}
+	if committedGraph != nil {
+		committedGraph.writer = nil
+		e.storeCache(committedGraph)
 	}
 	return batch, nil
 }
@@ -90,6 +99,10 @@ func executeDocument(ctx context.Context, document *cypher.Document, graph *memo
 		if !ok {
 			return app.BatchResult{}, fmt.Errorf("unsupported statement %T", statement)
 		}
+		if query.Explain {
+			batch.Results = append(batch.Results, explainQuery(query))
+			continue
+		}
 		result, err := executeQuery(ctx, document.Source, query, graph, params)
 		if err != nil {
 			return app.BatchResult{}, err
@@ -102,11 +115,56 @@ func executeDocument(ctx context.Context, document *cypher.Document, graph *memo
 
 // Snapshot returns a complete graph state for interactive clients.
 func (e *Engine) Snapshot(ctx context.Context, snapshot domain.Snapshot) (GraphSnapshot, error) {
-	graph, err := loadSnapshot(ctx, e.store, snapshot)
+	graph, err := e.loadGraph(ctx, snapshot)
 	if err != nil {
 		return GraphSnapshot{}, err
 	}
 	return GraphSnapshot{Revision: graph.revision, Nodes: graph.nodeValues(), Edges: graph.edgeValues()}, nil
+}
+
+func (e *Engine) loadGraph(ctx context.Context, snapshot domain.Snapshot) (*memoryGraph, error) {
+	if !snapshot.IsCurrent() {
+		return loadSnapshot(ctx, e.store, snapshot)
+	}
+	revision, err := e.store.CurrentRevision(ctx)
+	if err != nil {
+		return nil, err
+	}
+	e.cacheMu.RLock()
+	cached := e.cache
+	if cached != nil && cached.revision == revision {
+		e.cacheMu.RUnlock()
+		return cached, nil
+	}
+	e.cacheMu.RUnlock()
+	selector := revision
+	loaded, err := loadSnapshot(ctx, e.store, domain.Snapshot{Revision: &selector})
+	if err != nil {
+		return nil, err
+	}
+	e.storeCache(loaded)
+	return loaded, nil
+}
+
+func (e *Engine) storeCache(graph *memoryGraph) {
+	e.cacheMu.Lock()
+	if e.cache == nil || e.cache.revision <= graph.revision {
+		e.cache = graph
+	}
+	e.cacheMu.Unlock()
+}
+
+func (e *Engine) loadWriteGraph(transaction *store.WriteTx) (*memoryGraph, error) {
+	base := transaction.CurrentRevision()
+	e.cacheMu.RLock()
+	cached := e.cache
+	if cached != nil && cached.revision == base {
+		nodes, edges := cached.nodeValues(), cached.edgeValues()
+		e.cacheMu.RUnlock()
+		return newMemoryGraph(base, nodes, edges, transaction), nil
+	}
+	e.cacheMu.RUnlock()
+	return loadWriteGraph(transaction)
 }
 
 // CurrentRevision returns the cheap invalidation token used by the TUI.
@@ -124,6 +182,9 @@ func statementMutates(statement cypher.Statement) bool {
 	if !ok {
 		return statement.IsMutation()
 	}
+	if query.Explain {
+		return false
+	}
 	if clausesMutate(query.Clauses) {
 		return true
 	}
@@ -133,6 +194,21 @@ func statementMutates(statement cypher.Statement) bool {
 		}
 	}
 	return false
+}
+
+func explainQuery(query *cypher.QueryStatement) app.Result {
+	rows := make([][]any, 0, len(query.Clauses))
+	for index, clause := range query.Clauses {
+		name := strings.TrimPrefix(fmt.Sprintf("%T", clause), "*cypher.")
+		rows = append(rows, []any{int64(index), name, clause.Mutates()})
+	}
+	for branchIndex, branch := range query.UnionBranches {
+		for clauseIndex, clause := range branch.Query.Clauses {
+			name := strings.TrimPrefix(fmt.Sprintf("%T", clause), "*cypher.")
+			rows = append(rows, []any{fmt.Sprintf("union_%d.%d", branchIndex+1, clauseIndex), name, clause.Mutates()})
+		}
+	}
+	return app.Result{Columns: []string{"operator", "clause", "mutates"}, Rows: rows}
 }
 
 func clausesMutate(clauses []cypher.Clause) bool {
@@ -157,7 +233,7 @@ func clausesMutate(clauses []cypher.Clause) bool {
 
 func readOnlyProcedure(name string) bool {
 	switch strings.ToLower(name) {
-	case "db.labels", "db.relationshiptypes", "db.propertykeys", "sheets.nodes", "sheets.edges", "sheets.revisions":
+	case "db.labels", "db.relationshiptypes", "db.propertykeys", "sheets.nodes", "sheets.edges":
 		return true
 	default:
 		return false

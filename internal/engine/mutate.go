@@ -48,6 +48,7 @@ func (e *queryExecution) createPattern(values row, pattern cypher.PatternPart) (
 			if err != nil {
 				return nil, err
 			}
+			dropNullProperties(properties)
 			labels := make([]string, len(nodePattern.Labels))
 			for labelIndex, label := range nodePattern.Labels {
 				labels[labelIndex] = label.Name
@@ -86,6 +87,7 @@ func (e *queryExecution) createPattern(values row, pattern cypher.PatternPart) (
 		if err != nil {
 			return nil, err
 		}
+		dropNullProperties(properties)
 		from, to := path.Nodes[index-1].ID, node.ID
 		if relationship.Direction == cypher.Incoming {
 			from, to = to, from
@@ -241,6 +243,9 @@ func (e *queryExecution) setProperty(entity any, name string, value any) error {
 			}
 			return err
 		}
+		if value == nil {
+			return e.removeProperty(entity, name)
+		}
 		properties := clonePropertyMap(entity.Properties)
 		if properties == nil {
 			properties = make(domain.Properties)
@@ -275,6 +280,9 @@ func (e *queryExecution) setProperty(entity any, name string, value any) error {
 			}
 			return err
 		}
+		if value == nil {
+			return e.removeProperty(entity, name)
+		}
 		properties := clonePropertyMap(entity.Properties)
 		if properties == nil {
 			properties = make(domain.Properties)
@@ -301,6 +309,7 @@ func (e *queryExecution) replaceProperties(entity any, properties domain.Propert
 	delete(properties, "body")
 	positionValue, hasPosition := properties["position"]
 	delete(properties, "position")
+	dropNullProperties(properties)
 	switch entity := entity.(type) {
 	case *domain.Node:
 		update := store.NodeUpdate{Properties: &properties}
@@ -575,6 +584,14 @@ func takePosition(properties domain.Properties) (*int64, error) {
 		return nil, fmt.Errorf("relationship position must be an integer or null")
 	}
 	return &position, nil
+}
+
+func dropNullProperties(properties domain.Properties) {
+	for key, value := range properties {
+		if value == nil {
+			delete(properties, key)
+		}
+	}
 }
 
 func collectDeletedEntities(value any, nodes map[domain.EntityID]*domain.Node, edges map[domain.EntityID]*domain.Edge) {

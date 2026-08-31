@@ -23,6 +23,9 @@ func executeQuery(ctx context.Context, source string, query *cypher.QueryStateme
 	execution := &queryExecution{
 		ctx: ctx, source: source, graph: graph, evaluator: newEvaluator(params),
 	}
+	execution.evaluator.graph = graph
+	execution.evaluator.pattern = execution.evaluatePattern
+	execution.evaluator.subquery = execution.evaluateExistsSubquery
 	primary, err := execution.clauses(query.Clauses, []row{{}})
 	if err != nil {
 		return app.Result{}, err
@@ -52,7 +55,7 @@ func executeQuery(ctx context.Context, source string, query *cypher.QueryStateme
 
 func (e *queryExecution) clauses(clauses []cypher.Clause, rows []row) (app.Result, error) {
 	result := app.Result{}
-	for _, clause := range clauses {
+	for clauseIndex, clause := range clauses {
 		if err := e.ctx.Err(); err != nil {
 			return app.Result{}, err
 		}
@@ -76,6 +79,9 @@ func (e *queryExecution) clauses(clauses []cypher.Clause, rows []row) (app.Resul
 			err = e.delete(rows, clause)
 		case *cypher.CallClause:
 			rows, err = e.call(rows, clause)
+			if err == nil && clauseIndex == len(clauses)-1 {
+				result = rowsResult(rows)
+			}
 		default:
 			err = fmt.Errorf("unsupported clause %T", clause)
 		}
@@ -85,6 +91,30 @@ func (e *queryExecution) clauses(clauses []cypher.Clause, rows []row) (app.Resul
 	}
 	e.lastRows = rows
 	return result, nil
+}
+
+func rowsResult(rows []row) app.Result {
+	set := make(map[string]struct{})
+	for _, values := range rows {
+		for key := range values {
+			if key != internalPathKey && key != expressionPathKey {
+				set[key] = struct{}{}
+			}
+		}
+	}
+	columns := make([]string, 0, len(set))
+	for key := range set {
+		columns = append(columns, key)
+	}
+	sort.Strings(columns)
+	table := make([][]any, len(rows))
+	for rowIndex, values := range rows {
+		table[rowIndex] = make([]any, len(columns))
+		for columnIndex, column := range columns {
+			table[rowIndex][columnIndex] = values[column]
+		}
+	}
+	return app.Result{Columns: columns, Rows: table}
 }
 
 func (e *queryExecution) unwind(input []row, clause *cypher.UnwindClause) ([]row, error) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/domain"
@@ -187,5 +188,114 @@ func TestEngineReadOnlyProcedures(t *testing.T) {
 	}
 	if got := result.Results[0].Rows; len(got) != 2 || got[0][0] != "Milestone" || got[1][0] != "Task" {
 		t.Fatalf("procedure rows = %#v", got)
+	}
+}
+
+func TestEnginePatternExpressionsAndExistsSubqueries(t *testing.T) {
+	engine, _ := testEngine(t)
+	execute(t, engine, `
+CREATE (a:Task {title:'a'})-[:BLOCKS]->(b:Task {title:'b'})-[:BLOCKS]->(c:Task {title:'c'}),
+       (a)-[:BLOCKS]->(c)`, nil)
+	result := execute(t, engine, `
+MATCH (a:Task {title:'a'}), (c:Task {title:'c'})
+WHERE EXISTS { MATCH (a)-[:BLOCKS*]->(c) }
+RETURN length(shortestPath((a)-[:BLOCKS*]->(c))) AS distance,
+       size(relationships(shortestPath((a)-[:BLOCKS*]->(c)))) AS edges`, nil)
+	if got := result.Results[0].Rows; len(got) != 1 || got[0][0] != int64(1) || got[0][1] != int64(1) {
+		t.Fatalf("pattern result = %#v", got)
+	}
+}
+
+func TestEngineListPredicatesAndReduce(t *testing.T) {
+	engine, _ := testEngine(t)
+	result := execute(t, engine, `
+RETURN any(x IN [1,2,3] WHERE x = 2) AS any,
+       all(x IN [1,2,3] WHERE x > 0) AS all,
+       none(x IN [1,2,3] WHERE x < 0) AS none,
+       single(x IN [1,2,3] WHERE x = 2) AS single,
+       reduce(total = 0, x IN [1,2,3] | total + x) AS total`, nil)
+	want := []any{true, true, true, true, int64(6)}
+	if got := result.Results[0].Rows; len(got) != 1 {
+		t.Fatalf("rows = %#v", got)
+	} else {
+		for index := range want {
+			if got[0][index] != want[index] {
+				t.Fatalf("row = %#v, want %#v", got[0], want)
+			}
+		}
+	}
+}
+
+func TestEngineExplainDoesNotMutate(t *testing.T) {
+	engine, database := testEngine(t)
+	result := execute(t, engine, "EXPLAIN CREATE (:Task)", nil)
+	if len(result.Results[0].Rows) != 1 || result.Revision != nil {
+		t.Fatalf("explain result = %#v", result)
+	}
+	revision, err := database.CurrentRevision(context.Background())
+	if err != nil || revision != 0 {
+		t.Fatalf("revision = %d, %v", revision, err)
+	}
+}
+
+func TestEngineTemporalValuesAndNullPropertyRemoval(t *testing.T) {
+	engine, _ := testEngine(t)
+	execute(t, engine, `
+CREATE (n:Task {title:'temporal', created:datetime('2026-08-31T12:30:00Z'), estimate:duration('PT1H30M')})
+SET n.obsolete = 'yes', n.obsolete = null`, nil)
+	result := execute(t, engine, `
+MATCH (n:Task {title:'temporal'})
+RETURN n.created AS created, n.estimate AS estimate, n.obsolete AS obsolete`, nil)
+	row := result.Results[0].Rows[0]
+	created, ok := row[0].(time.Time)
+	if !ok || !created.Equal(time.Date(2026, 8, 31, 12, 30, 0, 0, time.UTC)) {
+		t.Fatalf("created = %#v", row[0])
+	}
+	if row[1] != 90*time.Minute || row[2] != nil {
+		t.Fatalf("temporal row = %#v", row)
+	}
+}
+
+func TestEngineStandaloneProcedureReturnsColumns(t *testing.T) {
+	engine, _ := testEngine(t)
+	execute(t, engine, "CREATE (:Task), (:Milestone)", nil)
+	result := execute(t, engine, "CALL db.labels()", nil)
+	if len(result.Results[0].Columns) != 1 || result.Results[0].Columns[0] != "label" || len(result.Results[0].Rows) != 2 {
+		t.Fatalf("procedure result = %#v", result.Results[0])
+	}
+}
+
+func TestEngineCacheObservesOtherProcessesAndProtectsSnapshots(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "sheets.db")
+	firstStore, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStore.Close()
+	secondStore, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStore.Close()
+	first, _ := New(firstStore)
+	second, _ := New(secondStore)
+	execute(t, first, "CREATE (:Task {title:'one'})", nil)
+	if got := execute(t, first, "MATCH (n) RETURN count(n)", nil).Results[0].Rows[0][0]; got != int64(1) {
+		t.Fatalf("initial count = %v", got)
+	}
+	execute(t, second, "CREATE (:Task {title:'two'})", nil)
+	if got := execute(t, first, "MATCH (n) RETURN count(n)", nil).Results[0].Rows[0][0]; got != int64(2) {
+		t.Fatalf("count after external write = %v", got)
+	}
+
+	snapshot, err := first.Snapshot(ctx, domain.Snapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Nodes[0].Properties["title"] = "tampered"
+	result := execute(t, first, "MATCH (n {title:'one'}) RETURN n.title", nil)
+	if len(result.Results[0].Rows) != 1 || result.Results[0].Rows[0][0] != "one" {
+		t.Fatalf("snapshot mutation escaped into cache: %#v", result)
 	}
 }

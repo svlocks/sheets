@@ -101,6 +101,50 @@ func matchPattern(graph *memoryGraph, evaluator evaluator, input []row, pattern 
 // matchedPathRow keeps the concrete path alongside a row until its named path
 // variable is bound. It is never exposed outside pattern matching.
 const internalPathKey = "\x00sheets.path"
+const expressionPathKey = "\x00sheets.expression-path"
+
+func (e *queryExecution) evaluatePattern(element cypher.PatternElement, values row) ([]Path, error) {
+	matched, err := matchPattern(e.graph, e.evaluator, []row{cloneRow(values)}, cypher.PatternPart{
+		Variable: cypher.Identifier{Name: expressionPathKey},
+		Element:  element,
+	})
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]Path, 0, len(matched))
+	for _, candidate := range matched {
+		path, ok := candidate[expressionPathKey].(Path)
+		if ok {
+			paths = append(paths, path)
+		}
+	}
+	return paths, nil
+}
+
+func (e *queryExecution) evaluateExistsSubquery(query *cypher.QueryStatement, values row) (bool, error) {
+	if statementMutates(query) {
+		return false, fmt.Errorf("EXISTS subqueries cannot mutate the graph")
+	}
+	previous := e.lastRows
+	defer func() { e.lastRows = previous }()
+	_, err := e.clauses(query.Clauses, []row{cloneRow(values)})
+	if err != nil {
+		return false, err
+	}
+	if len(e.lastRows) > 0 {
+		return true, nil
+	}
+	for _, branch := range query.UnionBranches {
+		_, err := e.clauses(branch.Query.Clauses, []row{cloneRow(values)})
+		if err != nil {
+			return false, err
+		}
+		if len(e.lastRows) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
 
 func extendPattern(graph *memoryGraph, evaluator evaluator, values row, element cypher.PatternElement, relationshipIndex int, current Path) ([]row, error) {
 	if relationshipIndex >= len(element.Relationships) {
@@ -218,30 +262,93 @@ func adjacentEdges(graph *memoryGraph, node domain.EntityID, direction cypher.Di
 }
 
 func candidateNodes(graph *memoryGraph, evaluator evaluator, values row, pattern cypher.NodePattern) ([]*domain.Node, error) {
+	expected, err := expectedProperties(evaluator, values, pattern.Properties)
+	if err != nil {
+		return nil, err
+	}
 	if pattern.Variable.Name != "" {
 		if bound, exists := values[pattern.Variable.Name]; exists {
 			node, ok := bound.(*domain.Node)
 			if !ok || node == nil {
 				return nil, nil
 			}
-			matches, err := nodePatternMatches(evaluator, values, node, pattern)
-			if err != nil || !matches {
-				return nil, err
+			if !nodeMatchesExpected(node, pattern.Labels, expected) {
+				return nil, nil
 			}
 			return []*domain.Node{node}, nil
 		}
 	}
-	result := make([]*domain.Node, 0)
-	for _, node := range graph.nodePointers() {
-		matches, err := nodePatternMatches(evaluator, values, node, pattern)
-		if err != nil {
-			return nil, err
+	var indexed map[domain.EntityID]*domain.Node
+	choose := func(candidates map[domain.EntityID]*domain.Node) {
+		if candidates != nil && (indexed == nil || len(candidates) < len(indexed)) {
+			indexed = candidates
 		}
-		if matches {
+	}
+	for _, label := range pattern.Labels {
+		choose(graph.labels[label.Name])
+	}
+	for key, value := range expected {
+		if value == nil {
+			return nil, nil
+		}
+		choose(graph.properties[key][valueKey(value)])
+	}
+	candidates := graph.nodePointers()
+	if indexed != nil {
+		candidates = make([]*domain.Node, 0, len(indexed))
+		for _, node := range indexed {
+			candidates = append(candidates, node)
+		}
+		sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
+	}
+	result := make([]*domain.Node, 0, len(candidates))
+	for _, node := range candidates {
+		if nodeMatchesExpected(node, pattern.Labels, expected) {
 			result = append(result, node)
 		}
 	}
 	return result, nil
+}
+
+func expectedProperties(evaluator evaluator, values row, expression cypher.Expression) (map[string]any, error) {
+	if expression == nil {
+		return nil, nil
+	}
+	expected, err := evaluator.expression(expression, values)
+	if err != nil {
+		return nil, err
+	}
+	propertyMap, ok := expected.(map[string]any)
+	if !ok {
+		if typed, typedOK := expected.(domain.Properties); typedOK {
+			propertyMap = typed
+		} else {
+			return nil, evalError(expression, "pattern properties must evaluate to a map")
+		}
+	}
+	return propertyMap, nil
+}
+
+func nodeMatchesExpected(node *domain.Node, labels []cypher.Identifier, expected map[string]any) bool {
+	for _, label := range labels {
+		found := false
+		for _, actual := range node.Labels {
+			if actual == label.Name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	for key, expectedValue := range expected {
+		actual := property(node, key)
+		if actual == nil || expectedValue == nil || !equalValues(actual, expectedValue) {
+			return false
+		}
+	}
+	return true
 }
 
 func nodePatternMatches(evaluator evaluator, values row, node *domain.Node, pattern cypher.NodePattern) (bool, error) {

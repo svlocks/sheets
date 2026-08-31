@@ -22,6 +22,9 @@ func (e *queryExecution) call(input []row, clause *cypher.CallClause) ([]row, er
 		for _, procedureRow := range procedureRows {
 			next := cloneRow(outer)
 			if len(clause.Yield) == 0 {
+				for key, value := range procedureRow {
+					next[key] = value
+				}
 				result = append(result, next)
 				continue
 			}

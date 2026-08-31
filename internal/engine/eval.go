@@ -20,9 +20,12 @@ import (
 type row map[string]any
 
 type evaluator struct {
-	params map[string]any
-	now    func() time.Time
-	group  []row
+	params   map[string]any
+	now      func() time.Time
+	group    []row
+	graph    *memoryGraph
+	pattern  func(cypher.PatternElement, row) ([]Path, error)
+	subquery func(*cypher.QueryStatement, row) (bool, error)
 }
 
 func newEvaluator(params map[string]any) evaluator {
@@ -124,8 +127,24 @@ func (e evaluator) expression(expression cypher.Expression, values row) (any, er
 		return e.listPredicate(expression, values)
 	case *cypher.ReduceExpression:
 		return e.reduceExpression(expression, values)
-	case *cypher.PatternExpression, *cypher.ExistsSubquery:
-		return nil, evalError(expression, "graph expressions require a match context")
+	case *cypher.PatternExpression:
+		if e.pattern == nil {
+			return nil, evalError(expression, "graph expression requires a match context")
+		}
+		paths, err := e.pattern(expression.Pattern, values)
+		if err != nil {
+			return nil, err
+		}
+		result := make([]any, len(paths))
+		for index := range paths {
+			result[index] = paths[index]
+		}
+		return result, nil
+	case *cypher.ExistsSubquery:
+		if e.subquery == nil {
+			return nil, evalError(expression, "EXISTS subquery requires a match context")
+		}
+		return e.subquery(expression.Subquery, values)
 	default:
 		return nil, evalError(expression, "unsupported expression %T", expression)
 	}
@@ -725,6 +744,90 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 		default:
 			return nil, evalError(expression, "body expects a node")
 		}
+	case "nodes", "relationships":
+		if err := require(1); err != nil {
+			return nil, err
+		}
+		path, ok := arguments[0].(Path)
+		if !ok {
+			if arguments[0] == nil {
+				return nil, nil
+			}
+			return nil, evalError(expression, "%s expects a path", name)
+		}
+		if name == "nodes" {
+			result := make([]any, len(path.Nodes))
+			for index, node := range path.Nodes {
+				result[index] = node
+			}
+			return result, nil
+		}
+		result := make([]any, len(path.Relationships))
+		for index, edge := range path.Relationships {
+			result[index] = edge
+		}
+		return result, nil
+	case "startnode", "endnode":
+		if err := require(1); err != nil {
+			return nil, err
+		}
+		edge, ok := arguments[0].(*domain.Edge)
+		if !ok || edge == nil {
+			if arguments[0] == nil {
+				return nil, nil
+			}
+			return nil, evalError(expression, "%s expects a relationship", name)
+		}
+		if e.graph == nil {
+			return nil, evalError(expression, "%s requires a graph context", name)
+		}
+		// A zero-length node pattern constrained by the endpoint gives the
+		// canonical pointer from the current graph through the match callback.
+		endpoint := edge.From
+		if name == "endnode" {
+			endpoint = edge.To
+		}
+		return e.graph.nodes[endpoint], nil
+	case "exists":
+		if err := require(1); err != nil {
+			return nil, err
+		}
+		if paths, ok := arguments[0].([]any); ok {
+			return len(paths) > 0, nil
+		}
+		return arguments[0] != nil, nil
+	case "shortestpath", "allshortestpaths":
+		if err := require(1); err != nil {
+			return nil, err
+		}
+		items, ok := asList(arguments[0])
+		if !ok || len(items) == 0 {
+			return nil, nil
+		}
+		paths := make([]Path, 0, len(items))
+		minimum := math.MaxInt
+		for _, item := range items {
+			path, ok := item.(Path)
+			if !ok {
+				return nil, evalError(expression, "%s expects a pattern", name)
+			}
+			length := len(path.Relationships)
+			if length < minimum {
+				minimum = length
+				paths = paths[:0]
+			}
+			if length == minimum {
+				paths = append(paths, path)
+			}
+		}
+		if name == "shortestpath" {
+			return paths[0], nil
+		}
+		result := make([]any, len(paths))
+		for index := range paths {
+			result[index] = paths[index]
+		}
+		return result, nil
 	case "size", "length":
 		if err := require(1); err != nil {
 			return nil, err
@@ -732,6 +835,8 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 		switch value := arguments[0].(type) {
 		case string:
 			return int64(utf8.RuneCountInString(value)), nil
+		case Path:
+			return int64(len(value.Relationships)), nil
 		default:
 			if items, ok := asList(value); ok {
 				return int64(len(items)), nil
@@ -815,6 +920,15 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 			return nil, err
 		}
 		return e.now().UnixMilli(), nil
+	case "datetime", "localdatetime", "date", "time", "localtime":
+		return temporalValue(expression, name, arguments, e.now())
+	case "duration":
+		return durationValue(expression, arguments)
+	case "randomuuid":
+		if err := require(0); err != nil {
+			return nil, err
+		}
+		return randomUUID()
 	default:
 		return nil, evalError(expression, "unknown function %s", expression.Name.String())
 	}
