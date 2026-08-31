@@ -119,6 +119,10 @@ func (e evaluator) expression(expression cypher.Expression, values row) (any, er
 		return e.caseExpression(expression, values)
 	case *cypher.ListComprehension:
 		return e.listComprehension(expression, values)
+	case *cypher.ListPredicate:
+		return e.listPredicate(expression, values)
+	case *cypher.ReduceExpression:
+		return e.reduceExpression(expression, values)
 	case *cypher.PatternExpression, *cypher.ExistsSubquery:
 		return nil, evalError(expression, "graph expressions require a match context")
 	default:
@@ -503,6 +507,102 @@ func (e evaluator) listComprehension(expression *cypher.ListComprehension, value
 		result = append(result, value)
 	}
 	return result, nil
+}
+
+func (e evaluator) listPredicate(expression *cypher.ListPredicate, values row) (any, error) {
+	collection, err := e.expression(expression.List, values)
+	if err != nil || collection == nil {
+		return collection, err
+	}
+	items, ok := asList(collection)
+	if !ok {
+		return nil, evalError(expression, "%s expects a list", expression.Operator)
+	}
+	trueCount := 0
+	falseCount := 0
+	hasNull := false
+	for _, item := range items {
+		next := cloneRow(values)
+		next[expression.Variable.Name] = item
+		predicate, err := e.expression(expression.Where, next)
+		if err != nil {
+			return nil, err
+		}
+		if predicate == nil {
+			hasNull = true
+			continue
+		}
+		matched, ok := predicate.(bool)
+		if !ok {
+			return nil, evalError(expression, "%s predicate must be boolean", expression.Operator)
+		}
+		if matched {
+			trueCount++
+		} else {
+			falseCount++
+		}
+	}
+	switch strings.ToLower(expression.Operator) {
+	case "any":
+		if trueCount > 0 {
+			return true, nil
+		}
+		if hasNull {
+			return nil, nil
+		}
+		return false, nil
+	case "all":
+		if falseCount > 0 {
+			return false, nil
+		}
+		if hasNull {
+			return nil, nil
+		}
+		return true, nil
+	case "none":
+		if trueCount > 0 {
+			return false, nil
+		}
+		if hasNull {
+			return nil, nil
+		}
+		return true, nil
+	case "single":
+		if trueCount > 1 {
+			return false, nil
+		}
+		if hasNull {
+			return nil, nil
+		}
+		return trueCount == 1, nil
+	default:
+		return nil, evalError(expression, "unknown list predicate %q", expression.Operator)
+	}
+}
+
+func (e evaluator) reduceExpression(expression *cypher.ReduceExpression, values row) (any, error) {
+	accumulator, err := e.expression(expression.Initial, values)
+	if err != nil {
+		return nil, err
+	}
+	collection, err := e.expression(expression.List, values)
+	if err != nil || collection == nil {
+		return collection, err
+	}
+	items, ok := asList(collection)
+	if !ok {
+		return nil, evalError(expression, "reduce expects a list")
+	}
+	for _, item := range items {
+		next := cloneRow(values)
+		next[expression.Accumulator.Name] = accumulator
+		next[expression.Variable.Name] = item
+		accumulator, err = e.expression(expression.Expression, next)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return accumulator, nil
 }
 
 func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (any, error) {
