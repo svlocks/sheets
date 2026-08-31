@@ -67,11 +67,44 @@ func BenchmarkQueryPointMatch1K(b *testing.B) {
 	}
 }
 
+func BenchmarkQueryPointMatch10K(b *testing.B) {
+	executor := benchmarkEngine(b, 10_000)
+	request := app.ExecuteRequest{
+		Query:  "MATCH (n:Task {title:$title}) RETURN elementId(n), n.status",
+		Params: map[string]any{"title": "task-009999"},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := executor.Execute(context.Background(), request); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkQueryColdSnapshot1K(b *testing.B) {
 	executor := benchmarkEngine(b, 1_000)
 	request := app.ExecuteRequest{
 		Query:  "MATCH (n:Task {title:$title}) RETURN elementId(n), n.status",
 		Params: map[string]any{"title": "task-000999"},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		executor.cacheMu.Lock()
+		executor.cache = nil
+		executor.cacheMu.Unlock()
+		if _, err := executor.Execute(context.Background(), request); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQueryColdSnapshot10K(b *testing.B) {
+	executor := benchmarkEngine(b, 10_000)
+	request := app.ExecuteRequest{
+		Query:  "MATCH (n:Task {title:$title}) RETURN elementId(n), n.status",
+		Params: map[string]any{"title": "task-009999"},
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
