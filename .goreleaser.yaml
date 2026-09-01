@@ -36,7 +36,7 @@ archives:
     builds_info:
       owner: root
       group: root
-      mtime: "{{ .CommitDate }}"
+      mtime: 2000-01-01T00:00:00Z
     format_overrides:
       - goos: windows
         formats: [zip]
@@ -45,7 +45,7 @@ archives:
         info:
           owner: root
           group: root
-          mtime: "{{ .CommitDate }}"
+          mtime: 2000-01-01T00:00:00Z
           mode: 0644
 
 checksum:
