@@ -3,9 +3,11 @@ package engine
 import (
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/svlocks/sheets/internal/cypher"
 	"github.com/svlocks/sheets/internal/domain"
+	"github.com/svlocks/sheets/internal/domain/temporal"
 	"github.com/svlocks/sheets/internal/store"
 )
 
@@ -142,7 +144,7 @@ func (e *queryExecution) merge(input []row, clause *cypher.MergeClause) ([]row, 
 		}
 		created := len(matches) == 0
 		if created {
-			createdRow, err := e.createPattern(values, clause.Pattern)
+			createdRow, err := e.createPattern(values, mergeCreatePattern(clause.Pattern))
 			if err != nil {
 				return nil, err
 			}
@@ -161,6 +163,18 @@ func (e *queryExecution) merge(input []row, clause *cypher.MergeClause) ([]row, 
 		}
 	}
 	return result, nil
+}
+
+// An undirected MERGE pattern searches in both directions, but when no match
+// exists the M23 creation semantics choose the written left-to-right direction.
+func mergeCreatePattern(pattern cypher.PatternPart) cypher.PatternPart {
+	pattern.Element.Relationships = append([]cypher.RelationshipPattern(nil), pattern.Element.Relationships...)
+	for index := range pattern.Element.Relationships {
+		if pattern.Element.Relationships[index].Direction == cypher.Undirected {
+			pattern.Element.Relationships[index].Direction = cypher.Outgoing
+		}
+	}
+	return pattern
 }
 
 func (e *queryExecution) rejectMergeNullProperties(values row, pattern cypher.PatternPart) error {
@@ -254,6 +268,9 @@ func (e *queryExecution) setAssignment(values row, item cypher.SetItem) error {
 		}
 		properties, ok := toProperties(assigned)
 		if !ok {
+			properties, ok = entityProperties(assigned)
+		}
+		if !ok {
 			return evalError(item.Value, "SET %s expects a map", item.Operator)
 		}
 		if item.Operator == "+=" {
@@ -270,6 +287,9 @@ func (e *queryExecution) setAssignment(values row, item cypher.SetItem) error {
 }
 
 func (e *queryExecution) setProperty(entity any, name string, value any) error {
+	if value != nil && !validPropertyValue(value) {
+		return fmt.Errorf("invalid property type %T: properties cannot contain maps, entities, paths, or nested collections", value)
+	}
 	switch entity := entity.(type) {
 	case *domain.Node:
 		if entity == nil {
@@ -596,13 +616,66 @@ func toProperties(value any) (domain.Properties, bool) {
 }
 
 func propertiesOfEntity(entity any) domain.Properties {
+	properties, _ := entityProperties(entity)
+	if properties == nil {
+		properties = make(domain.Properties)
+	}
+	return properties
+}
+
+func entityProperties(entity any) (domain.Properties, bool) {
 	switch entity := entity.(type) {
 	case *domain.Node:
-		return clonePropertyMap(entity.Properties)
+		if entity == nil {
+			return make(domain.Properties), true
+		}
+		return clonePropertyMap(entity.Properties), true
+	case domain.Node:
+		return clonePropertyMap(entity.Properties), true
 	case *domain.Edge:
-		return clonePropertyMap(entity.Properties)
+		if entity == nil {
+			return make(domain.Properties), true
+		}
+		return clonePropertyMap(entity.Properties), true
+	case domain.Edge:
+		return clonePropertyMap(entity.Properties), true
 	default:
-		return make(domain.Properties)
+		return nil, false
+	}
+}
+
+func validPropertyValue(value any) bool {
+	if value == nil {
+		return true
+	}
+	if _, mapValue := asMap(value); mapValue {
+		return false
+	}
+	switch value.(type) {
+	case domain.Node, *domain.Node, domain.Edge, *domain.Edge, Path, PathValue:
+		return false
+	}
+	if items, list := asList(value); list {
+		for _, item := range items {
+			if item == nil || !validPropertyScalar(item) {
+				return false
+			}
+		}
+		return true
+	}
+	return validPropertyScalar(value)
+}
+
+func validPropertyScalar(value any) bool {
+	switch value.(type) {
+	case string, bool,
+		int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64,
+		float32, float64, time.Time, time.Duration,
+		temporal.Date, temporal.LocalTime, temporal.Time, temporal.LocalDateTime,
+		temporal.DateTime, temporal.Duration:
+		return true
+	default:
+		return false
 	}
 }
 

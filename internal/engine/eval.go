@@ -94,6 +94,9 @@ func (e evaluator) expression(expression cypher.Expression, values row) (any, er
 		if err != nil {
 			return nil, err
 		}
+		if e.deletedEntity(value) {
+			return nil, evalError(expression, "cannot access a property of a deleted entity")
+		}
 		return property(value, expression.Property.Name), nil
 	case *cypher.LabelExpression:
 		value, err := e.expression(expression.Expression, values)
@@ -270,7 +273,7 @@ func (e evaluator) binary(expression *cypher.BinaryExpression, values row) (any,
 		leftString, leftOK := left.(string)
 		rightString, rightOK := right.(string)
 		if !leftOK || !rightOK {
-			return nil, evalError(expression, "%s expects strings", operator)
+			return nil, nil
 		}
 		switch operator {
 		case "STARTS WITH":
@@ -513,7 +516,7 @@ func numericBinary(expression cypher.Expression, operator string, left, right an
 	if operator == "%" && rightFloat == 0 || operator == "/" && rightFloat == 0 && leftInteger && rightInteger {
 		return nil, evalError(expression, "division by zero")
 	}
-	if leftInteger && rightInteger && operator != "/" && operator != "^" {
+	if leftInteger && rightInteger && operator != "^" {
 		l, _ := integer(left)
 		r, _ := integer(right)
 		switch operator {
@@ -537,6 +540,11 @@ func numericBinary(expression cypher.Expression, operator string, left, right an
 				return int64(0), nil
 			}
 			return l % r, nil
+		case "/":
+			if l == math.MinInt64 && r == -1 {
+				return nil, evalError(expression, "integer overflow")
+			}
+			return l / r, nil
 		}
 	}
 	switch operator {
@@ -577,14 +585,63 @@ func (e evaluator) index(expression *cypher.IndexExpression, values row) (any, e
 		}
 		return items[position], nil
 	}
-	if values, ok := collection.(map[string]any); ok {
+	if values, ok := asMap(collection); ok {
 		key, ok := index.(string)
 		if !ok {
 			return nil, evalError(expression, "map index must be a string")
 		}
 		return values[key], nil
 	}
+	if e.deletedEntity(collection) {
+		return nil, evalError(expression, "cannot access a property of a deleted entity")
+	}
+	if isPropertyContainer(collection) {
+		key, ok := index.(string)
+		if !ok {
+			return nil, evalError(expression, "property index must be a string")
+		}
+		return property(collection, key), nil
+	}
 	return nil, evalError(expression, "cannot index %T", collection)
+}
+
+func isPropertyContainer(value any) bool {
+	switch value.(type) {
+	case domain.Node, *domain.Node, domain.Edge, *domain.Edge,
+		time.Time, time.Duration, temporal.Date, temporal.LocalTime, temporal.Time,
+		temporal.LocalDateTime, temporal.DateTime, temporal.Duration:
+		return true
+	default:
+		return false
+	}
+}
+
+func (e evaluator) deletedEntity(value any) bool {
+	if e.graph == nil {
+		return false
+	}
+	switch value := value.(type) {
+	case domain.Node:
+		_, exists := e.graph.nodes[value.ID]
+		return !exists
+	case *domain.Node:
+		if value == nil {
+			return false
+		}
+		_, exists := e.graph.nodes[value.ID]
+		return !exists
+	case domain.Edge:
+		_, exists := e.graph.edges[value.ID]
+		return !exists
+	case *domain.Edge:
+		if value == nil {
+			return false
+		}
+		_, exists := e.graph.edges[value.ID]
+		return !exists
+	default:
+		return false
+	}
 }
 
 func (e evaluator) slice(expression *cypher.SliceExpression, values row) (any, error) {
@@ -860,11 +917,17 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 		if err := require(1); err != nil {
 			return nil, err
 		}
+		if e.deletedEntity(arguments[0]) {
+			return nil, evalError(expression, "cannot access labels of a deleted entity")
+		}
 		var labels []string
 		switch value := arguments[0].(type) {
 		case domain.Node:
 			labels = value.Labels
 		case *domain.Node:
+			if value == nil {
+				return nil, nil
+			}
 			labels = value.Labels
 		case nil:
 			return nil, nil
@@ -894,10 +957,19 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 		if err := require(1); err != nil {
 			return nil, err
 		}
+		if arguments[0] == nil || isNilEntity(arguments[0]) {
+			return nil, nil
+		}
+		if e.deletedEntity(arguments[0]) {
+			return nil, evalError(expression, "cannot access properties of a deleted entity")
+		}
 		return properties(arguments[0]), nil
 	case "keys":
 		if err := require(1); err != nil {
 			return nil, err
+		}
+		if e.deletedEntity(arguments[0]) {
+			return nil, evalError(expression, "cannot access properties of a deleted entity")
 		}
 		propertyMap := properties(arguments[0])
 		if propertyMap == nil {
@@ -2230,10 +2302,14 @@ func convertValue(expression cypher.Expression, name string, value any) (any, er
 		switch value := value.(type) {
 		case string:
 			parsed, err := strconv.ParseInt(value, 10, 64)
-			if err != nil {
+			if err == nil {
+				return parsed, nil
+			}
+			decimal, decimalErr := strconv.ParseFloat(value, 64)
+			if decimalErr != nil {
 				return nil, nil
 			}
-			return parsed, nil
+			return truncatedInteger(decimal)
 		case bool:
 			if value {
 				return int64(1), nil
@@ -2247,10 +2323,7 @@ func convertValue(expression cypher.Expression, name string, value any) (any, er
 			if !ok {
 				return nil, evalError(expression, "invalid value type %T for toInteger", value)
 			}
-			if number > math.MaxInt64 || number < math.MinInt64 {
-				return nil, nil
-			}
-			return int64(number), nil
+			return truncatedInteger(number)
 		}
 	case "tofloat":
 		if value, _, ok := number(value); ok {
@@ -2283,6 +2356,16 @@ func convertValue(expression cypher.Expression, name string, value any) (any, er
 	default:
 		return nil, evalError(expression, "unknown conversion %s", name)
 	}
+}
+
+func truncatedInteger(value float64) (any, error) {
+	// float64(math.MaxInt64) rounds to 2^63, so the positive bound must be
+	// exclusive. MinInt64 itself is exactly representable and remains valid.
+	const twoTo63 = 9223372036854775808.0
+	if math.IsNaN(value) || math.IsInf(value, 0) || value >= twoTo63 || value < -twoTo63 {
+		return nil, nil
+	}
+	return int64(value), nil
 }
 
 func substring(expression cypher.Expression, arguments []any) (any, error) {
@@ -2339,7 +2422,7 @@ func integerRange(expression cypher.Expression, arguments []any) (any, error) {
 	stepMagnitude := new(big.Int).Abs(big.NewInt(step))
 	countValue := new(big.Int).Quo(distance, stepMagnitude)
 	countValue.Add(countValue, big.NewInt(1))
-	if !countValue.IsInt64() || countValue.Int64() > 1_000_000 {
+	if !countValue.IsInt64() || countValue.Int64() > 1_048_576 {
 		return nil, evalError(expression, "range result is too large")
 	}
 	count := countValue.Int64()

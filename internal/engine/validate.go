@@ -76,6 +76,9 @@ func validateClauses(source string, clauses []cypher.Clause, scope variableScope
 		switch clause := raw.(type) {
 		case *cypher.MatchClause:
 			next := cloneScope(current)
+			if err := validateRelationshipUniqueness(clause.Patterns); err != nil {
+				return nil, nil, err
+			}
 			if err := bindPatternVariables(next, clause.Patterns); err != nil {
 				return nil, nil, err
 			}
@@ -276,7 +279,13 @@ func validateProjection(source string, clause *cypher.ProjectionClause, input va
 		}
 	}
 
-	if err := validateNonAggregateExpression(source, clause.Where, output, "WITH WHERE"); err != nil {
+	whereScope := cloneScope(output)
+	if !aggregates {
+		for name, kind := range input {
+			whereScope[name] = kind
+		}
+	}
+	if err := validateNonAggregateExpression(source, clause.Where, whereScope, "WITH WHERE"); err != nil {
 		return nil, nil, err
 	}
 	orderScope := cloneScope(output)
@@ -286,7 +295,13 @@ func validateProjection(source string, clause *cypher.ProjectionClause, input va
 		}
 	}
 	for _, item := range clause.OrderBy {
-		if err := validateExpression(source, item.Expression, orderScope); err != nil {
+		var err error
+		if clause.Distinct && !aggregates {
+			err = validateDistinctOrderExpression(source, item.Expression, clause.Items, input, output)
+		} else {
+			err = validateExpression(source, item.Expression, orderScope)
+		}
+		if err != nil {
 			return nil, nil, err
 		}
 		if aggregates {
@@ -310,7 +325,53 @@ func validateProjection(source string, clause *cypher.ProjectionClause, input va
 	if err := validateStaticPagination(source, clause.Limit, "LIMIT"); err != nil {
 		return nil, nil, err
 	}
+	if clause.With {
+		for _, item := range clause.Items {
+			if item.Star || item.Alias.Name != "" {
+				continue
+			}
+			if _, variable := item.Expression.(*cypher.Variable); !variable {
+				return nil, nil, semanticError(item.Expression, "WITH expressions must be aliased")
+			}
+		}
+	}
 	return output, columns, nil
+}
+
+func validateDistinctOrderExpression(
+	source string,
+	expression cypher.Expression,
+	items []cypher.ProjectionItem,
+	input, output variableScope,
+) error {
+	if err := validateExpression(source, expression, output); err == nil {
+		return nil
+	}
+	key := expressionSourceKey(source, expression)
+	for _, item := range items {
+		if item.Star || expressionSourceKey(source, item.Expression) != key {
+			continue
+		}
+		return validateExpression(source, expression, input)
+	}
+	return validateExpression(source, expression, output)
+}
+
+func validateRelationshipUniqueness(patterns []cypher.PatternPart) error {
+	for _, pattern := range patterns {
+		seen := make(map[string]struct{}, len(pattern.Element.Relationships))
+		for _, relationship := range pattern.Element.Relationships {
+			name := relationship.Variable.Name
+			if name == "" {
+				continue
+			}
+			if _, exists := seen[name]; exists {
+				return semanticSpanError(relationship.Variable.Span, "relationship variable %q cannot be reused in the same pattern", name)
+			}
+			seen[name] = struct{}{}
+		}
+	}
+	return nil
 }
 
 type aggregateOrderScope struct {
@@ -723,6 +784,12 @@ func validateNonAggregateExpression(source string, expression cypher.Expression,
 	if containsAggregate(expression) {
 		return semanticError(expression, "%s does not allow aggregate functions", context)
 	}
+	if strings.HasSuffix(context, "WHERE") {
+		kind := expressionKind(expression, scope)
+		if isKnownNonNullKind(kind) && kind != variableBoolean {
+			return semanticError(expression, "%s expects a boolean, got %s", context, variableKindName(kind))
+		}
+	}
 	return nil
 }
 
@@ -887,7 +954,7 @@ func validateBinaryStaticTypes(expression *cypher.BinaryExpression, scope variab
 		if isKnownNonNullKind(right) && right != variableList {
 			return semanticError(expression.Right, "%s expects a list on its right side, got %s", operator, variableKindName(right))
 		}
-	case "STARTS WITH", "ENDS WITH", "CONTAINS", "=~":
+	case "=~":
 		if isKnownNonNullKind(left) && left != variableString {
 			return semanticError(expression.Left, "%s expects strings, got %s", operator, variableKindName(left))
 		}

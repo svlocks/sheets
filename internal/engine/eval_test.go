@@ -54,7 +54,8 @@ func TestEvaluatorArithmeticAndNullLogic(t *testing.T) {
 		want       any
 	}{
 		{"integer arithmetic", binary(literal(int64(6)), "*", literal(int64(7))), int64(42)},
-		{"float arithmetic", binary(literal(int64(3)), "/", literal(int64(2))), 1.5},
+		{"integer division", binary(literal(int64(3)), "/", literal(int64(2))), int64(1)},
+		{"float division", binary(literal(float64(3)), "/", literal(int64(2))), 1.5},
 		{"numeric equality", binary(literal(int64(3)), "=", literal(float64(3))), true},
 		{"large integer inequality", binary(literal(int64(math.MaxInt64)), "=", literal(int64(math.MaxInt64-1))), false},
 		{"null equality", binary(literal(nil), "=", literal(nil)), nil},

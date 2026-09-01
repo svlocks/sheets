@@ -116,10 +116,7 @@ func (e evaluator) aggregate(expression *cypher.FunctionInvocation, representati
 			if err := e.ctx.Err(); err != nil {
 				return nil, err
 			}
-			comparison, ok := compareValues(value, best)
-			if !ok {
-				return nil, evalError(expression, "%s cannot compare %T and %T", name, value, best)
-			}
+			comparison := compareOrderValues(value, best)
 			if name == "min" && comparison < 0 || name == "max" && comparison > 0 {
 				best = value
 			}

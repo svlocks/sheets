@@ -806,9 +806,6 @@ func relationshipBounds(evaluator evaluator, values row, relationship cypher.Rel
 			return 0, 0, evalError(relationship.Length.Upper, "path upper bound must be a non-negative integer")
 		}
 	}
-	if maximum < minimum {
-		return 0, 0, fmt.Errorf("path upper bound %d is below lower bound %d", maximum, minimum)
-	}
 	return minimum, maximum, nil
 }
 

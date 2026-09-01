@@ -973,9 +973,6 @@ func staticRelationshipBounds(pattern cypher.RelationshipPattern, params map[str
 		}
 		maximum = int(integer)
 	}
-	if maximum < minimum {
-		return 0, 0, fmt.Errorf("path upper bound %d is below lower bound %d", maximum, minimum)
-	}
 	if maximum > maxDepth {
 		return 0, 0, fmt.Errorf("query path depth budget of %d exceeded", maxDepth)
 	}

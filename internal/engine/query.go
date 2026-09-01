@@ -108,7 +108,13 @@ func (e *queryExecution) clauses(clauses []cypher.Clause, rows []row) (app.Resul
 			rows, err = matchClauseRows(e.graph, e.evaluator, rows, clause)
 			addPatternVariables(known, clause.Patterns)
 		case *cypher.UnwindClause:
-			rows, err = e.unwind(rows, clause)
+			limit := int64(-1)
+			if clauseIndex+1 < len(clauses) {
+				limit, err = e.safeImmediateProjectionLimit(clauses[clauseIndex+1])
+			}
+			if err == nil {
+				rows, err = e.unwind(rows, clause, limit)
+			}
 			known[clause.Alias.Name] = variableUnknown
 		case *cypher.ProjectionClause:
 			inputKnown := known
@@ -225,7 +231,7 @@ func rowsResult(rows []row) app.Result {
 	return app.Result{Columns: columns, Rows: table}
 }
 
-func (e *queryExecution) unwind(input []row, clause *cypher.UnwindClause) ([]row, error) {
+func (e *queryExecution) unwind(input []row, clause *cypher.UnwindClause, limit int64) ([]row, error) {
 	result := make([]row, 0)
 	for _, values := range input {
 		if err := e.ctx.Err(); err != nil {
@@ -243,6 +249,9 @@ func (e *queryExecution) unwind(input []row, clause *cypher.UnwindClause) ([]row
 			return nil, evalError(clause.Expression, "UNWIND expects a list, got %T", value)
 		}
 		for _, item := range items {
+			if limit >= 0 && int64(len(result)) >= limit {
+				return result, nil
+			}
 			if err := e.evaluator.rows.take(e.ctx, 1); err != nil {
 				return nil, err
 			}
@@ -254,11 +263,30 @@ func (e *queryExecution) unwind(input []row, clause *cypher.UnwindClause) ([]row
 	return result, nil
 }
 
+func (e *queryExecution) safeImmediateProjectionLimit(clause cypher.Clause) (int64, error) {
+	projection, ok := clause.(*cypher.ProjectionClause)
+	if !ok || !projection.With || projection.Limit == nil || projection.Skip != nil ||
+		projection.Distinct || projection.Where != nil || len(projection.OrderBy) != 0 ||
+		projectionAggregates(projection.Items) {
+		return -1, nil
+	}
+	value, err := e.evaluator.expression(projection.Limit, row{})
+	if err != nil {
+		return 0, err
+	}
+	limit, ok := integer(value)
+	if !ok || limit < 0 {
+		return 0, evalError(projection.Limit, "LIMIT must be a non-negative integer")
+	}
+	return limit, nil
+}
+
 func (e *queryExecution) project(input []row, clause *cypher.ProjectionClause, known variableScope) ([]row, app.Result, error) {
 	columns := projectionColumns(e.source, clause.Items, input, known)
 	var projected []row
 	var tableRows [][]any
 	var sortScopes []row
+	var filterScopes []row
 	var sortEvaluators []evaluator
 	if projectionAggregates(clause.Items) {
 		groups, err := e.groupRows(input, clause.Items)
@@ -282,6 +310,7 @@ func (e *queryExecution) project(input []row, clause *cypher.ProjectionClause, k
 			projected = append(projected, mapped)
 			tableRows = append(tableRows, values)
 			sortScopes = append(sortScopes, projectionSortScope(representative, mapped, clause))
+			filterScopes = append(filterScopes, mapped)
 			sortEvaluators = append(sortEvaluators, groupEvaluator)
 		}
 	} else {
@@ -299,6 +328,7 @@ func (e *queryExecution) project(input []row, clause *cypher.ProjectionClause, k
 			projected = append(projected, mapped)
 			tableRows = append(tableRows, projectedValues)
 			sortScopes = append(sortScopes, projectionSortScope(values, mapped, clause))
+			filterScopes = append(filterScopes, projectionFilterScope(values, mapped))
 			sortEvaluators = append(sortEvaluators, e.evaluator)
 		}
 	}
@@ -313,7 +343,7 @@ func (e *queryExecution) project(input []row, clause *cypher.ProjectionClause, k
 			if err := e.ctx.Err(); err != nil {
 				return nil, app.Result{}, err
 			}
-			keep, filterErr := e.evaluator.expression(clause.Where, values)
+			keep, filterErr := e.evaluator.expression(clause.Where, filterScopes[index])
 			if filterErr != nil {
 				return nil, app.Result{}, filterErr
 			}
@@ -364,13 +394,19 @@ func (e *queryExecution) project(input []row, clause *cypher.ProjectionClause, k
 }
 
 func projectionSortScope(source, projected row, clause *cypher.ProjectionClause) row {
-	// DISTINCT removes variables which were not projected. Aggregating
-	// projections retain the representative input so projected grouping keys
-	// and aggregate ORDER BY expressions can be evaluated with the group.
-	scope := row{}
-	if !clause.Distinct || projectionAggregates(clause.Items) {
-		scope = cloneRow(source)
+	// Validation limits DISTINCT sort expressions to projected expressions,
+	// while evaluation still needs their original input bindings.
+	scope := cloneRow(source)
+	for name, value := range projected {
+		scope[name] = value
 	}
+	return scope
+}
+
+func projectionFilterScope(source, projected row) row {
+	// WITH WHERE is evaluated before the projection becomes the downstream
+	// scope, and can therefore see both incoming bindings and new aliases.
+	scope := cloneRow(source)
 	for name, value := range projected {
 		scope[name] = value
 	}
