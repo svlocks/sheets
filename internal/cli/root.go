@@ -78,16 +78,9 @@ func (e *commandEnvironment) initCommand() *cobra.Command {
 					target = filepath.Join(base, target)
 				}
 			}
-			found, err := project.Init(target)
+			found, err := project.InitContext(command.Context(), target)
 			if err != nil {
 				return err
-			}
-			database, err := store.Open(command.Context(), found.DBPath)
-			if err != nil {
-				return fmt.Errorf("initialize database: %w", err)
-			}
-			if err := database.Close(); err != nil {
-				return fmt.Errorf("close initialized database: %w", err)
 			}
 			if !quiet {
 				_, err = fmt.Fprintf(command.OutOrStdout(), "Initialized sheets project in %s\n", found.MetadataDir)

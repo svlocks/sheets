@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,6 +63,21 @@ func TestInitRootAndNestedDiscovery(t *testing.T) {
 	}
 	if got, want := strings.TrimSpace(stdout), filepath.Join(canonical, ".sheets", "sheets.db"); got != want {
 		t.Fatalf("database = %q, want %q", got, want)
+	}
+}
+
+func TestInitHonorsCancellation(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "cancelled")
+	command := New(Options{})
+	command.SetArgs([]string{"init", root})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := command.ExecuteContext(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("init error = %v, want context.Canceled", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, project.MetadataDirName)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("metadata stat error = %v, want not exist", statErr)
 	}
 }
 
