@@ -19,9 +19,9 @@ import (
 )
 
 const (
-	maxPropertyDepth  = 128
-	maxPropertyValues = 1_000_000
-	maxPropertyBytes  = 64 << 20
+	maxPropertyDepth  = domain.MaxPropertyDepth
+	maxPropertyValues = domain.MaxPropertyValues
+	maxPropertyBytes  = domain.MaxCanonicalPropertyBytes
 )
 
 type encodedValue struct {
@@ -32,6 +32,90 @@ type encodedValue struct {
 	Offset int                     `json:"u,omitempty"`
 	Items  []encodedValue          `json:"a,omitempty"`
 	Map    map[string]encodedValue `json:"o,omitempty"`
+}
+
+// canonicalEncodedValueSize computes the exact size encoding/json will emit
+// for encodedValue. Checking before Marshal prevents an escape-heavy string
+// from forcing an allocation well beyond the durable 64 MiB ceiling.
+func canonicalEncodedValueSize(value encodedValue) int64 {
+	size := int64(2) // braces
+	fields := 0
+	addField := func(name string, valueSize int64) {
+		if fields > 0 {
+			size++
+		}
+		size += jsonStringSize(name) + 1 + valueSize
+		fields++
+	}
+	addField("k", jsonStringSize(value.Kind))
+	if value.Bool {
+		addField("b", 4)
+	}
+	if value.Text != "" {
+		addField("s", jsonStringSize(value.Text))
+	}
+	if value.Zone != "" {
+		addField("z", jsonStringSize(value.Zone))
+	}
+	if value.Offset != 0 {
+		addField("u", int64(len(strconv.Itoa(value.Offset))))
+	}
+	if len(value.Items) > 0 {
+		itemsSize := int64(2)
+		for index, item := range value.Items {
+			if index > 0 {
+				itemsSize++
+			}
+			itemsSize += canonicalEncodedValueSize(item)
+		}
+		addField("a", itemsSize)
+	}
+	if len(value.Map) > 0 {
+		mapSize := int64(2)
+		index := 0
+		for key, item := range value.Map {
+			if index > 0 {
+				mapSize++
+			}
+			mapSize += jsonStringSize(key) + 1 + canonicalEncodedValueSize(item)
+			index++
+		}
+		addField("o", mapSize)
+	}
+	return size
+}
+
+// jsonStringSize matches encoding/json's default HTML-safe string spelling.
+// All callers validate UTF-8 before invoking it.
+func jsonStringSize(value string) int64 {
+	size := int64(2) // quotes
+	for index := 0; index < len(value); {
+		character := value[index]
+		if character < utf8.RuneSelf {
+			index++
+			switch character {
+			case '\\', '"', '\b', '\f', '\n', '\r', '\t':
+				size += 2
+			case '<', '>', '&':
+				size += 6
+			default:
+				if character < 0x20 {
+					size += 6
+				} else {
+					size++
+				}
+			}
+			continue
+		}
+		r, width := utf8.DecodeRuneInString(value[index:])
+		index += width
+		if r == '\u2028' || r == '\u2029' {
+			size += 6
+		} else {
+			size += int64(width)
+		}
+	}
+	return size
 }
 
 // An unnamed fixed offset is a real, lossless time zone representation (for
@@ -56,19 +140,29 @@ func encodeProperties(p domain.Properties) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	encodedSize := canonicalEncodedValueSize(v)
+	if encodedSize > int64(maxPropertyBytes) {
+		return nil, &domain.ResourceLimitError{
+			Field: "canonical property encoding", Unit: "bytes",
+			Limit: maxPropertyBytes, Actual: int(encodedSize),
+		}
+	}
 	data, err := json.Marshal(v)
 	if err != nil {
 		return nil, fmt.Errorf("encode properties: %w", err)
 	}
 	if len(data) > maxPropertyBytes {
-		return nil, fmt.Errorf("encode properties: encoded value exceeds %d bytes", maxPropertyBytes)
+		return nil, &domain.ResourceLimitError{
+			Field: "canonical property encoding", Unit: "bytes",
+			Limit: maxPropertyBytes, Actual: len(data),
+		}
 	}
 	return data, nil
 }
 
 func decodeProperties(data []byte) (domain.Properties, error) {
-	if len(data) > maxPropertyBytes {
-		return nil, fmt.Errorf("decode properties: encoded value exceeds %d bytes", maxPropertyBytes)
+	if err := domain.ValidateBytes("canonical property encoding", data, maxPropertyBytes); err != nil {
+		return nil, fmt.Errorf("decode properties: %w", err)
 	}
 	var value encodedValue
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -120,8 +214,41 @@ type encodeReference struct {
 }
 
 type encodeState struct {
-	visiting map[encodeReference]struct{}
-	values   int
+	visiting      map[encodeReference]struct{}
+	values        int
+	base64Payload int
+}
+
+func (s *encodeState) encodeBytes(value []byte) (encodedValue, error) {
+	if err := domain.ValidateBytes("property byte string", value, domain.MaxPropertyScalarBytes); err != nil {
+		return encodedValue{}, err
+	}
+	if err := s.reserveEncodedBytes(len(value)); err != nil {
+		return encodedValue{}, err
+	}
+	return encodedValue{Kind: "bytes", Text: base64.StdEncoding.EncodeToString(value)}, nil
+}
+
+func (s *encodeState) reserveEncodedBytes(length int) error {
+	encodedBytes := base64.StdEncoding.EncodedLen(length)
+	if s.base64Payload > domain.MaxCanonicalPropertyBytes-encodedBytes {
+		return &domain.ResourceLimitError{
+			Field: "aggregate encoded property byte strings", Unit: "bytes",
+			Limit: domain.MaxCanonicalPropertyBytes, Actual: s.base64Payload + encodedBytes,
+		}
+	}
+	s.base64Payload += encodedBytes
+	return nil
+}
+
+func (s *encodeState) reserveChildren(field string, count int) error {
+	if count > domain.MaxPropertyValues-s.values {
+		return &domain.ResourceLimitError{
+			Field: field, Unit: "values",
+			Limit: domain.MaxPropertyValues, Actual: s.values + count,
+		}
+	}
+	return nil
 }
 
 func (s *encodeState) encodeValue(value any, depth int) (encodedValue, error) {
@@ -138,12 +265,12 @@ func (s *encodeState) encodeValue(value any, depth int) (encodedValue, error) {
 	case bool:
 		return encodedValue{Kind: "bool", Bool: v}, nil
 	case string:
-		if !utf8.ValidString(v) {
-			return encodedValue{}, fmt.Errorf("property string is not valid UTF-8")
+		if err := domain.ValidateText("property string", v, domain.MaxPropertyScalarBytes); err != nil {
+			return encodedValue{}, err
 		}
 		return encodedValue{Kind: "string", Text: v}, nil
 	case []byte:
-		return encodedValue{Kind: "bytes", Text: base64.StdEncoding.EncodeToString(v)}, nil
+		return s.encodeBytes(v)
 	case temporal.Date:
 		return encodeTemporalBinary("date", v.MarshalBinary)
 	case temporal.LocalTime:
@@ -174,8 +301,8 @@ func (s *encodeState) encodeValue(value any, depth int) (encodedValue, error) {
 		if err != nil {
 			return encodedValue{}, fmt.Errorf("encode time: %w", err)
 		}
-		if !utf8.ValidString(wireZone) {
-			return encodedValue{}, fmt.Errorf("time zone name is not valid UTF-8")
+		if err := domain.ValidateText("time zone name", wireZone, domain.MaxTimeZoneNameBytes); err != nil {
+			return encodedValue{}, err
 		}
 		return encodedValue{Kind: "time", Text: base64.StdEncoding.EncodeToString(data), Zone: wireZone, Offset: offset}, nil
 	case time.Duration:
@@ -227,8 +354,8 @@ func (s *encodeState) encodeValue(value any, depth int) (encodedValue, error) {
 		return encodedValue{Kind: "bool", Bool: rv.Bool()}, nil
 	case reflect.String:
 		text := rv.String()
-		if !utf8.ValidString(text) {
-			return encodedValue{}, fmt.Errorf("property string is not valid UTF-8")
+		if err := domain.ValidateText("property string", text, domain.MaxPropertyScalarBytes); err != nil {
+			return encodedValue{}, err
 		}
 		return encodedValue{Kind: "string", Text: text}, nil
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
@@ -254,6 +381,15 @@ func (s *encodeState) encodeValue(value any, depth int) (encodedValue, error) {
 			return encodedValue{Kind: "null"}, nil
 		}
 		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			if rv.Len() > domain.MaxPropertyScalarBytes {
+				return encodedValue{}, &domain.ResourceLimitError{
+					Field: "property byte string", Unit: "bytes",
+					Limit: domain.MaxPropertyScalarBytes, Actual: rv.Len(),
+				}
+			}
+			if err := s.reserveEncodedBytes(rv.Len()); err != nil {
+				return encodedValue{}, err
+			}
 			bytesValue := make([]byte, rv.Len())
 			for i := range bytesValue {
 				bytesValue[i] = byte(rv.Index(i).Uint())
@@ -262,14 +398,10 @@ func (s *encodeState) encodeValue(value any, depth int) (encodedValue, error) {
 		}
 		fallthrough
 	case reflect.Array:
-		items := make([]any, rv.Len())
-		for i := range items {
-			items[i] = rv.Index(i).Interface()
-		}
 		if rv.Kind() == reflect.Slice {
-			return s.withReference(rv, func() (encodedValue, error) { return s.encodeListItems(items, depth) })
+			return s.withReference(rv, func() (encodedValue, error) { return s.encodeReflectedList(rv, depth) })
 		}
-		return s.encodeListItems(items, depth)
+		return s.encodeReflectedList(rv, depth)
 	}
 	return encodedValue{}, fmt.Errorf("unsupported property value %T", value)
 }
@@ -301,10 +433,13 @@ func (s *encodeState) encodeMap(values map[string]any, depth int) (encodedValue,
 }
 
 func (s *encodeState) encodeMapItems(values map[string]any, depth int) (encodedValue, error) {
+	if err := s.reserveChildren("property map", len(values)); err != nil {
+		return encodedValue{}, err
+	}
 	out := make(map[string]encodedValue, len(values))
 	for key, value := range values {
-		if !utf8.ValidString(key) {
-			return encodedValue{}, fmt.Errorf("property map key is not valid UTF-8")
+		if err := domain.ValidateText("property map key", key, domain.MaxPropertyKeyBytes); err != nil {
+			return encodedValue{}, err
 		}
 		encoded, err := s.encodeValue(value, depth+1)
 		if err != nil {
@@ -317,12 +452,15 @@ func (s *encodeState) encodeMapItems(values map[string]any, depth int) (encodedV
 
 func (s *encodeState) encodeReflectedMap(values reflect.Value, depth int) (encodedValue, error) {
 	return s.withReference(values, func() (encodedValue, error) {
+		if err := s.reserveChildren("property map", values.Len()); err != nil {
+			return encodedValue{}, err
+		}
 		out := make(map[string]encodedValue, values.Len())
 		iterator := values.MapRange()
 		for iterator.Next() {
 			key := iterator.Key().String()
-			if !utf8.ValidString(key) {
-				return encodedValue{}, fmt.Errorf("property map key is not valid UTF-8")
+			if err := domain.ValidateText("property map key", key, domain.MaxPropertyKeyBytes); err != nil {
+				return encodedValue{}, err
 			}
 			encoded, err := s.encodeValue(iterator.Value().Interface(), depth+1)
 			if err != nil {
@@ -344,6 +482,9 @@ func (s *encodeState) encodeList(values []any, depth int) (encodedValue, error) 
 }
 
 func (s *encodeState) encodeListItems(values []any, depth int) (encodedValue, error) {
+	if err := s.reserveChildren("property list", len(values)); err != nil {
+		return encodedValue{}, err
+	}
 	out := make([]encodedValue, len(values))
 	for i, value := range values {
 		encoded, err := s.encodeValue(value, depth+1)
@@ -351,6 +492,21 @@ func (s *encodeState) encodeListItems(values []any, depth int) (encodedValue, er
 			return encodedValue{}, fmt.Errorf("list item %d: %w", i, err)
 		}
 		out[i] = encoded
+	}
+	return encodedValue{Kind: "list", Items: out}, nil
+}
+
+func (s *encodeState) encodeReflectedList(values reflect.Value, depth int) (encodedValue, error) {
+	if err := s.reserveChildren("property list", values.Len()); err != nil {
+		return encodedValue{}, err
+	}
+	out := make([]encodedValue, values.Len())
+	for index := range values.Len() {
+		encoded, err := s.encodeValue(values.Index(index).Interface(), depth+1)
+		if err != nil {
+			return encodedValue{}, fmt.Errorf("list item %d: %w", index, err)
+		}
+		out[index] = encoded
 	}
 	return encodedValue{Kind: "list", Items: out}, nil
 }
@@ -386,11 +542,23 @@ func (s *decodeState) decodeValue(v encodedValue, depth int) (any, error) {
 	case "bool":
 		return v.Bool, nil
 	case "string":
+		if err := domain.ValidateText("property string", v.Text, domain.MaxPropertyScalarBytes); err != nil {
+			return nil, fmt.Errorf("decode properties: %w", err)
+		}
 		return v.Text, nil
 	case "bytes":
+		if len(v.Text) > base64.StdEncoding.EncodedLen(domain.MaxPropertyScalarBytes) {
+			return nil, &domain.ResourceLimitError{
+				Field: "encoded property byte string", Unit: "bytes",
+				Limit: base64.StdEncoding.EncodedLen(domain.MaxPropertyScalarBytes), Actual: len(v.Text),
+			}
+		}
 		data, err := base64.StdEncoding.DecodeString(v.Text)
 		if err != nil {
 			return nil, fmt.Errorf("decode bytes: %w", err)
+		}
+		if err := domain.ValidateBytes("property byte string", data, domain.MaxPropertyScalarBytes); err != nil {
+			return nil, fmt.Errorf("decode properties: %w", err)
 		}
 		return data, nil
 	case "date":
@@ -406,6 +574,9 @@ func (s *decodeState) decodeValue(v encodedValue, depth int) (any, error) {
 	case "cypher_duration":
 		return decodeTemporalBinary(v.Text, "cypher_duration", 29, 29, func(data []byte) (any, error) { return temporal.DurationFromBinary(data) })
 	case "time":
+		if err := domain.ValidateText("time zone name", v.Zone, domain.MaxTimeZoneNameBytes); err != nil {
+			return nil, fmt.Errorf("decode properties: %w", err)
+		}
 		data, err := base64.StdEncoding.DecodeString(v.Text)
 		if err != nil {
 			return nil, fmt.Errorf("decode time: %w", err)
@@ -463,6 +634,9 @@ func (s *decodeState) decodeValue(v encodedValue, depth int) (any, error) {
 	case "map":
 		result := make(domain.Properties, len(v.Map))
 		for key, item := range v.Map {
+			if err := domain.ValidateText("property map key", key, domain.MaxPropertyKeyBytes); err != nil {
+				return nil, fmt.Errorf("decode properties: %w", err)
+			}
 			decoded, err := s.decodeValue(item, depth+1)
 			if err != nil {
 				return nil, err
@@ -531,36 +705,97 @@ func ensureJSONEnd(decoder *json.Decoder) error {
 }
 
 func encodeLabels(labels []string) ([]byte, []string, error) {
+	if len(labels) > domain.MaxPropertyValues {
+		return nil, nil, &domain.ResourceLimitError{
+			Field: "node labels", Unit: "values",
+			Limit: domain.MaxPropertyValues, Actual: len(labels),
+		}
+	}
+	for _, label := range labels {
+		if err := domain.ValidateTextWithoutNUL("node label", label, domain.MaxLabelBytes); err != nil {
+			return nil, nil, err
+		}
+	}
 	normalized := normalizeLabels(labels)
-	for _, label := range normalized {
-		if !utf8.ValidString(label) || strings.IndexByte(label, 0) >= 0 {
-			return nil, nil, fmt.Errorf("label must be valid UTF-8 without NUL bytes")
+	encodedSize := int64(4) // nil labels encode as null.
+	if normalized != nil {
+		encodedSize = 2
+		for index, label := range normalized {
+			if index > 0 {
+				encodedSize++
+			}
+			encodedSize += jsonStringSize(label)
+		}
+	}
+	if encodedSize > int64(domain.MaxEncodedLabelsBytes) {
+		return nil, nil, &domain.ResourceLimitError{
+			Field: "canonical label encoding", Unit: "bytes",
+			Limit: domain.MaxEncodedLabelsBytes, Actual: int(encodedSize),
 		}
 	}
 	data, err := json.Marshal(normalized)
-	if len(data) > maxPropertyBytes {
-		return nil, nil, fmt.Errorf("encoded labels exceed %d bytes", maxPropertyBytes)
+	if len(data) > domain.MaxEncodedLabelsBytes {
+		return nil, nil, &domain.ResourceLimitError{
+			Field: "canonical label encoding", Unit: "bytes",
+			Limit: domain.MaxEncodedLabelsBytes, Actual: len(data),
+		}
 	}
 	return data, normalized, err
 }
 
 func decodeLabels(data []byte) ([]string, error) {
-	if len(data) > maxPropertyBytes {
-		return nil, fmt.Errorf("decode labels: encoded value exceeds %d bytes", maxPropertyBytes)
+	if err := domain.ValidateBytes("canonical label encoding", data, domain.MaxEncodedLabelsBytes); err != nil {
+		return nil, fmt.Errorf("decode labels: %w", err)
 	}
-	var labels []string
-	if err := json.Unmarshal(data, &labels); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, fmt.Errorf("decode labels: %w", err)
+	}
+	if token == nil {
+		if err := ensureJSONEnd(decoder); err != nil {
+			return nil, fmt.Errorf("decode labels: %w", err)
+		}
+		if !bytes.Equal(data, []byte("null")) {
+			return nil, fmt.Errorf("decode labels: non-canonical label encoding")
+		}
+		return nil, nil
+	}
+	opening, ok := token.(json.Delim)
+	if !ok || opening != '[' {
+		return nil, fmt.Errorf("decode labels: root is not an array or null")
+	}
+	labels := make([]string, 0, min(16, domain.MaxPropertyValues))
+	for decoder.More() {
+		if len(labels) == domain.MaxPropertyValues {
+			return nil, &domain.ResourceLimitError{
+				Field: "node labels", Unit: "values",
+				Limit: domain.MaxPropertyValues, Actual: domain.MaxPropertyValues + 1,
+			}
+		}
+		var label string
+		if err := decoder.Decode(&label); err != nil {
+			return nil, fmt.Errorf("decode labels: %w", err)
+		}
+		if err := domain.ValidateTextWithoutNUL("node label", label, domain.MaxLabelBytes); err != nil {
+			return nil, fmt.Errorf("decode labels: %w", err)
+		}
+		labels = append(labels, label)
+	}
+	closing, err := decoder.Token()
+	if err != nil {
+		return nil, fmt.Errorf("decode labels: invalid array terminator: %w", err)
+	}
+	if closing != json.Delim(']') {
+		return nil, fmt.Errorf("decode labels: invalid array terminator")
+	}
+	if err := ensureJSONEnd(decoder); err != nil {
 		return nil, fmt.Errorf("decode labels: %w", err)
 	}
 	normalized := normalizeLabels(labels)
 	canonical, err := json.Marshal(normalized)
 	if err != nil || !bytes.Equal(data, canonical) {
 		return nil, fmt.Errorf("decode labels: non-canonical label encoding")
-	}
-	for _, label := range normalized {
-		if !utf8.ValidString(label) || strings.IndexByte(label, 0) >= 0 {
-			return nil, fmt.Errorf("decode labels: invalid UTF-8 or NUL byte")
-		}
 	}
 	return normalized, nil
 }

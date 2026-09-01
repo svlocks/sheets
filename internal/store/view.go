@@ -267,8 +267,8 @@ func compileEdgePredicate(predicate EdgePredicate) (edgePlan, error) {
 		return edgePlan{}, err
 	}
 	for _, edgeType := range types {
-		if !utf8.ValidString(edgeType) || strings.IndexByte(edgeType, 0) >= 0 {
-			return edgePlan{}, fmt.Errorf("%w: edge type is not valid UTF-8", ErrInvalidArgument)
+		if err := domain.ValidateTextWithoutNUL("relationship type", edgeType, domain.MaxRelationshipTypeBytes); err != nil {
+			return edgePlan{}, fmt.Errorf("%w: %w", ErrInvalidArgument, err)
 		}
 	}
 	properties, err := compileProperties(predicate.Properties)
@@ -300,8 +300,8 @@ func compileProperties(properties domain.Properties) (compiledProperties, error)
 		// not reject an otherwise valid schema-free property key here: writers
 		// and residual comparison support it, and bound SQL parameters avoid any
 		// C-string ambiguity.
-		if !utf8.ValidString(key) {
-			return compiledProperties{}, fmt.Errorf("%w: property key is not valid UTF-8", ErrInvalidArgument)
+		if err := domain.ValidateText("property key", key, domain.MaxPropertyKeyBytes); err != nil {
+			return compiledProperties{}, fmt.Errorf("%w: %w", ErrInvalidArgument, err)
 		}
 		keys = append(keys, key)
 	}
@@ -310,7 +310,15 @@ func compileProperties(properties domain.Properties) (compiledProperties, error)
 		state := encodeState{visiting: make(map[encodeReference]struct{})}
 		value, err := state.encodeValue(properties[key], 0)
 		if err != nil {
-			return compiledProperties{}, fmt.Errorf("%w: property %q: %v", ErrInvalidArgument, key, err)
+			return compiledProperties{}, fmt.Errorf("%w: property %q: %w", ErrInvalidArgument, key, err)
+		}
+		encodedSize := canonicalEncodedValueSize(value)
+		if encodedSize > int64(maxPropertyBytes) {
+			limitErr := &domain.ResourceLimitError{
+				Field: "encoded property predicate", Unit: "bytes",
+				Limit: maxPropertyBytes, Actual: int(encodedSize),
+			}
+			return compiledProperties{}, fmt.Errorf("%w: property %q: %w", ErrInvalidArgument, key, limitErr)
 		}
 		data, err := json.Marshal(value)
 		if err != nil {

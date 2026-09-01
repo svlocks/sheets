@@ -188,7 +188,7 @@ func TestV2TemporalMigrationPreservesLegacyRowsAndIsAtomic(t *testing.T) {
 		if err := raw.QueryRow("SELECT kind, value FROM node_property_index WHERE id=? AND key='when'", string(id)).Scan(&afterKind, &afterValue); err != nil {
 			t.Fatal(err)
 		}
-		if version != 3 || beforeKind != "time" || afterKind != beforeKind || !reflect.DeepEqual(afterValue, beforeValue) {
+		if version != schemaVersion || beforeKind != "time" || afterKind != beforeKind || !reflect.DeepEqual(afterValue, beforeValue) {
 			t.Fatalf("legacy scalar row changed: version=%d before=%s/%s after=%s/%s", version, beforeKind, beforeValue, afterKind, afterValue)
 		}
 	})
@@ -265,7 +265,7 @@ func TestV2TemporalMigrationCrashAndConcurrentOpen(t *testing.T) {
 		raw := openRawSQLite(t, path)
 		defer func() { _ = raw.Close() }()
 		var version int
-		if err := raw.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 3 {
+		if err := raw.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != schemaVersion {
 			t.Fatalf("concurrent migration version=%d, %v", version, err)
 		}
 	})

@@ -4,10 +4,43 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/svlocks/sheets/internal/domain"
 )
+
+var (
+	benchmarkEncoded []byte
+	benchmarkError   error
+)
+
+func BenchmarkDurableValueValidation(b *testing.B) {
+	b.Run("revision_metadata", func(b *testing.B) {
+		meta := RevisionMeta{Actor: "benchmark", Message: "validate bounded metadata"}
+		b.ReportAllocs()
+		for range b.N {
+			benchmarkError = validateRevisionMeta(meta)
+		}
+	})
+	b.Run("markdown_body_4KiB", func(b *testing.B) {
+		body := "# Heading\n\n" + strings.Repeat("x", 4<<10)
+		b.ReportAllocs()
+		for range b.N {
+			benchmarkError = validateNodeBody(body)
+		}
+	})
+	b.Run("nested_properties", func(b *testing.B) {
+		properties := domain.Properties{
+			"title": "benchmark", "tags": []any{"one", "two", "three"},
+			"metadata": domain.Properties{"rank": int64(7), "enabled": true},
+		}
+		b.ReportAllocs()
+		for range b.N {
+			benchmarkEncoded, benchmarkError = encodeProperties(properties)
+		}
+	})
+}
 
 func BenchmarkWriteBatch(b *testing.B) {
 	ctx := context.Background()

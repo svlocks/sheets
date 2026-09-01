@@ -18,19 +18,27 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/svlocks/sheets/internal/domain"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 // This is the SHA-256 digest of the ordered, non-internal sqlite_schema rows
 // produced by the embedded migrations. It makes routine Open detect altered
 // trigger/index definitions without scanning graph data.
-const expectedSchemaFingerprint = "ce220b74c7edd80aff1942223383af9bc3c43f580fbe1537a46fcbbaf3709b3a"
+const expectedSchemaFingerprint = "77988fee52f43cdbcb9050836717c5f3287d6524d68f573d462f893b663ea8f0"
+
+// Migrations verify the complete preceding schema before applying DDL. Later
+// migrations replace tables and triggers, so checking only the final schema
+// could otherwise silently repair an altered historical definition.
+const (
+	expectedV1SchemaFingerprint = "9dea9ce84b3782df2bb8bc4a3ca1e8257bb6532a84b5aae104e65e865056c116"
+	expectedV2SchemaFingerprint = "868d00a7ad6e6bd2564e6c20687e1fe24af149ad4bcc6b56be00f302f75ec69c"
+	expectedV3SchemaFingerprint = "ce220b74c7edd80aff1942223383af9bc3c43f580fbe1537a46fcbbaf3709b3a"
+)
 
 //go:embed migrations/001_initial.sql
 var initialMigration string
@@ -40,6 +48,9 @@ var invariantMigration string
 
 //go:embed migrations/003_temporal_values.sql
 var temporalMigration string
+
+//go:embed migrations/004_resource_limits.sql
+var resourceLimitMigration string
 
 // ErrClosed is returned when an operation is attempted on a closed Store.
 var ErrClosed = errors.New("store is closed")
@@ -175,6 +186,9 @@ func makeDSN(path string, busy time.Duration) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse database URI: %w", err)
 	}
+	if err := anchorRelativeFileURI(uri); err != nil {
+		return "", err
+	}
 	ms := busy.Milliseconds()
 	query := uri.Query()
 	query.Add("_pragma", "foreign_keys(1)")
@@ -183,6 +197,45 @@ func makeDSN(path string, busy time.Duration) (string, error) {
 	query.Add("_pragma", "busy_timeout("+strconv.FormatInt(ms, 10)+")")
 	uri.RawQuery = query.Encode()
 	return uri.String(), nil
+}
+
+// anchorRelativeFileURI prevents lazy connections in one sql.DB pool from
+// resolving file:graph.db against different working directories after an
+// os.Chdir. It deliberately does not claim to pin a pathname against symlink
+// replacement; that requires a SQLite VFS capable of fd-relative opens and
+// sidecar handling.
+func anchorRelativeFileURI(uri *url.URL) error {
+	if uri == nil || !strings.EqualFold(uri.Scheme, "file") || uri.Host != "" ||
+		strings.EqualFold(uri.Query().Get("mode"), "memory") {
+		return nil
+	}
+	var path string
+	switch {
+	case uri.Opaque != "":
+		var err error
+		path, err = url.PathUnescape(uri.Opaque)
+		if err != nil {
+			return fmt.Errorf("decode database URI path: %w", err)
+		}
+		if path == ":memory:" {
+			return nil
+		}
+	case uri.Path != "":
+		path = filepath.FromSlash(uri.Path)
+	default:
+		return nil
+	}
+	if filepath.IsAbs(path) {
+		return nil
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolve database URI path: %w", err)
+	}
+	uri.Opaque = ""
+	uri.Path = filepath.ToSlash(absolute)
+	uri.RawPath = ""
+	return nil
 }
 
 func randomToken() string {
@@ -239,10 +292,22 @@ func (s *Store) initialize(ctx context.Context) (err error) {
 	if version > schemaVersion {
 		return fmt.Errorf("database schema version %d is newer than supported version %d", version, schemaVersion)
 	}
-	migrations := []string{initialMigration, invariantMigration, temporalMigration}
+	migrations := []string{initialMigration, invariantMigration, temporalMigration, resourceLimitMigration}
 	migrated := version < schemaVersion
+	dataPreflighted := version == 0
 	for version < schemaVersion {
 		next := version + 1
+		if version != 0 {
+			if err := validateMigrationSourceSchema(ctx, conn, version); err != nil {
+				return fmt.Errorf("%w: before migration %d: %v", ErrCorrupt, next, err)
+			}
+		}
+		if !dataPreflighted {
+			if err := validateMigrationSourceValues(ctx, conn, version); err != nil {
+				return fmt.Errorf("%w: preflight migration %d: %v", ErrCorrupt, next, err)
+			}
+			dataPreflighted = true
+		}
 		if _, err := conn.ExecContext(ctx, migrations[next-1]); err != nil {
 			return fmt.Errorf("apply migration %d: %w", next, err)
 		}
@@ -266,6 +331,120 @@ func (s *Store) initialize(ctx context.Context) (err error) {
 	return nil
 }
 
+func validateMigrationSourceSchema(ctx context.Context, conn *sql.Conn, version int) error {
+	expected := map[int]string{
+		1: expectedV1SchemaFingerprint,
+		2: expectedV2SchemaFingerprint,
+		3: expectedV3SchemaFingerprint,
+	}[version]
+	if expected == "" {
+		return fmt.Errorf("no expected fingerprint for schema version %d", version)
+	}
+	fingerprint, err := schemaFingerprint(ctx, conn)
+	if err != nil {
+		return fmt.Errorf("fingerprint schema version %d: %w", version, err)
+	}
+	if fingerprint != expected {
+		return fmt.Errorf("schema version %d has definition fingerprint %s", version, fingerprint)
+	}
+	return nil
+}
+
+func validateMigrationSourceValues(ctx context.Context, conn *sql.Conn, version int) error {
+	var err error
+	if version == 1 {
+		err = validateBaseResourceEnvelopes(ctx, conn)
+	} else {
+		err = validateResourceEnvelopes(ctx, conn)
+	}
+	if err != nil {
+		return err
+	}
+	return validateCanonicalGraphValues(ctx, conn)
+}
+
+func validateBaseResourceEnvelopes(ctx context.Context, conn *sql.Conn) error {
+	var invalid int
+	err := conn.QueryRowContext(ctx, `SELECT
+		EXISTS (SELECT 1 FROM revisions
+			WHERE octet_length(actor) > ? OR octet_length(message) > ?)
+		OR EXISTS (SELECT 1 FROM node_versions
+			WHERE octet_length(labels) > ? OR octet_length(properties) > ? OR octet_length(body) > ?)
+		OR EXISTS (SELECT 1 FROM edge_versions
+			WHERE octet_length(type) > ? OR octet_length(properties) > ?)`,
+		domain.MaxRevisionActorBytes, domain.MaxRevisionMessageBytes,
+		domain.MaxEncodedLabelsBytes, domain.MaxCanonicalPropertyBytes, domain.MaxNodeBodyBytes,
+		domain.MaxRelationshipTypeBytes, domain.MaxCanonicalPropertyBytes,
+	).Scan(&invalid)
+	if err != nil {
+		return fmt.Errorf("inspect durable base value envelopes: %w", err)
+	}
+	if invalid != 0 {
+		return errors.New("existing durable base value exceeds sheets resource limits")
+	}
+	return validateStoredLabelResources(ctx, conn)
+}
+
+// validateResourceEnvelopes uses SQLite-side byte counts so migrating a
+// database containing an enormous raw-SQL value never copies that value into
+// Go merely to discover that it violates the v4 ceiling. Nested canonical
+// values are checked later by validateCanonicalGraphValues once every envelope
+// is known to be bounded.
+func validateResourceEnvelopes(ctx context.Context, conn *sql.Conn) error {
+	var invalid int
+	err := conn.QueryRowContext(ctx, `SELECT
+		EXISTS (SELECT 1 FROM revisions
+			WHERE octet_length(actor) > ? OR octet_length(message) > ?)
+		OR EXISTS (SELECT 1 FROM node_versions
+			WHERE octet_length(labels) > ? OR octet_length(properties) > ? OR octet_length(body) > ?)
+		OR EXISTS (SELECT 1 FROM edge_versions
+			WHERE octet_length(type) > ? OR octet_length(properties) > ?)
+		OR EXISTS (SELECT 1 FROM node_version_labels
+			WHERE octet_length(label) > ?)
+		OR EXISTS (SELECT 1 FROM node_property_index
+			WHERE octet_length(key) > ? OR octet_length(value) > ?)
+		OR EXISTS (SELECT 1 FROM edge_property_index
+			WHERE octet_length(key) > ? OR octet_length(value) > ?)`,
+		domain.MaxRevisionActorBytes, domain.MaxRevisionMessageBytes,
+		domain.MaxEncodedLabelsBytes, domain.MaxCanonicalPropertyBytes, domain.MaxNodeBodyBytes,
+		domain.MaxRelationshipTypeBytes, domain.MaxCanonicalPropertyBytes,
+		domain.MaxLabelBytes,
+		domain.MaxPropertyKeyBytes, domain.MaxCanonicalPropertyBytes,
+		domain.MaxPropertyKeyBytes, domain.MaxCanonicalPropertyBytes,
+	).Scan(&invalid)
+	if err != nil {
+		return fmt.Errorf("inspect durable value envelopes: %w", err)
+	}
+	if invalid != 0 {
+		return errors.New("existing durable value exceeds sheets resource limits")
+	}
+	return validateStoredLabelResources(ctx, conn)
+}
+
+func validateStoredLabelResources(ctx context.Context, conn *sql.Conn) error {
+	var invalid int
+	err := conn.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1
+		FROM node_versions AS versions
+		WHERE CASE
+			WHEN json_valid(CAST(versions.labels AS TEXT)) <> 1 THEN 0
+			WHEN json_type(CAST(versions.labels AS TEXT)) <> 'array' THEN 0
+			WHEN json_array_length(CAST(versions.labels AS TEXT)) > ? THEN 1
+			ELSE EXISTS (
+				SELECT 1 FROM json_each(CAST(versions.labels AS TEXT)) AS label
+				WHERE octet_length(label.value) > ? OR instr(label.value, char(0)) <> 0
+			)
+		END
+	)`, domain.MaxPropertyValues, domain.MaxLabelBytes).Scan(&invalid)
+	if err != nil {
+		return fmt.Errorf("inspect stored label resources: %w", err)
+	}
+	if invalid != 0 {
+		return errors.New("existing labels exceed sheets resource limits")
+	}
+	return nil
+}
+
 func validateSchema(ctx context.Context, conn *sql.Conn, deep bool) error {
 	checks := []string{
 		"SELECT revision, committed_ns, actor, message, sealed FROM revisions LIMIT 0",
@@ -278,53 +457,64 @@ func validateSchema(ctx context.Context, conn *sql.Conn, deep bool) error {
 		"SELECT id, valid_from, valid_to, key, kind, value FROM edge_property_index LIMIT 0",
 	}
 	expectedObjects := map[string]string{
-		"revisions":                           "table",
-		"nodes":                               "table",
-		"node_versions":                       "table",
-		"node_version_labels":                 "table",
-		"node_property_index":                 "table",
-		"edges":                               "table",
-		"edge_versions":                       "table",
-		"edge_property_index":                 "table",
-		"one_current_node_version":            "index",
-		"one_unsealed_revision":               "index",
-		"one_current_edge_version":            "index",
-		"one_current_child_parent":            "index",
-		"node_version_labels_by_label":        "index",
-		"node_versions_by_close":              "index",
-		"node_property_lookup":                "index",
-		"edge_property_lookup":                "index",
-		"current_edges_from_page":             "index",
-		"current_edges_to_page":               "index",
-		"current_edges_type_page":             "index",
-		"edge_versions_from_history":          "index",
-		"edge_versions_to_history":            "index",
-		"edge_versions_type_history":          "index",
-		"edge_versions_by_close":              "index",
-		"revisions_validate_insert":           "trigger",
-		"revisions_validate_update":           "trigger",
-		"revisions_validate_delete":           "trigger",
-		"nodes_validate_insert":               "trigger",
-		"nodes_validate_update":               "trigger",
-		"nodes_validate_delete":               "trigger",
-		"edges_validate_insert":               "trigger",
-		"edges_validate_update":               "trigger",
-		"edges_validate_delete":               "trigger",
-		"node_versions_validate_insert":       "trigger",
-		"node_versions_validate_update":       "trigger",
-		"node_versions_validate_delete":       "trigger",
-		"node_version_labels_insert":          "trigger",
-		"node_version_labels_update":          "trigger",
-		"edge_versions_validate_insert":       "trigger",
-		"edge_versions_validate_update":       "trigger",
-		"edge_versions_validate_update_graph": "trigger",
-		"edge_versions_validate_delete":       "trigger",
-		"node_property_index_close":           "trigger",
-		"node_property_index_insert":          "trigger",
-		"node_property_index_update":          "trigger",
-		"edge_property_index_close":           "trigger",
-		"edge_property_index_insert":          "trigger",
-		"edge_property_index_update":          "trigger",
+		"revisions":                                  "table",
+		"nodes":                                      "table",
+		"node_versions":                              "table",
+		"node_version_labels":                        "table",
+		"node_property_index":                        "table",
+		"edges":                                      "table",
+		"edge_versions":                              "table",
+		"edge_property_index":                        "table",
+		"one_current_node_version":                   "index",
+		"one_unsealed_revision":                      "index",
+		"one_current_edge_version":                   "index",
+		"one_current_child_parent":                   "index",
+		"node_version_labels_by_label":               "index",
+		"node_versions_by_close":                     "index",
+		"node_property_lookup":                       "index",
+		"edge_property_lookup":                       "index",
+		"current_edges_from_page":                    "index",
+		"current_edges_to_page":                      "index",
+		"current_edges_type_page":                    "index",
+		"edge_versions_from_history":                 "index",
+		"edge_versions_to_history":                   "index",
+		"edge_versions_type_history":                 "index",
+		"edge_versions_by_close":                     "index",
+		"revisions_validate_insert":                  "trigger",
+		"revisions_validate_update":                  "trigger",
+		"revisions_validate_delete":                  "trigger",
+		"nodes_validate_insert":                      "trigger",
+		"nodes_validate_update":                      "trigger",
+		"nodes_validate_delete":                      "trigger",
+		"edges_validate_insert":                      "trigger",
+		"edges_validate_update":                      "trigger",
+		"edges_validate_delete":                      "trigger",
+		"node_versions_validate_insert":              "trigger",
+		"node_versions_validate_update":              "trigger",
+		"node_versions_validate_delete":              "trigger",
+		"node_version_labels_insert":                 "trigger",
+		"node_version_labels_update":                 "trigger",
+		"edge_versions_validate_insert":              "trigger",
+		"edge_versions_validate_update":              "trigger",
+		"edge_versions_validate_update_graph":        "trigger",
+		"edge_versions_validate_delete":              "trigger",
+		"node_property_index_close":                  "trigger",
+		"node_property_index_insert":                 "trigger",
+		"node_property_index_update":                 "trigger",
+		"edge_property_index_close":                  "trigger",
+		"edge_property_index_insert":                 "trigger",
+		"edge_property_index_update":                 "trigger",
+		"revisions_resource_limits_insert":           "trigger",
+		"node_versions_resource_limits_insert":       "trigger",
+		"node_versions_resource_limits_update":       "trigger",
+		"edge_versions_resource_limits_insert":       "trigger",
+		"edge_versions_resource_limits_update":       "trigger",
+		"node_version_labels_resource_limits_insert": "trigger",
+		"node_version_labels_resource_limits_update": "trigger",
+		"node_property_index_resource_limits_insert": "trigger",
+		"node_property_index_resource_limits_update": "trigger",
+		"edge_property_index_resource_limits_insert": "trigger",
+		"edge_property_index_resource_limits_update": "trigger",
 	}
 	objectArgs := make([]any, 0, len(expectedObjects))
 	for name := range expectedObjects {
@@ -684,8 +874,8 @@ func validateCanonicalGraphValues(ctx context.Context, conn *sql.Conn) error {
 		if _, err := decodeProperties(properties); err != nil {
 			return errors.Join(fmt.Errorf("validate node %s properties: %w", id, err), nodeRows.Close())
 		}
-		if !utf8.ValidString(body) {
-			return errors.Join(fmt.Errorf("validate node %s body: invalid UTF-8", id), nodeRows.Close())
+		if err := validateNodeBody(body); err != nil {
+			return errors.Join(fmt.Errorf("validate node %s body: %w", id, err), nodeRows.Close())
 		}
 	}
 	if err := nodeRows.Err(); err != nil {
@@ -706,8 +896,11 @@ func validateCanonicalGraphValues(ctx context.Context, conn *sql.Conn) error {
 		if err := edgeRows.Scan(&id, &edgeType, &position, &properties); err != nil {
 			return errors.Join(fmt.Errorf("validate edge values: %w", err), edgeRows.Close())
 		}
-		if edgeType == "" || !utf8.ValidString(edgeType) || strings.IndexByte(edgeType, 0) >= 0 || edgeType != "CHILD" && position.Valid {
-			return errors.Join(fmt.Errorf("validate edge %s: invalid type or position", id), edgeRows.Close())
+		if err := validateRelationshipType(edgeType); err != nil {
+			return errors.Join(fmt.Errorf("validate edge %s: %w", id, err), edgeRows.Close())
+		}
+		if edgeType != "CHILD" && position.Valid {
+			return errors.Join(fmt.Errorf("validate edge %s: invalid position for relationship type", id), edgeRows.Close())
 		}
 		if _, err := decodeProperties(properties); err != nil {
 			return errors.Join(fmt.Errorf("validate edge %s properties: %w", id, err), edgeRows.Close())
@@ -730,8 +923,8 @@ func validateCanonicalGraphValues(ctx context.Context, conn *sql.Conn) error {
 		if err := revisionRows.Scan(&revision, &actor, &message); err != nil {
 			return errors.Join(fmt.Errorf("validate revision metadata: %w", err), revisionRows.Close())
 		}
-		if !utf8.ValidString(actor) || !utf8.ValidString(message) {
-			return errors.Join(fmt.Errorf("validate revision %d metadata: invalid UTF-8", revision), revisionRows.Close())
+		if err := validateRevisionMeta(RevisionMeta{Actor: actor, Message: message}); err != nil {
+			return errors.Join(fmt.Errorf("validate revision %d metadata: %w", revision, err), revisionRows.Close())
 		}
 	}
 	if err := revisionRows.Err(); err != nil {

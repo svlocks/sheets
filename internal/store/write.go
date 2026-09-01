@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/svlocks/sheets/internal/domain"
 )
@@ -60,6 +59,27 @@ type WriteResult struct {
 	Revision domain.Revision
 	Changed  bool
 	Info     *domain.RevisionInfo
+}
+
+func validateRevisionMeta(meta RevisionMeta) error {
+	if err := domain.ValidateText("revision actor", meta.Actor, domain.MaxRevisionActorBytes); err != nil {
+		return err
+	}
+	return domain.ValidateText("revision message", meta.Message, domain.MaxRevisionMessageBytes)
+}
+
+func validateNodeBody(body string) error {
+	return domain.ValidateText("node body", body, domain.MaxNodeBodyBytes)
+}
+
+func validateRelationshipType(edgeType string) error {
+	if edgeType == "" {
+		return &domain.ConstraintError{Constraint: "edge_type", Detail: "relationship type is required"}
+	}
+	if err := domain.ValidateTextWithoutNUL("relationship type", edgeType, domain.MaxRelationshipTypeBytes); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+	}
+	return nil
 }
 
 // WriteTx is the mutation surface passed to Store.Write. It must not be used
@@ -274,8 +294,8 @@ func (tx *WriteTx) ensureRevision() (domain.Revision, error) {
 	if tx.base >= domain.Revision(math.MaxInt64) {
 		return 0, errors.New("revision space exhausted")
 	}
-	if !utf8.ValidString(tx.meta.Actor) || !utf8.ValidString(tx.meta.Message) {
-		return 0, fmt.Errorf("%w: revision actor and message must be valid UTF-8", ErrInvalidArgument)
+	if err := validateRevisionMeta(tx.meta); err != nil {
+		return 0, fmt.Errorf("%w: %w", ErrInvalidArgument, err)
 	}
 	when := tx.meta.Time
 	if when.IsZero() {
@@ -335,6 +355,9 @@ func (tx *WriteTx) CreateNode(input NodeInput) (result domain.Node, retErr error
 	if err := tx.checkActive(); err != nil {
 		return domain.Node{}, err
 	}
+	if err := validateNodeBody(input.Body); err != nil {
+		return domain.Node{}, fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+	}
 	id := input.ID
 	if id == "" {
 		var err error
@@ -348,14 +371,11 @@ func (tx *WriteTx) CreateNode(input NodeInput) (result domain.Node, retErr error
 	}
 	labelsData, labels, err := encodeLabels(input.Labels)
 	if err != nil {
-		return domain.Node{}, fmt.Errorf("encode node labels: %w", err)
+		return domain.Node{}, fmt.Errorf("%w: encode node labels: %w", ErrInvalidArgument, err)
 	}
 	properties, err := encodeProperties(input.Properties)
 	if err != nil {
-		return domain.Node{}, fmt.Errorf("encode node properties: %w", err)
-	}
-	if !utf8.ValidString(input.Body) {
-		return domain.Node{}, fmt.Errorf("%w: node body is not valid UTF-8", ErrInvalidArgument)
+		return domain.Node{}, fmt.Errorf("%w: encode node properties: %w", ErrInvalidArgument, err)
 	}
 	clonedProperties, err := decodeProperties(properties)
 	if err != nil {
@@ -404,17 +424,17 @@ func (tx *WriteTx) UpdateNode(id domain.EntityID, update NodeUpdate) (result dom
 	if update.Body != nil {
 		next.Body = *update.Body
 	}
+	if err := validateNodeBody(next.Body); err != nil {
+		return domain.Node{}, fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+	}
 	labelsData, normalized, err := encodeLabels(next.Labels)
 	if err != nil {
-		return domain.Node{}, err
+		return domain.Node{}, fmt.Errorf("%w: encode node labels: %w", ErrInvalidArgument, err)
 	}
 	next.Labels = normalized
 	properties, err := encodeProperties(next.Properties)
 	if err != nil {
-		return domain.Node{}, fmt.Errorf("encode node properties: %w", err)
-	}
-	if !utf8.ValidString(next.Body) {
-		return domain.Node{}, fmt.Errorf("%w: node body is not valid UTF-8", ErrInvalidArgument)
+		return domain.Node{}, fmt.Errorf("%w: encode node properties: %w", ErrInvalidArgument, err)
 	}
 	currentLabels, _, _ := encodeLabels(current.Labels)
 	currentProperties, err := encodeProperties(current.Properties)
@@ -533,6 +553,9 @@ func (tx *WriteTx) CreateEdge(input EdgeInput) (result domain.Edge, retErr error
 	if err := tx.checkActive(); err != nil {
 		return domain.Edge{}, err
 	}
+	if err := validateRelationshipType(input.Type); err != nil {
+		return domain.Edge{}, err
+	}
 	id := input.ID
 	if id == "" {
 		var err error
@@ -546,7 +569,7 @@ func (tx *WriteTx) CreateEdge(input EdgeInput) (result domain.Edge, retErr error
 	}
 	properties, err := encodeProperties(input.Properties)
 	if err != nil {
-		return domain.Edge{}, fmt.Errorf("encode edge properties: %w", err)
+		return domain.Edge{}, fmt.Errorf("%w: encode edge properties: %w", ErrInvalidArgument, err)
 	}
 	clonedProperties, err := decodeProperties(properties)
 	if err != nil {
@@ -611,7 +634,7 @@ func (tx *WriteTx) UpdateEdge(id domain.EntityID, update EdgeUpdate) (result dom
 	}
 	properties, err := encodeProperties(next.Properties)
 	if err != nil {
-		return domain.Edge{}, fmt.Errorf("encode edge properties: %w", err)
+		return domain.Edge{}, fmt.Errorf("%w: encode edge properties: %w", ErrInvalidArgument, err)
 	}
 	currentProperties, err := encodeProperties(current.Properties)
 	if err != nil {
@@ -705,11 +728,8 @@ func (tx *WriteTx) validateEdge(edge domain.Edge, exclude domain.EntityID) error
 	if edge.From == "" || edge.To == "" {
 		return &domain.ConstraintError{Constraint: "edge_endpoint", Detail: "source and target IDs are required"}
 	}
-	if edge.Type == "" {
-		return &domain.ConstraintError{Constraint: "edge_type", Detail: "relationship type is required"}
-	}
-	if !utf8.ValidString(edge.Type) || strings.IndexByte(edge.Type, 0) >= 0 {
-		return &domain.ConstraintError{Constraint: "edge_type", Detail: "relationship type must be valid UTF-8 without NUL bytes"}
+	if err := validateRelationshipType(edge.Type); err != nil {
+		return err
 	}
 	if edge.Type != "CHILD" && edge.Position != nil {
 		return &domain.ConstraintError{Constraint: "edge_position", Detail: "position is only valid on CHILD edges"}
@@ -993,6 +1013,9 @@ func mapConflict(operation string, err error) error {
 	if isSQLiteBusy(err) {
 		return fmt.Errorf("%s: %w: %v", operation, ErrBusy, err)
 	}
+	if strings.Contains(strings.ToLower(err.Error()), "sheets_resource_limit") {
+		return fmt.Errorf("%w: %s: %v", ErrInvalidArgument, operation, err)
+	}
 	if isSQLiteConstraint(err) {
 		return fmt.Errorf("%w: %s: %v", domain.ErrConflict, operation, err)
 	}
@@ -1003,6 +1026,9 @@ func mapConstraintError(operation string, err error) error {
 	message := strings.ToLower(err.Error())
 	if isSQLiteBusy(err) {
 		return fmt.Errorf("%s: %w: %v", operation, ErrBusy, err)
+	}
+	if strings.Contains(message, "sheets_resource_limit") {
+		return fmt.Errorf("%w: %s: %v", ErrInvalidArgument, operation, err)
 	}
 	if strings.Contains(message, "one_current_child_parent") || strings.Contains(message, "edge_versions.to_id") || strings.Contains(message, "sheets_child_parent") {
 		return &domain.ConstraintError{Constraint: "child_parent", Detail: "target already has a current parent"}
