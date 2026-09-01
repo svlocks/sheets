@@ -19,6 +19,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/domain"
+	"github.com/svlocks/sheets/internal/domain/temporal"
 )
 
 type formPurpose uint8
@@ -574,6 +575,9 @@ func decodeProperties(value string) (domain.Properties, error) {
 }
 
 func decodeJSONObject(value string, decodeFloatTags bool) (domain.Properties, error) {
+	if err := app.RejectDuplicateJSONKeys([]byte(value)); err != nil {
+		return nil, fmt.Errorf("properties contain invalid JSON: %w", err)
+	}
 	decoder := json.NewDecoder(strings.NewReader(value))
 	decoder.UseNumber()
 	var properties map[string]any
@@ -594,13 +598,22 @@ func decodeJSONObject(value string, decodeFloatTags bool) (domain.Properties, er
 	if err != nil {
 		return nil, err
 	}
+	decoded, err := app.DecodeTaggedJSONValue(normalized, decodeFloatTags)
+	if err != nil {
+		return nil, err
+	}
+	var ok bool
+	normalized, ok = decoded.(map[string]any)
+	if !ok {
+		return nil, errors.New("properties must remain a JSON object")
+	}
 	return domain.Properties(normalized), nil
 }
 
 func decodeParams(value string) (map[string]any, error) {
-	// Query parameters deliberately follow the CLI's plain-JSON input
-	// contract. $float objects are an editable-property extension, not an
-	// alternate meaning for the same CLI/TUI console parameter document.
+	// Query parameters use the same exact typed-value contract as CLI JSON.
+	// $float remains an ordinary map to preserve the established plain-JSON
+	// parameter behavior; non-finite tags are an editable-property extension.
 	properties, err := decodeJSONObject(value, false)
 	return map[string]any(properties), err
 }
@@ -689,7 +702,22 @@ func restorePropertyMapTypes(values domain.Properties, originals domain.Properti
 
 func restorePropertyType(value, original any) (any, error) {
 	switch original := original.(type) {
+	case temporal.Date:
+		return restoredTemporal[temporal.Date](value, "$date")
+	case temporal.LocalTime:
+		return restoredTemporal[temporal.LocalTime](value, "$local_time")
+	case temporal.Time:
+		return restoredTemporal[temporal.Time](value, "$offset_time")
+	case temporal.LocalDateTime:
+		return restoredTemporal[temporal.LocalDateTime](value, "$local_datetime")
+	case temporal.DateTime:
+		return restoredTemporal[temporal.DateTime](value, "$zoned_datetime")
+	case temporal.Duration:
+		return restoredTemporal[temporal.Duration](value, "$cypher_duration")
 	case time.Time:
+		if typed, ok := value.(time.Time); ok {
+			return typed, nil
+		}
 		text, ok := value.(string)
 		if !ok {
 			return nil, errors.New("temporal value must remain an RFC3339 string")
@@ -703,12 +731,18 @@ func restorePropertyType(value, original any) (any, error) {
 		}
 		return parsed, nil
 	case time.Duration:
+		if typed, ok := value.(time.Duration); ok {
+			return typed, nil
+		}
 		integer, ok := value.(int64)
 		if !ok {
 			return nil, errors.New("duration must remain an integer number of nanoseconds")
 		}
 		return time.Duration(integer), nil
 	case []byte:
+		if typed, ok := value.([]byte); ok {
+			return typed, nil
+		}
 		text, ok := value.(string)
 		if !ok {
 			return nil, errors.New("byte value must remain a base64 string")
@@ -758,6 +792,14 @@ func restorePropertyType(value, original any) (any, error) {
 	default:
 		return value, nil
 	}
+}
+
+func restoredTemporal[T any](value any, tag string) (any, error) {
+	typed, ok := value.(T)
+	if !ok {
+		return nil, fmt.Errorf("%s value has incompatible JSON type %T", tag, value)
+	}
+	return typed, nil
 }
 
 func validateOptionalInteger(value string) error {

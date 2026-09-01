@@ -2,13 +2,17 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"math"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/domain"
+	"github.com/svlocks/sheets/internal/domain/temporal"
 	"github.com/svlocks/sheets/internal/engine"
 )
 
@@ -28,6 +32,73 @@ func TestParseFormat(t *testing.T) {
 	}
 	if _, err := ParseFormat("yaml"); !errors.Is(err, ErrInvalidFormat) {
 		t.Fatalf("ParseFormat(yaml) error = %v; errors.Is(_, ErrInvalidFormat) is false", err)
+	}
+}
+
+func TestRenderTemporalValuesAreTypedReadableAndParameterRoundTrippable(t *testing.T) {
+	date, _ := temporal.ParseDate("1984-10-11")
+	localTime, _ := temporal.ParseLocalTime("12:31:14.645876123")
+	offsetTime, _ := temporal.ParseTime("12:31:14.645876123+01:00")
+	localDateTime := temporal.NewLocalDateTime(date, localTime)
+	dateTime, _ := temporal.NewDateTime(localDateTime, "Europe/Stockholm")
+	duration, _ := temporal.NewDuration(-7, 14, -4, 500_000_000)
+	legacyTime := time.Date(2026, 8, 31, 9, 10, 11, 12, time.FixedZone("legacy", -5*3600))
+	values := []any{date, localTime, offsetTime, localDateTime, dateTime, duration, legacyTime, 90 * time.Minute, []byte{0, 255}}
+	batch := app.BatchResult{Results: []app.Result{{
+		Columns: []string{"date", "local_time", "offset_time", "local_datetime", "datetime", "duration", "legacy_time", "legacy_duration", "bytes"},
+		Rows:    [][]any{values},
+	}}}
+	for _, format := range []string{"json", "jsonl"} {
+		var output bytes.Buffer
+		if err := Render(&output, format, batch); err != nil {
+			t.Fatal(err)
+		}
+		for _, tag := range []string{
+			`"$date"`, `"$local_time"`, `"$offset_time"`, `"$local_datetime"`,
+			`"$zoned_datetime"`, `"$cypher_duration"`, `"$legacy_time"`,
+			`"$legacy_duration"`, `"$bytes"`,
+		} {
+			if !strings.Contains(output.String(), tag) {
+				t.Errorf("%s output lacks %s: %s", format, tag, output.String())
+			}
+		}
+	}
+	var table bytes.Buffer
+	if err := Render(&table, "table", batch); err != nil {
+		t.Fatal(err)
+	}
+	for _, readable := range []string{
+		"date(1984-10-11)", "localtime(12:31:14.645876123)",
+		"time(12:31:14.645876123+01:00)", "localdatetime(1984-10-11T12:31:14.645876123)",
+		"datetime(1984-10-11T12:31:14.645876123+01:00[Europe/Stockholm])",
+		"duration(P-7M14DT-3.5S)", "legacy_time(", "legacy_duration(1h30m0s)", "bytes(AP8=)",
+	} {
+		if !strings.Contains(table.String(), readable) {
+			t.Errorf("table output lacks %q: %s", readable, table.String())
+		}
+	}
+
+	for index, value := range values {
+		data, err := json.Marshal(jsonValue(value))
+		if err != nil {
+			t.Fatal(err)
+		}
+		params, err := (parameterInput{Values: []string{"value=" + string(data)}}).load(strings.NewReader(""))
+		if err != nil {
+			t.Fatalf("round-trip parameter %d (%T): %v\n%s", index, value, err, data)
+		}
+		got := params["value"]
+		switch value := value.(type) {
+		case time.Time:
+			decoded, ok := got.(time.Time)
+			if !ok || !decoded.Equal(value) || decoded.Location().String() != value.Location().String() {
+				t.Errorf("legacy time parameter = %#v", got)
+			}
+		default:
+			if !reflect.DeepEqual(got, value) {
+				t.Errorf("parameter %d = %#v (%T), want %#v (%T)", index, got, got, value, value)
+			}
+		}
 	}
 }
 
@@ -219,9 +290,10 @@ func TestMachineFormatsUseStableEmptyArraysAndTaggedNonFiniteFloats(t *testing.T
 }
 
 func TestRenderJSONDoesNotMutatePathValues(t *testing.T) {
+	date, _ := temporal.ParseDate("1984-10-11")
 	path := engine.PathValue{
-		Nodes:         []domain.Node{{Properties: domain.Properties{"score": math.NaN()}}},
-		Relationships: []domain.Edge{{Properties: domain.Properties{"weight": math.Inf(1)}}},
+		Nodes:         []domain.Node{{Properties: domain.Properties{"score": math.NaN(), "date": date}}},
+		Relationships: []domain.Edge{{Properties: domain.Properties{"weight": math.Inf(1), "nested": []any{date}}}},
 	}
 	batch := app.BatchResult{Results: []app.Result{{Rows: [][]any{{path}}}}}
 	var output bytes.Buffer
@@ -233,6 +305,12 @@ func TestRenderJSONDoesNotMutatePathValues(t *testing.T) {
 	}
 	if weight, ok := path.Relationships[0].Properties["weight"].(float64); !ok || !math.IsInf(weight, 1) {
 		t.Fatalf("Render mutated path relationship property to %#v", path.Relationships[0].Properties["weight"])
+	}
+	if _, ok := path.Nodes[0].Properties["date"].(temporal.Date); !ok {
+		t.Fatalf("Render mutated path temporal property to %#v", path.Nodes[0].Properties["date"])
+	}
+	if got := strings.Count(output.String(), `"$date"`); got != 2 {
+		t.Fatalf("nested path temporal envelope count = %d, output = %s", got, output.String())
 	}
 }
 

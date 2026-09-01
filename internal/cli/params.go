@@ -10,6 +10,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/svlocks/sheets/internal/app"
 )
 
 // parameterInput describes the two CLI parameter forms. Object accepts a JSON
@@ -147,64 +149,7 @@ func decodeJSON(data []byte, dst any) error {
 }
 
 func rejectDuplicateObjectKeys(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	if err := scanJSONValue(decoder); err != nil {
-		return err
-	}
-	return nil
-}
-
-func scanJSONValue(decoder *json.Decoder) error {
-	token, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	delimiter, composite := token.(json.Delim)
-	if !composite {
-		return nil
-	}
-	switch delimiter {
-	case '{':
-		keys := make(map[string]struct{})
-		for decoder.More() {
-			rawKey, err := decoder.Token()
-			if err != nil {
-				return err
-			}
-			key, ok := rawKey.(string)
-			if !ok {
-				return errors.New("invalid JSON object key")
-			}
-			if _, exists := keys[key]; exists {
-				return fmt.Errorf("duplicate object key %q", key)
-			}
-			keys[key] = struct{}{}
-			if err := scanJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-	case '[':
-		for decoder.More() {
-			if err := scanJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-	default:
-		return fmt.Errorf("invalid JSON delimiter %q", delimiter)
-	}
-	closing, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	want := json.Delim('}')
-	if delimiter == '[' {
-		want = ']'
-	}
-	if closing != want {
-		return fmt.Errorf("invalid JSON delimiter %q", closing)
-	}
-	return nil
+	return app.RejectDuplicateJSONKeys(data)
 }
 
 // normalizeJSONNumbers changes json.Number values in decoded data into int64
@@ -212,18 +157,33 @@ func scanJSONValue(decoder *json.Decoder) error {
 func normalizeJSONNumbers(dst any) error {
 	switch value := dst.(type) {
 	case *map[string]any:
+		if *value == nil {
+			return nil
+		}
 		normalized, err := normalizeMap(*value)
 		if err != nil {
 			return err
 		}
-		*value = normalized
+		decoded, err := app.DecodeTaggedJSONValue(normalized, false)
+		if err != nil {
+			return err
+		}
+		result, ok := decoded.(map[string]any)
+		if !ok {
+			return fmt.Errorf("expected a JSON object, got a typed value")
+		}
+		*value = result
 		return nil
 	case *any:
 		normalized, err := normalizeJSONValue(*value)
 		if err != nil {
 			return err
 		}
-		*value = normalized
+		decoded, err := app.DecodeTaggedJSONValue(normalized, false)
+		if err != nil {
+			return err
+		}
+		*value = decoded
 		return nil
 	default:
 		return fmt.Errorf("unsupported JSON destination %T", dst)

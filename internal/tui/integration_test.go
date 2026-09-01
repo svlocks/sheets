@@ -10,6 +10,7 @@ import (
 
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/domain"
+	"github.com/svlocks/sheets/internal/domain/temporal"
 	"github.com/svlocks/sheets/internal/engine"
 	"github.com/svlocks/sheets/internal/store"
 )
@@ -377,10 +378,19 @@ func TestTypedPropertiesSurviveARealFormEdit(t *testing.T) {
 	backend := engineBackend{root: t.TempDir(), engine: executor}
 	zone := time.FixedZone("Audit/Fixed", -5*60*60)
 	when := time.Date(2026, time.August, 31, 12, 34, 56, 123, zone)
+	date, _ := temporal.ParseDate("1984-10-11")
+	localTime, _ := temporal.ParseLocalTime("12:31:14.645876123")
+	offsetTime, _ := temporal.ParseTime("12:31:14.645876123+01:00")
+	localDateTime := temporal.NewLocalDateTime(date, localTime)
+	dateTime, _ := temporal.NewDateTime(localDateTime, "Europe/Stockholm")
+	cypherDuration, _ := temporal.NewDuration(-7, 14, -4, 500_000_000)
 	properties := domain.Properties{
 		"title": "Typed", "float": float64(1), "nan": math.NaN(), "when": when,
 		"duration": 90 * time.Minute, "bytes": []byte{0, 1, 2, 255},
-		"nested": map[string]any{"values": []any{math.Inf(-1), when}},
+		"date": date, "local_time": localTime, "offset_time": offsetTime,
+		"local_datetime": localDateTime, "zoned_datetime": dateTime,
+		"cypher_duration": cypherDuration,
+		"nested":          map[string]any{"values": []any{math.Inf(-1), when, dateTime, cypherDuration}},
 	}
 	if _, err := executor.Execute(ctx, app.ExecuteRequest{
 		Query: "CREATE (n:Task) SET n = $properties RETURN n", Params: map[string]any{"properties": properties},
@@ -425,11 +435,35 @@ func TestTypedPropertiesSurviveARealFormEdit(t *testing.T) {
 	if value, ok := got["bytes"].([]byte); !ok || !bytes.Equal(value, []byte{0, 1, 2, 255}) {
 		t.Fatalf("bytes changed = %#v (%T)", got["bytes"], got["bytes"])
 	}
+	if value, ok := got["date"].(temporal.Date); !ok || !value.Equal(date) {
+		t.Fatalf("date changed = %#v", got["date"])
+	}
+	if value, ok := got["local_time"].(temporal.LocalTime); !ok || !value.Equal(localTime) {
+		t.Fatalf("local time changed = %#v", got["local_time"])
+	}
+	if value, ok := got["offset_time"].(temporal.Time); !ok || !value.Equal(offsetTime) {
+		t.Fatalf("offset time changed = %#v", got["offset_time"])
+	}
+	if value, ok := got["local_datetime"].(temporal.LocalDateTime); !ok || !value.Equal(localDateTime) {
+		t.Fatalf("local date-time changed = %#v", got["local_datetime"])
+	}
+	if value, ok := got["zoned_datetime"].(temporal.DateTime); !ok || !value.Equal(dateTime) {
+		t.Fatalf("zoned date-time changed = %#v", got["zoned_datetime"])
+	}
+	if value, ok := got["cypher_duration"].(temporal.Duration); !ok || !value.Equal(cypherDuration) {
+		t.Fatalf("Cypher duration changed = %#v", got["cypher_duration"])
+	}
 	nested := got["nested"].(domain.Properties)["values"].([]any)
 	if value, ok := nested[0].(float64); !ok || !math.IsInf(value, -1) {
 		t.Fatalf("nested infinity changed = %#v", nested[0])
 	}
 	if value, ok := nested[1].(time.Time); !ok || !value.Equal(when) || value.Location().String() != when.Location().String() {
 		t.Fatalf("nested temporal changed = %#v", nested[1])
+	}
+	if value, ok := nested[2].(temporal.DateTime); !ok || !value.Equal(dateTime) {
+		t.Fatalf("nested zoned date-time changed = %#v", nested[2])
+	}
+	if value, ok := nested[3].(temporal.Duration); !ok || !value.Equal(cypherDuration) {
+		t.Fatalf("nested Cypher duration changed = %#v", nested[3])
 	}
 }

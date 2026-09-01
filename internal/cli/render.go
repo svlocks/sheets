@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,12 +11,13 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/x/ansi"
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/domain"
-	"github.com/svlocks/sheets/internal/engine"
+	"github.com/svlocks/sheets/internal/domain/temporal"
 )
 
 // Format is a supported command output format.
@@ -122,10 +124,6 @@ type jsonResult struct {
 	Page    *domain.PageInfo `json:"page,omitempty"`
 }
 
-type taggedFloat struct {
-	Float string `json:"$float"`
-}
-
 // JSONL records deliberately use a small envelope so a consumer can process
 // rows without buffering a complete result. Statement indexes are zero-based.
 type jsonlRow struct {
@@ -204,59 +202,7 @@ func renderJSONL(w io.Writer, batch app.BatchResult) error {
 // can produce them, so machine formats use an explicit, unambiguous tagged
 // object instead of failing after the query has already run.
 func jsonValue(value any) any {
-	switch value := value.(type) {
-	case float64:
-		switch {
-		case math.IsNaN(value):
-			return taggedFloat{Float: "NaN"}
-		case math.IsInf(value, 1):
-			return taggedFloat{Float: "+Infinity"}
-		case math.IsInf(value, -1):
-			return taggedFloat{Float: "-Infinity"}
-		default:
-			return value
-		}
-	case float32:
-		return jsonValue(float64(value))
-	case []any:
-		result := make([]any, len(value))
-		for index, item := range value {
-			result[index] = jsonValue(item)
-		}
-		return result
-	case map[string]any:
-		result := make(map[string]any, len(value))
-		for key, item := range value {
-			result[key] = jsonValue(item)
-		}
-		return result
-	case domain.Properties:
-		result := make(map[string]any, len(value))
-		for key, item := range value {
-			result[key] = jsonValue(item)
-		}
-		return result
-	case domain.Node:
-		value.Properties = jsonValue(value.Properties).(map[string]any)
-		return value
-	case domain.Edge:
-		value.Properties = jsonValue(value.Properties).(map[string]any)
-		return value
-	case engine.PathValue:
-		result := engine.PathValue{
-			Nodes:         make([]domain.Node, len(value.Nodes)),
-			Relationships: make([]domain.Edge, len(value.Relationships)),
-		}
-		for index, node := range value.Nodes {
-			result.Nodes[index] = jsonValue(node).(domain.Node)
-		}
-		for index, relationship := range value.Relationships {
-			result.Relationships[index] = jsonValue(relationship).(domain.Edge)
-		}
-		return result
-	default:
-		return value
-	}
+	return app.JSONValue(value)
 }
 
 func writeJSONLine(w io.Writer, record any) error {
@@ -445,11 +391,29 @@ func formatTableValue(value any) string {
 		return formatFloat(float64(value), 32)
 	case float64:
 		return formatFloat(value, 64)
+	case temporal.Date:
+		return "date(" + value.String() + ")"
+	case temporal.LocalTime:
+		return "localtime(" + value.String() + ")"
+	case temporal.Time:
+		return "time(" + value.String() + ")"
+	case temporal.LocalDateTime:
+		return "localdatetime(" + value.String() + ")"
+	case temporal.DateTime:
+		return "datetime(" + value.String() + ")"
+	case temporal.Duration:
+		return "duration(" + value.String() + ")"
+	case time.Time:
+		return "legacy_time(" + value.Format(time.RFC3339Nano) + "[" + value.Location().String() + "])"
+	case time.Duration:
+		return "legacy_duration(" + value.String() + ")"
+	case []byte:
+		return "bytes(" + base64.StdEncoding.EncodeToString(value) + ")"
 	}
 
 	// JSON gives maps, lists, and domain values a compact deterministic form
 	// (encoding/json sorts string map keys).
-	if encoded, err := json.Marshal(value); err == nil {
+	if encoded, err := json.Marshal(app.JSONValue(value)); err == nil {
 		return string(encoded)
 	}
 	return safeTableString(fmt.Sprint(value))

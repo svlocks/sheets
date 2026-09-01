@@ -1,9 +1,11 @@
 package tui
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/table"
 	"charm.land/bubbles/v2/textarea"
@@ -12,6 +14,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/svlocks/sheets/internal/app"
+	"github.com/svlocks/sheets/internal/domain/temporal"
 )
 
 type queryFocus uint8
@@ -369,6 +372,24 @@ func queryCell(value any) string {
 		text = value
 	case json.Number:
 		text = value.String()
+	case temporal.Date:
+		text = "date(" + value.String() + ")"
+	case temporal.LocalTime:
+		text = "localtime(" + value.String() + ")"
+	case temporal.Time:
+		text = "time(" + value.String() + ")"
+	case temporal.LocalDateTime:
+		text = "localdatetime(" + value.String() + ")"
+	case temporal.DateTime:
+		text = "datetime(" + value.String() + ")"
+	case temporal.Duration:
+		text = "duration(" + value.String() + ")"
+	case time.Time:
+		text = "legacy_time(" + value.Format(time.RFC3339Nano) + ")"
+	case time.Duration:
+		text = "legacy_duration(" + value.String() + ")"
+	case []byte:
+		text = "bytes(" + base64.StdEncoding.EncodeToString(value) + ")"
 	default:
 		text = stableJSON(value)
 	}

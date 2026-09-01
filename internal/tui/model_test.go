@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/domain"
+	"github.com/svlocks/sheets/internal/domain/temporal"
 )
 
 type fakeSnapshot struct {
@@ -229,12 +230,24 @@ func TestCreateFormBuildsParameterizedCypher(t *testing.T) {
 func TestPropertyFormsPreserveTypedNestedValuesAndCLIIntegerRules(t *testing.T) {
 	zone := time.FixedZone("Audit/Offset", -6*60*60)
 	when := time.Date(2026, time.August, 31, 12, 34, 56, 789, zone)
+	date, _ := temporal.ParseDate("1984-10-11")
+	localTime, _ := temporal.ParseLocalTime("12:31:14.645876123")
+	offsetTime, _ := temporal.ParseTime("12:31:14.645876123+01:00")
+	localDateTime := temporal.NewLocalDateTime(date, localTime)
+	dateTime, _ := temporal.NewDateTime(localDateTime, "Europe/Stockholm")
+	cypherDuration, _ := temporal.NewDuration(-7, 14, -4, 500_000_000)
 	node := task("typed", "Typed")
 	node.Properties["finite_float"] = float64(1)
 	node.Properties["nan"] = math.NaN()
 	node.Properties["when"] = when
 	node.Properties["duration"] = 90 * time.Minute
 	node.Properties["bytes"] = []byte{0, 1, 2, 255}
+	node.Properties["date"] = date
+	node.Properties["local_time"] = localTime
+	node.Properties["offset_time"] = offsetTime
+	node.Properties["local_datetime"] = localDateTime
+	node.Properties["zoned_datetime"] = dateTime
+	node.Properties["cypher_duration"] = cypherDuration
 	node.Properties["position"] = "node-local-position"
 	node.Properties["nested"] = map[string]any{"values": []any{math.Inf(1), when}}
 
@@ -242,6 +255,11 @@ func TestPropertyFormsPreserveTypedNestedValuesAndCLIIntegerRules(t *testing.T) 
 	data := form.data.(*nodeFormData)
 	if !strings.Contains(data.properties, `"$float": "+Infinity"`) || !strings.Contains(data.properties, `"$float": "NaN"`) {
 		t.Fatalf("editable JSON lost non-finite values:\n%s", data.properties)
+	}
+	for _, tag := range []string{"$date", "$local_time", "$offset_time", "$local_datetime", "$zoned_datetime", "$cypher_duration", "$legacy_time", "$legacy_duration", "$bytes"} {
+		if !strings.Contains(data.properties, `"`+tag+`"`) {
+			t.Fatalf("editable JSON lost %s:\n%s", tag, data.properties)
+		}
 	}
 	request, err := form.request()
 	if err != nil {
@@ -265,6 +283,24 @@ func TestPropertyFormsPreserveTypedNestedValuesAndCLIIntegerRules(t *testing.T) 
 	}
 	if value, ok := properties["bytes"].([]byte); !ok || !bytes.Equal(value, []byte{0, 1, 2, 255}) {
 		t.Fatalf("bytes did not round-trip: %#v (%T)", properties["bytes"], properties["bytes"])
+	}
+	if value, ok := properties["date"].(temporal.Date); !ok || !value.Equal(date) {
+		t.Fatalf("date did not round-trip: %#v", properties["date"])
+	}
+	if value, ok := properties["local_time"].(temporal.LocalTime); !ok || !value.Equal(localTime) {
+		t.Fatalf("local time did not round-trip: %#v", properties["local_time"])
+	}
+	if value, ok := properties["offset_time"].(temporal.Time); !ok || !value.Equal(offsetTime) {
+		t.Fatalf("offset time did not round-trip: %#v", properties["offset_time"])
+	}
+	if value, ok := properties["local_datetime"].(temporal.LocalDateTime); !ok || !value.Equal(localDateTime) {
+		t.Fatalf("local date-time did not round-trip: %#v", properties["local_datetime"])
+	}
+	if value, ok := properties["zoned_datetime"].(temporal.DateTime); !ok || !value.Equal(dateTime) {
+		t.Fatalf("zoned date-time did not round-trip: %#v", properties["zoned_datetime"])
+	}
+	if value, ok := properties["cypher_duration"].(temporal.Duration); !ok || !value.Equal(cypherDuration) {
+		t.Fatalf("Cypher duration did not round-trip: %#v", properties["cypher_duration"])
 	}
 	nested := properties["nested"].(domain.Properties)["values"].([]any)
 	if value, ok := nested[0].(float64); !ok || !math.IsInf(value, 1) {
@@ -293,12 +329,36 @@ func TestPropertyFormsPreserveTypedNestedValuesAndCLIIntegerRules(t *testing.T) 
 	if _, err := decodeRelationshipProperties(`{"position":1}`); err == nil {
 		t.Fatal("relationship properties accepted reserved position")
 	}
+	if _, err := decodeProperties(`{"x":1,"\u0078":2}`); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("duplicate property key error = %v", err)
+	}
 	params, err := decodeParams(`{"value":{"$float":"NaN"}}`)
 	if err != nil {
 		t.Fatalf("decodeParams() error = %v", err)
 	}
 	if _, ok := params["value"].(map[string]any); !ok {
 		t.Fatalf("TUI console reinterpreted plain CLI JSON parameter: %#v", params["value"])
+	}
+	typedParams, err := decodeParams(prettyJSON(domain.Properties{"date": date, "nested": []any{dateTime, cypherDuration}}))
+	if err != nil {
+		t.Fatalf("typed decodeParams() error = %v", err)
+	}
+	if _, ok := typedParams["date"].(temporal.Date); !ok {
+		t.Fatalf("typed date parameter = %#v", typedParams["date"])
+	}
+	for _, test := range []struct {
+		value any
+		want  string
+	}{
+		{date, "date(1984-10-11)"}, {localTime, "localtime(12:31:14.645876123)"},
+		{offsetTime, "time(12:31:14.645876123+01:00)"},
+		{localDateTime, "localdatetime(1984-10-11T12:31:14.645876123)"},
+		{dateTime, "datetime(1984-10-11T12:31:14.645876123+01:00[Europe/Stockholm])"},
+		{cypherDuration, "duration(P-7M14DT-3.5S)"},
+	} {
+		if got := queryCell(test.value); got != test.want {
+			t.Errorf("queryCell(%T) = %q, want %q", test.value, got, test.want)
+		}
 	}
 }
 

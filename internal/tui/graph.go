@@ -1,15 +1,12 @@
 package tui
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"math"
-	"reflect"
 	"sort"
 	"strings"
-	"time"
 
+	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/domain"
 )
 
@@ -200,7 +197,7 @@ func edgeSearchValue(edge domain.Edge, graph graphState) string {
 }
 
 func stableJSON(value any) string {
-	encoded, err := json.Marshal(jsonSafeValue(value))
+	encoded, err := json.Marshal(app.JSONValue(value))
 	if err != nil {
 		return fmt.Sprint(value)
 	}
@@ -208,100 +205,9 @@ func stableJSON(value any) string {
 }
 
 func prettyJSON(value any) string {
-	encoded, err := json.MarshalIndent(jsonSafeValue(value), "", "  ")
+	encoded, err := json.MarshalIndent(app.JSONValue(value), "", "  ")
 	if err != nil {
 		return fmt.Sprint(value)
 	}
 	return string(encoded)
-}
-
-// jsonSafeValue mirrors the CLI's unambiguous tagged representation for IEEE
-// non-finite values while recursively preserving ordinary JSON encodings for
-// graph entities, temporal values, durations, bytes, lists, and maps. Query
-// rows and editable property objects must not degrade to fmt's Go syntax just
-// because one deeply nested float is NaN or infinite.
-func jsonSafeValue(value any) any {
-	switch value := value.(type) {
-	case nil, bool, string, json.Number, time.Time:
-		return value
-	case time.Duration:
-		return int64(value)
-	case float64:
-		return safeFloat(value)
-	case float32:
-		return safeFloat(float64(value))
-	case []byte:
-		return base64.StdEncoding.EncodeToString(value)
-	}
-	return jsonSafeReflect(reflect.ValueOf(value))
-}
-
-func safeFloat(value float64) any {
-	switch {
-	case math.IsNaN(value):
-		return map[string]any{"$float": "NaN"}
-	case math.IsInf(value, 1):
-		return map[string]any{"$float": "+Infinity"}
-	case math.IsInf(value, -1):
-		return map[string]any{"$float": "-Infinity"}
-	default:
-		return value
-	}
-}
-
-func jsonSafeReflect(value reflect.Value) any {
-	if !value.IsValid() {
-		return nil
-	}
-	for value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer {
-		if value.IsNil() {
-			return nil
-		}
-		value = value.Elem()
-	}
-	switch value.Kind() {
-	case reflect.Map:
-		if value.Type().Key().Kind() != reflect.String {
-			return fmt.Sprint(value.Interface())
-		}
-		result := make(map[string]any, value.Len())
-		iterator := value.MapRange()
-		for iterator.Next() {
-			result[iterator.Key().String()] = jsonSafeValue(iterator.Value().Interface())
-		}
-		return result
-	case reflect.Slice, reflect.Array:
-		result := make([]any, value.Len())
-		for index := range result {
-			result[index] = jsonSafeValue(value.Index(index).Interface())
-		}
-		return result
-	case reflect.Struct:
-		result := make(map[string]any)
-		typeInfo := value.Type()
-		for index := 0; index < value.NumField(); index++ {
-			fieldInfo := typeInfo.Field(index)
-			if fieldInfo.PkgPath != "" {
-				continue
-			}
-			tag := fieldInfo.Tag.Get("json")
-			name, options, _ := strings.Cut(tag, ",")
-			if name == "-" {
-				continue
-			}
-			if name == "" {
-				name = fieldInfo.Name
-			}
-			field := value.Field(index)
-			if strings.Contains(options, "omitempty") && field.IsZero() {
-				continue
-			}
-			result[name] = jsonSafeValue(field.Interface())
-		}
-		return result
-	case reflect.Invalid, reflect.Chan, reflect.Func, reflect.UnsafePointer:
-		return fmt.Sprint(value.Interface())
-	default:
-		return value.Interface()
-	}
 }
