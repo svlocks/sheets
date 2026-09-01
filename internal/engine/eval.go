@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	mathrand "math/rand/v2"
 	"reflect"
 	"regexp"
 	"sort"
@@ -1133,7 +1134,7 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 			return nil, err
 		}
 		return convertValue(expression, name, arguments[0])
-	case "tolower", "lower", "toupper", "upper", "trim", "ltrim", "rtrim", "reverse":
+	case "tolower", "lower", "toupper", "upper", "trim", "ltrim", "rtrim":
 		if err := require(1); err != nil {
 			return nil, err
 		}
@@ -1156,8 +1157,26 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 		case "rtrim":
 			return strings.TrimRightFunc(text, func(r rune) bool { return r == ' ' || r == '\t' || r == '\r' || r == '\n' }), nil
 		default:
+			return nil, evalError(expression, "unknown string function %s", name)
+		}
+	case "reverse":
+		if err := require(1); err != nil {
+			return nil, err
+		}
+		if arguments[0] == nil {
+			return nil, nil
+		}
+		if text, ok := arguments[0].(string); ok {
 			return reverseString(text), nil
 		}
+		if items, ok := asList(arguments[0]); ok {
+			result := append([]any(nil), items...)
+			for left, right := 0, len(result)-1; left < right; left, right = left+1, right-1 {
+				result[left], result[right] = result[right], result[left]
+			}
+			return result, nil
+		}
+		return nil, evalError(expression, "reverse expects a string or list")
 	case "replace":
 		if len(arguments) != 3 {
 			return nil, evalError(expression, "replace expects 3 arguments")
@@ -1169,10 +1188,35 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 			return nil, evalError(expression, "replace expects strings")
 		}
 		return strings.ReplaceAll(text, old, newValue), nil
+	case "split":
+		if len(arguments) != 2 {
+			return nil, evalError(expression, "split expects 2 arguments")
+		}
+		if arguments[0] == nil || arguments[1] == nil {
+			return nil, nil
+		}
+		text, textOK := arguments[0].(string)
+		separator, separatorOK := arguments[1].(string)
+		if !textOK || !separatorOK {
+			return nil, evalError(expression, "split expects strings")
+		}
+		parts := strings.Split(text, separator)
+		result := make([]any, len(parts))
+		for index := range parts {
+			result[index] = parts[index]
+		}
+		return result, nil
 	case "substring":
 		return substring(expression, arguments)
 	case "range":
 		return integerRange(expression, arguments)
+	case "abs", "ceil", "sqrt", "sign":
+		return numericFunction(expression, name, arguments)
+	case "rand":
+		if err := require(0); err != nil {
+			return nil, err
+		}
+		return mathrand.Float64(), nil
 	case "timestamp":
 		if err := require(0); err != nil {
 			return nil, err
@@ -1226,6 +1270,50 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 		return randomUUID()
 	default:
 		return nil, evalError(expression, "unknown function %s", expression.Name.String())
+	}
+}
+
+func numericFunction(expression cypher.Expression, name string, arguments []any) (any, error) {
+	if len(arguments) != 1 {
+		return nil, evalError(expression, "%s expects 1 argument", name)
+	}
+	if arguments[0] == nil {
+		return nil, nil
+	}
+	value, integerValue, ok := number(arguments[0])
+	if !ok {
+		return nil, evalError(expression, "%s expects a number", name)
+	}
+	switch name {
+	case "abs":
+		if integerValue {
+			exact, _ := integer(arguments[0])
+			if exact == math.MinInt64 {
+				return nil, evalError(expression, "abs result is out of integer range")
+			}
+			if exact < 0 {
+				exact = -exact
+			}
+			return exact, nil
+		}
+		return math.Abs(value), nil
+	case "ceil":
+		return math.Ceil(value), nil
+	case "sqrt":
+		return math.Sqrt(value), nil
+	case "sign":
+		switch {
+		case math.IsNaN(value):
+			return int64(0), nil
+		case value < 0:
+			return int64(-1), nil
+		case value > 0:
+			return int64(1), nil
+		default:
+			return int64(0), nil
+		}
+	default:
+		return nil, evalError(expression, "unknown numeric function %s", name)
 	}
 }
 

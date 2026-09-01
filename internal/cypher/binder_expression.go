@@ -565,7 +565,7 @@ func supportedFunction(name string) bool {
 		"reverse", "replace", "substring", "range", "timestamp", "datetime", "localdatetime", "date", "time", "localtime",
 		"duration", "datetime.fromepoch", "datetime.fromepochmillis", "date.truncate", "datetime.truncate",
 		"localdatetime.truncate", "time.truncate", "localtime.truncate", "duration.between", "duration.inmonths",
-		"duration.indays", "duration.inseconds", "randomuuid":
+		"duration.indays", "duration.inseconds", "randomuuid", "abs", "ceil", "sqrt", "sign", "split", "rand":
 		return true
 	default:
 		return false

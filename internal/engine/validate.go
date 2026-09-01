@@ -1189,9 +1189,13 @@ func validatePatternPlacement(expression cypher.Expression, allowed bool) error 
 func validateAggregateShape(expression cypher.Expression, insideAggregate bool) error {
 	switch expression := expression.(type) {
 	case *cypher.FunctionInvocation:
-		aggregate := isAggregate(strings.ToLower(expression.Name.String()))
+		name := strings.ToLower(expression.Name.String())
+		aggregate := isAggregate(name)
 		if aggregate && insideAggregate {
 			return semanticError(expression, "aggregate functions cannot be nested")
+		}
+		if insideAggregate && name == "rand" {
+			return semanticError(expression, "non-constant function rand is not allowed inside an aggregate")
 		}
 		for _, argument := range expression.Arguments {
 			if err := validateAggregateShape(argument, insideAggregate || aggregate); err != nil {
@@ -1421,7 +1425,7 @@ func expressionKind(expression cypher.Expression, scope variableScope) variableK
 
 func functionResultKind(name string) variableKind {
 	switch name {
-	case "labels", "keys", "nodes", "relationships", "range", "collect":
+	case "labels", "keys", "nodes", "relationships", "range", "collect", "split":
 		return variableList
 	case "properties":
 		return variableMap
@@ -1429,9 +1433,9 @@ func functionResultKind(name string) variableKind {
 		return variableString
 	case "toboolean", "tobooleanornull", "exists":
 		return variableBoolean
-	case "tointeger", "tointegerornull", "size", "length", "id", "count":
+	case "tointeger", "tointegerornull", "size", "length", "id", "count", "sign":
 		return variableInteger
-	case "tofloat", "tofloatornull", "avg", "stdev", "stdevp":
+	case "tofloat", "tofloatornull", "avg", "stdev", "stdevp", "ceil", "sqrt", "rand":
 		return variableFloat
 	}
 	return variableUnknown

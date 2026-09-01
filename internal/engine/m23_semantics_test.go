@@ -139,3 +139,64 @@ RETURN sum(i)`, nil)
 		t.Fatalf("bounded UNWIND sum = %#v, want 3", got)
 	}
 }
+
+func TestM23CommonScalarFunctions(t *testing.T) {
+	executor, _ := testEngine(t)
+	result := execute(t, executor, `
+RETURN split('a😀b', '😀') AS parts,
+	   reverse([1, 2, 3]) AS reversedList,
+	   abs(-3) AS integerAbs,
+       abs(-3.5) AS floatAbs,
+       ceil(1.2) AS ceiling,
+       sqrt(12.96) AS squareRoot,
+       sign(-0.5) AS negativeSign,
+       sign(0) AS zeroSign,
+       sign(3) AS positiveSign`, nil)
+	want := []any{
+		[]any{"a", "b"}, []any{int64(3), int64(2), int64(1)}, int64(3), 3.5, 2.0, 3.6,
+		int64(-1), int64(0), int64(1),
+	}
+	if got := result.Results[0].Rows[0]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("scalar functions = %#v, want %#v", got, want)
+	}
+
+	result = execute(t, executor, `
+RETURN split(null, ',') AS splitValue,
+       abs(null) AS absValue,
+       ceil(null) AS ceilValue,
+       sqrt(null) AS sqrtValue,
+       sign(null) AS signValue`, nil)
+	if got, want := result.Results[0].Rows[0], []any{nil, nil, nil, nil, nil}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("null scalar functions = %#v, want %#v", got, want)
+	}
+
+	result = execute(t, executor, "UNWIND range(1, 64) AS i RETURN rand() AS value", nil)
+	seen := make(map[float64]struct{}, len(result.Results[0].Rows))
+	for _, values := range result.Results[0].Rows {
+		value, ok := values[0].(float64)
+		if !ok || value < 0 || value >= 1 {
+			t.Fatalf("rand() value = %#v", values[0])
+		}
+		seen[value] = struct{}{}
+	}
+	if len(seen) < 2 {
+		t.Fatalf("rand() did not vary across rows: %#v", seen)
+	}
+}
+
+func TestM23ScalarFunctionErrors(t *testing.T) {
+	executor, _ := testEngine(t)
+	for _, test := range []struct {
+		query string
+		want  string
+	}{
+		{"RETURN abs(-9223372036854775808)", "out of integer range"},
+		{"RETURN split(1, ',')", "split expects strings"},
+		{"RETURN count(rand())", "non-constant"},
+	} {
+		_, err := executor.Execute(context.Background(), app.ExecuteRequest{Query: test.query})
+		if err == nil || !strings.Contains(err.Error(), test.want) {
+			t.Fatalf("error for %q = %v, want %q", test.query, err, test.want)
+		}
+	}
+}

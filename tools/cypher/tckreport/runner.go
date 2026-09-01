@@ -663,7 +663,7 @@ func matchExpectedError(expectation string, actual error) (matched, supported bo
 		"InvalidClauseComposition":        {"cannot mix union"},
 		"NoVariablesInScope":              {"requires at least one variable"},
 		"NestedAggregation":               {"cannot be nested"},
-		"NonConstantExpression":           {"is not defined"},
+		"NonConstantExpression":           {"is not defined", "non-constant"},
 		"MapElementAccessByNonString":     {"map index must be a string"},
 		"MergeReadOwnWrites":              {"merge cannot use null property"},
 		"DeletedEntityAccess":             {"deleted entity"},

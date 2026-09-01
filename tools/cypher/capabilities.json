@@ -29,8 +29,8 @@
     },
     {
       "id": "expressions/mathematical/Mathematical11.feature::[1] Absolute function",
-      "expected": "typed_unsupported",
-      "test": "internal/cypher:TestTCKCapabilityCases/unsupported_function"
+      "expected": "bound",
+      "test": "internal/engine:TestM23CommonScalarFunctions"
     },
     {
       "id": "clauses/call/Call2.feature::[1] In-query call to procedure with explicit arguments",

@@ -28,7 +28,7 @@ func TestTCKCapabilityCases(t *testing.T) {
 		},
 		{
 			name:        "unsupported_function",
-			query:       "RETURN abs(-1)",
+			query:       "RETURN foo(-1)",
 			unsupported: "function invocation",
 		},
 		{
