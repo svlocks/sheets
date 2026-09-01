@@ -174,6 +174,68 @@ func TestRenderJSONLExactRecords(t *testing.T) {
 	}
 }
 
+func TestJSONLStreamMatchesBatchEnvelope(t *testing.T) {
+	page := domain.PageInfo{Next: "opaque"}
+	batch := app.BatchResult{Results: []app.Result{
+		{
+			Columns: []string{"value"},
+			Rows:    [][]any{{int64(1)}, {math.Inf(1)}},
+			Page:    &page,
+		},
+		{
+			Columns: []string{"empty"},
+			Summary: app.Summary{NodesCreated: 1},
+		},
+	}}
+	var want bytes.Buffer
+	if err := Render(&want, "jsonl", batch); err != nil {
+		t.Fatal(err)
+	}
+	var got bytes.Buffer
+	stream, err := newJSONLStream(&got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for statement, result := range batch.Results {
+		if err := stream.Emit(app.ResultEvent{Kind: app.ResultStart, Statement: statement, Columns: result.Columns}); err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range result.Rows {
+			if err := stream.Emit(app.ResultEvent{Kind: app.ResultRow, Statement: statement, Values: row}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := stream.Emit(app.ResultEvent{Kind: app.ResultEnd, Statement: statement, Summary: result.Summary, Page: result.Page}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := stream.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got.String() != want.String() {
+		t.Fatalf("streamed JSONL =\n%swant =\n%s", got.String(), want.String())
+	}
+}
+
+func TestJSONLStreamRejectsInvalidEventOrder(t *testing.T) {
+	stream, err := newJSONLStream(io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Emit(app.ResultEvent{Kind: app.ResultRow}); err == nil {
+		t.Fatal("row before start succeeded")
+	}
+	if err := stream.Emit(app.ResultEvent{Kind: app.ResultStart}); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Emit(app.ResultEvent{Kind: app.ResultStart}); err == nil {
+		t.Fatal("nested start succeeded")
+	}
+	if err := stream.Emit(app.ResultEvent{Kind: app.ResultEnd, Statement: 1}); err == nil {
+		t.Fatal("mismatched end succeeded")
+	}
+}
+
 func TestRenderTableExactAndSafeValues(t *testing.T) {
 	revision := domain.Revision(3)
 	node := domain.Node{ID: "n1", Labels: []string{"Task"}, Body: "line\nnext"}

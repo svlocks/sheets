@@ -3,6 +3,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -35,6 +36,54 @@ func (r ExecuteRequest) Validate() error {
 // Executor is the complete graph-language boundary used by frontends.
 type Executor interface {
 	Execute(context.Context, ExecuteRequest) (BatchResult, error)
+}
+
+// ErrStreamingMutation reports that a request cannot be delivered as rows
+// while preserving the all-or-nothing visibility of a graph mutation. Callers
+// may retry the request through Executor, which publishes results only after
+// the write transaction commits.
+var ErrStreamingMutation = errors.New("mutating requests cannot stream results")
+
+// ResultEventKind identifies one event in a streamed Cypher result. A result
+// always starts with ResultStart, contains zero or more ResultRow events, and
+// finishes with ResultEnd before the next statement begins.
+type ResultEventKind string
+
+const (
+	ResultStart ResultEventKind = "result_start"
+	ResultRow   ResultEventKind = "result_row"
+	ResultEnd   ResultEventKind = "result_end"
+)
+
+// ResultEvent is the bounded read-result boundary used by streaming
+// frontends. Statement indexes are zero-based. Columns is populated on
+// ResultStart, Values on ResultRow, and Summary/Page on ResultEnd.
+//
+// Values are detached from engine-owned graph state and remain valid after the
+// emitter returns. Emitters are invoked synchronously: returning blocks query
+// execution, which provides natural backpressure. If execution fails after
+// rows were emitted, the caller retains that valid event prefix but will not
+// receive ResultEnd for the interrupted statement.
+type ResultEvent struct {
+	Kind      ResultEventKind
+	Statement int
+	Columns   []string
+	Values    []any
+	Summary   Summary
+	Page      *domain.PageInfo
+}
+
+// ResultEmitter consumes one result event. Returning an error aborts execution
+// immediately; implementations should preserve writer and cancellation error
+// causes so errors.Is remains useful to the caller.
+type ResultEmitter func(ResultEvent) error
+
+// StreamExecutor incrementally delivers read results without retaining the
+// complete output table. Blocking Cypher operators such as ORDER BY, DISTINCT,
+// and aggregation may still retain their bounded working set before the first
+// row is emitted. Mutations return ErrStreamingMutation before execution.
+type StreamExecutor interface {
+	ExecuteStream(context.Context, ExecuteRequest, ResultEmitter) error
 }
 
 // RevisionPager is the bounded revision-history read boundary shared by

@@ -165,10 +165,27 @@ func (e *commandEnvironment) queryCommand(readOnly bool) *cobra.Command {
 				return err
 			}
 			defer func() { runErr = errors.Join(runErr, database.Close()) }()
-			batch, err := executor.Execute(command.Context(), app.ExecuteRequest{
+			request := app.ExecuteRequest{
 				Query: query, Params: params, Snapshot: snapshot, ReadOnly: readOnly,
 				Actor: flags.actor, Message: flags.message,
-			})
+			}
+			if format == FormatJSONL {
+				stream, streamErr := newJSONLStream(command.OutOrStdout())
+				if streamErr != nil {
+					return streamErr
+				}
+				streamErr = executor.ExecuteStream(command.Context(), request, stream.Emit)
+				flushErr := stream.Flush()
+				if !errors.Is(streamErr, app.ErrStreamingMutation) {
+					return errors.Join(streamErr, flushErr)
+				}
+				// Mutations retain execute-then-render semantics so no result is
+				// visible until the transaction commits successfully.
+				if flushErr != nil {
+					return flushErr
+				}
+			}
+			batch, err := executor.Execute(command.Context(), request)
 			if err != nil {
 				return err
 			}

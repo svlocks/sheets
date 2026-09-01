@@ -214,6 +214,107 @@ type jsonlPage struct {
 	Page      domain.PageInfo `json:"page"`
 }
 
+// jsonlStream converts the engine's synchronous event protocol to the same
+// stable records produced by renderJSONL. It retains only the active result's
+// columns and row count; row values are encoded before Emit returns.
+type jsonlStream struct {
+	writer    *bufio.Writer
+	active    bool
+	statement int
+	columns   []string
+	rows      int
+}
+
+func newJSONLStream(w io.Writer) (*jsonlStream, error) {
+	if w == nil {
+		return nil, errors.New("render output writer is nil")
+	}
+	return &jsonlStream{writer: bufio.NewWriterSize(w, 64<<10)}, nil
+}
+
+func (s *jsonlStream) Emit(event app.ResultEvent) error {
+	switch event.Kind {
+	case app.ResultStart:
+		if s.active {
+			return errors.New("JSONL result started before the previous result ended")
+		}
+		if event.Statement < 0 {
+			return errors.New("JSONL result has a negative statement index")
+		}
+		s.active = true
+		s.statement = event.Statement
+		s.columns = append(s.columns[:0], event.Columns...)
+		s.rows = 0
+		return nil
+	case app.ResultRow:
+		if err := s.expectActive(event.Statement, "row"); err != nil {
+			return err
+		}
+		values := make([]any, len(event.Values))
+		for index, value := range event.Values {
+			values[index] = jsonValue(value)
+		}
+		if err := writeJSONLine(s.writer, jsonlRow{
+			Type: "row", Statement: event.Statement, Columns: s.columns, Values: values,
+		}); err != nil {
+			return err
+		}
+		s.rows++
+		return nil
+	case app.ResultEnd:
+		if err := s.expectActive(event.Statement, "end"); err != nil {
+			return err
+		}
+		if s.rows == 0 {
+			if err := writeJSONLine(s.writer, jsonlResult{
+				Type: "result", Statement: event.Statement, Columns: s.columns,
+			}); err != nil {
+				return err
+			}
+		}
+		if event.Summary.Changed() {
+			if err := writeJSONLine(s.writer, jsonlSummary{
+				Type: "summary", Statement: event.Statement, Summary: event.Summary,
+			}); err != nil {
+				return err
+			}
+		}
+		if event.Page != nil && event.Page.Next != "" {
+			if err := writeJSONLine(s.writer, jsonlPage{
+				Type: "page", Statement: event.Statement, Page: *event.Page,
+			}); err != nil {
+				return err
+			}
+		}
+		s.active = false
+		s.columns = s.columns[:0]
+		s.rows = 0
+		return nil
+	default:
+		return fmt.Errorf("unknown result event kind %q", event.Kind)
+	}
+}
+
+func (s *jsonlStream) expectActive(statement int, event string) error {
+	if !s.active {
+		return fmt.Errorf("JSONL result %s arrived before start", event)
+	}
+	if statement != s.statement {
+		return fmt.Errorf("JSONL result %s is for statement %d, want %d", event, statement, s.statement)
+	}
+	return nil
+}
+
+func (s *jsonlStream) Flush() error {
+	if s == nil || s.writer == nil {
+		return errors.New("JSONL stream is nil")
+	}
+	if err := s.writer.Flush(); err != nil {
+		return fmt.Errorf("write JSONL output: %w", err)
+	}
+	return nil
+}
+
 func renderJSONL(w io.Writer, batch app.BatchResult) error {
 	for statement, result := range batch.Results {
 		columns := result.Columns

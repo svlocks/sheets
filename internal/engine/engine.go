@@ -23,6 +23,9 @@ type Engine struct {
 	plan    physicalPlan
 }
 
+var _ app.Executor = (*Engine)(nil)
+var _ app.StreamExecutor = (*Engine)(nil)
+
 // New creates a graph execution engine. The caller retains ownership of the
 // store and must close it when the application is finished.
 func New(source *store.Store) (*Engine, error) {
@@ -35,29 +38,9 @@ func New(source *store.Store) (*Engine, error) {
 // Execute implements app.Executor. A request containing any mutation runs all
 // of its statements in one Store.Write callback and therefore one revision.
 func (e *Engine) Execute(ctx context.Context, request app.ExecuteRequest) (app.BatchResult, error) {
-	if err := request.Validate(); err != nil {
-		return app.BatchResult{}, err
-	}
-	document, err := cypher.Parse(request.Query)
+	document, mutates, err := prepareRequest(ctx, request)
 	if err != nil {
 		return app.BatchResult{}, err
-	}
-	if len(document.Statements) == 0 {
-		return app.BatchResult{}, errors.New("query has no statements")
-	}
-	if err := validateDocumentSemantics(document); err != nil {
-		return app.BatchResult{}, err
-	}
-
-	mutates := false
-	for _, statement := range document.Statements {
-		mutates = mutates || statementMutates(statement)
-	}
-	if request.ReadOnly && mutates {
-		return app.BatchResult{}, domain.ErrReadOnly
-	}
-	if !request.Snapshot.IsCurrent() && mutates {
-		return app.BatchResult{}, domain.ErrHistoricalWrite
 	}
 
 	if !mutates {
@@ -100,6 +83,39 @@ func (e *Engine) Execute(ctx context.Context, request app.ExecuteRequest) (app.B
 		e.storeCache(committedGraph)
 	}
 	return batch, nil
+}
+
+func prepareRequest(ctx context.Context, request app.ExecuteRequest) (*cypher.Document, bool, error) {
+	if ctx == nil {
+		return nil, false, errors.New("execute query: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if err := request.Validate(); err != nil {
+		return nil, false, err
+	}
+	document, err := cypher.Parse(request.Query)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(document.Statements) == 0 {
+		return nil, false, errors.New("query has no statements")
+	}
+	if err := validateDocumentSemantics(document); err != nil {
+		return nil, false, err
+	}
+	mutates := false
+	for _, statement := range document.Statements {
+		mutates = mutates || statementMutates(statement)
+	}
+	if request.ReadOnly && mutates {
+		return nil, false, domain.ErrReadOnly
+	}
+	if !request.Snapshot.IsCurrent() && mutates {
+		return nil, false, domain.ErrHistoricalWrite
+	}
+	return document, mutates, nil
 }
 
 func executeDocument(

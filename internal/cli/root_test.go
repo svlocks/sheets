@@ -116,6 +116,38 @@ func TestExecAndQueryJSON(t *testing.T) {
 	}
 }
 
+func TestQueryJSONLStreamsAndExecJSONLPreservesAtomicRevision(t *testing.T) {
+	root := initializeProject(t)
+	created, _, err := runCommand(t, "", "-C", root, "exec", "--output", "jsonl",
+		"CREATE (:Task {title:'created'}) RETURN 1 AS value")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range []string{`"type":"row"`, `"type":"summary"`, `"type":"revision"`} {
+		if !strings.Contains(created, record) {
+			t.Fatalf("atomic exec JSONL lacks %s: %s", record, created)
+		}
+	}
+
+	streamed, _, err := runCommand(t, "", "-C", root, "query", "--output", "jsonl",
+		"UNWIND range(1, 3) AS value RETURN value")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(streamed, `"type":"row"`); got != 3 {
+		t.Fatalf("streamed row records = %d, want 3: %s", got, streamed)
+	}
+
+	partial, _, err := runCommand(t, "", "-C", root, "query", "--output", "jsonl",
+		"UNWIND [1, 'bad'] AS value RETURN value + 1 AS result")
+	if err == nil {
+		t.Fatal("runtime-error JSONL query succeeded")
+	}
+	if got := strings.Count(partial, `"type":"row"`); got != 1 {
+		t.Fatalf("runtime-error JSONL valid prefix has %d rows, want 1: %s (error %v)", got, partial, err)
+	}
+}
+
 func TestExecFileIsOneAtomicRevision(t *testing.T) {
 	root := initializeProject(t)
 	file := filepath.Join(t.TempDir(), "batch.cypher")

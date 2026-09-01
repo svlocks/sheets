@@ -26,9 +26,13 @@ type queryExecution struct {
 	source    string
 	graph     *memoryGraph
 	evaluator evaluator
-	summary   app.Summary
-	lastRows  []row
-	revisions revisionLister
+	output    *queryResultEmitter
+	// clauseDepth prevents terminal projections inside EXISTS and CALL
+	// subqueries from publishing into the top-level result stream.
+	clauseDepth int
+	summary     app.Summary
+	lastRows    []row
+	revisions   revisionLister
 }
 
 const defaultQueryRows int64 = 100_000
@@ -66,8 +70,27 @@ func executeQuery(
 	listRevisions revisionLister,
 	clock queryClock,
 ) (app.Result, error) {
+	return executeQueryWithEmitter(ctx, source, query, graph, params, listRevisions, clock, nil)
+}
+
+func executeQueryWithEmitter(
+	ctx context.Context,
+	source string,
+	query *cypher.QueryStatement,
+	graph *memoryGraph,
+	params map[string]any,
+	listRevisions revisionLister,
+	clock queryClock,
+	output *queryResultEmitter,
+) (app.Result, error) {
 	execution := &queryExecution{
 		ctx: ctx, source: source, graph: graph, evaluator: newEvaluatorWithClock(params, clock), revisions: listRevisions,
+	}
+	// UNION must validate column compatibility and may need whole-result
+	// deduplication before it can publish any rows. Keep that bounded blocking
+	// path materialized rather than exposing an incorrectly ordered stream.
+	if len(query.UnionBranches) == 0 {
+		execution.output = output
 	}
 	execution.evaluator.ctx = ctx
 	execution.evaluator.paths = &pathExpansionBudget{limit: maxPathExpansions}
@@ -105,6 +128,8 @@ func executeQuery(
 }
 
 func (e *queryExecution) clauses(clauses []cypher.Clause, rows []row) (app.Result, error) {
+	e.clauseDepth++
+	defer func() { e.clauseDepth-- }()
 	result := app.Result{}
 	known := scopeFromRows(rows)
 	for clauseIndex, clause := range clauses {
@@ -127,7 +152,8 @@ func (e *queryExecution) clauses(clauses []cypher.Clause, rows []row) (app.Resul
 			known[clause.Alias.Name] = variableUnknown
 		case *cypher.ProjectionClause:
 			inputKnown := known
-			rows, result, err = e.project(rows, clause, known)
+			stream := e.clauseDepth == 1 && clauseIndex == len(clauses)-1
+			rows, result, err = e.project(rows, clause, known, stream)
 			if clause.With {
 				known = projectionOutputScope(e.source, clause.Items, inputKnown, rows)
 			} else {
@@ -293,7 +319,63 @@ func (e *queryExecution) safeImmediateProjectionLimit(clause cypher.Clause) (int
 	return limit, nil
 }
 
-func (e *queryExecution) project(input []row, clause *cypher.ProjectionClause, known variableScope) ([]row, app.Result, error) {
+func (e *queryExecution) project(input []row, clause *cypher.ProjectionClause, known variableScope, stream bool) ([]row, app.Result, error) {
+	if stream && e.output != nil && !clause.With {
+		return e.projectStream(input, clause, known)
+	}
+	return e.projectMaterialized(input, clause, known)
+}
+
+func (e *queryExecution) projectStream(input []row, clause *cypher.ProjectionClause, known variableScope) ([]row, app.Result, error) {
+	columns := projectionColumns(e.source, clause.Items, input, known)
+	// This is the common non-blocking RETURN pipeline. Deliver each detached row
+	// before constructing the next one. SKIP and LIMIT deliberately remain on
+	// the materialized path: the established evaluator projects every input row
+	// before evaluating its pagination expressions, including errors and
+	// volatile functions on rows outside the returned window.
+	if !projectionAggregates(clause.Items) && clause.Where == nil && !clause.Distinct &&
+		len(clause.OrderBy) == 0 && clause.Skip == nil && clause.Limit == nil {
+		if err := e.output.start(columns); err != nil {
+			return nil, app.Result{}, err
+		}
+		for _, source := range input {
+			if err := e.ctx.Err(); err != nil {
+				return nil, app.Result{}, err
+			}
+			if err := e.evaluator.rows.take(e.ctx, 1); err != nil {
+				return nil, app.Result{}, err
+			}
+			values, err := evaluateProjectionValues(e.evaluator, source, clause.Items, columns)
+			if err != nil {
+				return nil, app.Result{}, err
+			}
+			if err := e.output.row(values); err != nil {
+				return nil, app.Result{}, err
+			}
+		}
+		return nil, app.Result{Columns: columns}, nil
+	}
+
+	// ORDER BY, DISTINCT, aggregation, and projection filtering are blocking
+	// operators by definition. Reuse the conformance-tested bounded evaluator,
+	// then release each output row as the sink accepts it.
+	_, result, err := e.projectMaterialized(input, clause, known)
+	if err != nil {
+		return nil, app.Result{}, err
+	}
+	if err := e.output.start(result.Columns); err != nil {
+		return nil, app.Result{}, err
+	}
+	for _, values := range result.Rows {
+		if err := e.output.row(values); err != nil {
+			return nil, app.Result{}, err
+		}
+	}
+	result.Rows = nil
+	return nil, result, nil
+}
+
+func (e *queryExecution) projectMaterialized(input []row, clause *cypher.ProjectionClause, known variableScope) ([]row, app.Result, error) {
 	columns := projectionColumns(e.source, clause.Items, input, known)
 	var projected []row
 	var tableRows [][]any
@@ -514,12 +596,22 @@ func projectionOutputScope(source string, items []cypher.ProjectionItem, input v
 }
 
 func evaluateProjection(evaluator evaluator, source row, items []cypher.ProjectionItem, columns []string) ([]any, row, error) {
-	values := make([]any, 0, len(columns))
+	values, err := evaluateProjectionValues(evaluator, source, items, columns)
+	if err != nil {
+		return nil, nil, err
+	}
 	mapped := make(row, len(columns))
-	columnIndex := 0
+	for index, name := range columns {
+		mapped[name] = values[index]
+	}
+	return values, mapped, nil
+}
+
+func evaluateProjectionValues(evaluator evaluator, source row, items []cypher.ProjectionItem, columns []string) ([]any, error) {
+	values := make([]any, 0, len(columns))
 	for _, item := range items {
 		if err := evaluator.ctx.Err(); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		if item.Star {
 			starNames := make([]string, 0, len(source))
@@ -531,21 +623,16 @@ func evaluateProjection(evaluator evaluator, source row, items []cypher.Projecti
 			sort.Strings(starNames)
 			for _, name := range starNames {
 				values = append(values, source[name])
-				mapped[name] = source[name]
-				columnIndex++
 			}
 			continue
 		}
 		value, err := evaluator.expression(item.Expression, source)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		name := columns[columnIndex]
 		values = append(values, value)
-		mapped[name] = value
-		columnIndex++
 	}
-	return values, mapped, nil
+	return values, nil
 }
 
 func (e *queryExecution) groupRows(input []row, items []cypher.ProjectionItem) ([][]row, error) {

@@ -287,6 +287,28 @@ func BenchmarkQueryGraphFreeScalar10K(b *testing.B) {
 	}
 }
 
+func BenchmarkReadResult10K(b *testing.B) {
+	executor := benchmarkEngine(b, 0)
+	request := app.ExecuteRequest{Query: "UNWIND range(1, 10000) AS value RETURN value, value * value AS square", ReadOnly: true}
+	b.Run("materialized", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			if _, err := executor.Execute(context.Background(), request); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("streamed", func(b *testing.B) {
+		emit := func(app.ResultEvent) error { return nil }
+		b.ReportAllocs()
+		for range b.N {
+			if err := executor.ExecuteStream(context.Background(), request, emit); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 func BenchmarkQueryWarmHierarchyTraversal1K(b *testing.B) {
 	executor := benchmarkEngine(b, 1_000)
 	request := app.ExecuteRequest{
