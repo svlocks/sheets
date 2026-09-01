@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/svlocks/sheets/internal/domain"
+	"github.com/svlocks/sheets/internal/domain/temporal"
 )
 
 const (
@@ -143,6 +144,18 @@ func (s *encodeState) encodeValue(value any, depth int) (encodedValue, error) {
 		return encodedValue{Kind: "string", Text: v}, nil
 	case []byte:
 		return encodedValue{Kind: "bytes", Text: base64.StdEncoding.EncodeToString(v)}, nil
+	case temporal.Date:
+		return encodeTemporalBinary("date", v.MarshalBinary)
+	case temporal.LocalTime:
+		return encodeTemporalBinary("local_time", v.MarshalBinary)
+	case temporal.Time:
+		return encodeTemporalBinary("offset_time", v.MarshalBinary)
+	case temporal.LocalDateTime:
+		return encodeTemporalBinary("local_datetime", v.MarshalBinary)
+	case temporal.DateTime:
+		return encodeTemporalBinary("zoned_datetime", v.MarshalBinary)
+	case temporal.Duration:
+		return encodeTemporalBinary("cypher_duration", v.MarshalBinary)
 	case time.Time:
 		_, offset := v.Zone()
 		location := v.Location().String()
@@ -261,6 +274,14 @@ func (s *encodeState) encodeValue(value any, depth int) (encodedValue, error) {
 	return encodedValue{}, fmt.Errorf("unsupported property value %T", value)
 }
 
+func encodeTemporalBinary(kind string, marshal func() ([]byte, error)) (encodedValue, error) {
+	data, err := marshal()
+	if err != nil {
+		return encodedValue{}, fmt.Errorf("encode %s: %w", kind, err)
+	}
+	return encodedValue{Kind: kind, Text: base64.StdEncoding.EncodeToString(data)}, nil
+}
+
 func integerValue(v int64) encodedValue {
 	return encodedValue{Kind: "int", Text: strconv.FormatInt(v, 10)}
 }
@@ -372,6 +393,18 @@ func (s *decodeState) decodeValue(v encodedValue, depth int) (any, error) {
 			return nil, fmt.Errorf("decode bytes: %w", err)
 		}
 		return data, nil
+	case "date":
+		return decodeTemporalBinary(v.Text, "date", func(data []byte) (any, error) { return temporal.DateFromBinary(data) })
+	case "local_time":
+		return decodeTemporalBinary(v.Text, "local_time", func(data []byte) (any, error) { return temporal.LocalTimeFromBinary(data) })
+	case "offset_time":
+		return decodeTemporalBinary(v.Text, "offset_time", func(data []byte) (any, error) { return temporal.TimeFromBinary(data) })
+	case "local_datetime":
+		return decodeTemporalBinary(v.Text, "local_datetime", func(data []byte) (any, error) { return temporal.LocalDateTimeFromBinary(data) })
+	case "zoned_datetime":
+		return decodeTemporalBinary(v.Text, "zoned_datetime", func(data []byte) (any, error) { return temporal.DateTimeFromBinary(data) })
+	case "cypher_duration":
+		return decodeTemporalBinary(v.Text, "cypher_duration", func(data []byte) (any, error) { return temporal.DurationFromBinary(data) })
 	case "time":
 		data, err := base64.StdEncoding.DecodeString(v.Text)
 		if err != nil {
@@ -442,6 +475,18 @@ func (s *decodeState) decodeValue(v encodedValue, depth int) (any, error) {
 	}
 }
 
+func decodeTemporalBinary(text, kind string, decode func([]byte) (any, error)) (any, error) {
+	data, err := base64.StdEncoding.DecodeString(text)
+	if err != nil {
+		return nil, fmt.Errorf("decode %s: %w", kind, err)
+	}
+	value, err := decode(data)
+	if err != nil {
+		return nil, fmt.Errorf("decode %s: %w", kind, err)
+	}
+	return value, nil
+}
+
 func validateEncodedShape(v encodedValue) error {
 	noBool := !v.Bool
 	noText := v.Text == ""
@@ -454,7 +499,8 @@ func validateEncodedShape(v encodedValue) error {
 		valid = noBool && noText && noZone && noItems && noMap
 	case "bool":
 		valid = noText && noZone && noItems && noMap
-	case "string", "bytes", "duration", "int", "float":
+	case "string", "bytes", "duration", "int", "float",
+		"date", "local_time", "offset_time", "local_datetime", "zoned_datetime", "cypher_duration":
 		valid = noBool && noZone && noItems && noMap
 	case "time":
 		valid = noBool && noItems && noMap

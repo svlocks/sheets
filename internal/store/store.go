@@ -25,18 +25,21 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 // This is the SHA-256 digest of the ordered, non-internal sqlite_schema rows
 // produced by the embedded migrations. It makes routine Open detect altered
 // trigger/index definitions without scanning graph data.
-const expectedSchemaFingerprint = "868d00a7ad6e6bd2564e6c20687e1fe24af149ad4bcc6b56be00f302f75ec69c"
+const expectedSchemaFingerprint = "ce220b74c7edd80aff1942223383af9bc3c43f580fbe1537a46fcbbaf3709b3a"
 
 //go:embed migrations/001_initial.sql
 var initialMigration string
 
 //go:embed migrations/002_harden_invariants.sql
 var invariantMigration string
+
+//go:embed migrations/003_temporal_values.sql
+var temporalMigration string
 
 // ErrClosed is returned when an operation is attempted on a closed Store.
 var ErrClosed = errors.New("store is closed")
@@ -236,7 +239,7 @@ func (s *Store) initialize(ctx context.Context) (err error) {
 	if version > schemaVersion {
 		return fmt.Errorf("database schema version %d is newer than supported version %d", version, schemaVersion)
 	}
-	migrations := []string{initialMigration, invariantMigration}
+	migrations := []string{initialMigration, invariantMigration, temporalMigration}
 	migrated := version < schemaVersion
 	for version < schemaVersion {
 		next := version + 1
