@@ -11,12 +11,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/domain"
 	"github.com/svlocks/sheets/internal/engine"
 	"github.com/svlocks/sheets/internal/project"
 	"github.com/svlocks/sheets/internal/store"
-	"github.com/spf13/cobra"
 )
 
 // TUIOptions contains terminal presentation settings owned by the CLI.

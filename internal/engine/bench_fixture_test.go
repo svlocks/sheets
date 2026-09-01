@@ -143,14 +143,14 @@ func TestFixtureRegimes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 	executor, err := New(database)
 	if err != nil {
 		t.Fatal(err)
 	}
 	queries := []struct {
-		name  string
-		query string
+		name   string
+		query  string
 		params map[string]any
 	}{
 		{"point", anchorQuery, map[string]any{"rank": int64(500_000)}},

@@ -5,8 +5,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/svlocks/sheets/skills"
 	"github.com/spf13/cobra"
+	"github.com/svlocks/sheets/skills"
 )
 
 // Agent-skill discovery directories. `.claude/skills` is read by Claude Code;

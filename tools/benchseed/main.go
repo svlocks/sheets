@@ -92,7 +92,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		if err := pprof.StartCPUProfile(f); err != nil {
 			log.Fatal(err)
 		}
@@ -117,7 +117,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	fmt.Printf("store opened in %.1fs\n", time.Since(openStart).Seconds())
 
 	r := rand.New(rand.NewPCG(*seed, 0))

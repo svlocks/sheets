@@ -13,13 +13,9 @@ no config files, no migrations to babysit.
 
 ## Install
 
-Go users:
-
 ```sh
 go install github.com/svlocks/sheets/cmd/sheets@latest
 ```
-
-No Go? Pull a static binary off the [releases page](https://github.com/svlocks/sheets/releases) and put it on your PATH.
 
 ## Quick start
 
