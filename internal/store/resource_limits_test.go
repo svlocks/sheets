@@ -80,7 +80,18 @@ func TestMakeDSNAnchorsRelativeFileURIButPreservesMemoryURI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if uri.Opaque != "" || filepath.Clean(filepath.FromSlash(uri.Path)) != filepath.Clean(expected) {
+	// The anchored URI is a Path on Unix and an Opaque drive-letter form on
+	// Windows; both must resolve to the same absolute filesystem path.
+	var actual string
+	if uri.Opaque != "" {
+		actual, err = url.PathUnescape(uri.Opaque)
+		if err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		actual = filepath.FromSlash(uri.Path)
+	}
+	if filepath.Clean(actual) != filepath.Clean(expected) {
 		t.Fatalf("relative file URI was not anchored: %s", dsn)
 	}
 
@@ -121,14 +132,14 @@ func TestMakeDSNAnchorsWindowsDriveWithoutAuthority(t *testing.T) {
 }
 
 func TestMakeDSNEncodesReservedCharacters(t *testing.T) {
-	// Reserved characters in a path must be percent-encoded so the DSN parses
-	// cleanly on every platform.
-	path := filepath.Join(t.TempDir(), "graph ?# %.db")
+	// '#' and '%' and a space are reserved in URIs but valid in filenames on
+	// every supported OS, and must be percent-encoded so the DSN parses.
+	path := filepath.Join(t.TempDir(), "graph # %.db")
 	dsn, err := makeDSN(path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(dsn, " ?# %") {
+	if strings.Contains(dsn, " # %") {
 		t.Fatalf("reserved characters left unencoded: %s", dsn)
 	}
 	if _, err := url.Parse(dsn); err != nil {

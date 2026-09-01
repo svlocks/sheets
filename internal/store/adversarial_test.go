@@ -890,7 +890,10 @@ func TestRevisionTimeRangeAndExhaustion(t *testing.T) {
 }
 
 func TestReservedFilesystemPathAndConnectionPragmas(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "graph ?# %.db")
+	// '#' and '%' and a space are reserved in URIs but valid in filenames on
+	// every supported OS. '?' is also URI-reserved but forbidden in Windows
+	// filenames, so it cannot be exercised here.
+	path := filepath.Join(t.TempDir(), "graph # %.db")
 	database, err := Open(context.Background(), path, WithBusyTimeout(1234*time.Millisecond), WithMaxOpenConns(4))
 	if err != nil {
 		t.Fatal(err)
