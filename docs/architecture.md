@@ -45,9 +45,9 @@ changes against one consistent current state, allocates one revision, writes
 new versions, and commits atomically. SQLite serializes writers while allowing
 independent processes to read concurrently.
 
-The embedded schema is currently version 5, with fingerprint
-`3be39b39c67594a6142d3167c7952c2c799d93c3b4d449de833695fb7e52c110`.
-Before upgrading an existing v1–v4 schema, migrations validate that version's
+The embedded schema is currently version 6, with fingerprint
+`77d1f4abe30e4a710190224b76f665c625ca85ae738b0ff0a8f6fffadcc7878d`.
+Before upgrading an existing v1–v5 schema, migrations validate that version's
 exact fingerprint and source values;
 v2 and later also validate derived-index provenance. Migration DDL and
 `user_version` commit in one transaction. Go admission and decode

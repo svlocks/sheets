@@ -24,12 +24,12 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-const schemaVersion = 5
+const schemaVersion = 6
 
 // This is the SHA-256 digest of the ordered, non-internal sqlite_schema rows
 // produced by the embedded migrations. It makes routine Open detect altered
 // trigger/index definitions without scanning graph data.
-const expectedSchemaFingerprint = "3be39b39c67594a6142d3167c7952c2c799d93c3b4d449de833695fb7e52c110"
+const expectedSchemaFingerprint = "77d1f4abe30e4a710190224b76f665c625ca85ae738b0ff0a8f6fffadcc7878d"
 
 // Migrations verify the complete preceding schema before applying DDL. Later
 // migrations replace tables and triggers, so checking only the final schema
@@ -39,6 +39,7 @@ const (
 	expectedV2SchemaFingerprint = "868d00a7ad6e6bd2564e6c20687e1fe24af149ad4bcc6b56be00f302f75ec69c"
 	expectedV3SchemaFingerprint = "ce220b74c7edd80aff1942223383af9bc3c43f580fbe1537a46fcbbaf3709b3a"
 	expectedV4SchemaFingerprint = "77988fee52f43cdbcb9050836717c5f3287d6524d68f573d462f893b663ea8f0"
+	expectedV5SchemaFingerprint = "3be39b39c67594a6142d3167c7952c2c799d93c3b4d449de833695fb7e52c110"
 )
 
 //go:embed migrations/001_initial.sql
@@ -55,6 +56,9 @@ var resourceLimitMigration string
 
 //go:embed migrations/005_derived_resource_limits.sql
 var derivedResourceLimitMigration string
+
+//go:embed migrations/006_deterministic_cycle_index.sql
+var deterministicCycleIndexMigration string
 
 // ErrClosed is returned when an operation is attempted on a closed Store.
 var ErrClosed = errors.New("store is closed")
@@ -302,6 +306,7 @@ func (s *Store) initialize(ctx context.Context) (err error) {
 		temporalMigration,
 		resourceLimitMigration,
 		derivedResourceLimitMigration,
+		deterministicCycleIndexMigration,
 	}
 	migrated := version < schemaVersion
 	for version < schemaVersion {
@@ -343,6 +348,7 @@ func validateMigrationSourceSchema(ctx context.Context, conn *sql.Conn, version 
 		2: expectedV2SchemaFingerprint,
 		3: expectedV3SchemaFingerprint,
 		4: expectedV4SchemaFingerprint,
+		5: expectedV5SchemaFingerprint,
 	}[version]
 	if expected == "" {
 		return fmt.Errorf("no expected fingerprint for schema version %d", version)
@@ -858,7 +864,8 @@ func validateDataIntegrity(ctx context.Context, conn *sql.Conn) error {
 				       MAX(paths.low_revision, next.valid_from),
 				       MIN(paths.high_revision, COALESCE(next.valid_to - 1, 9223372036854775807))
 				FROM child_paths AS paths
-				JOIN edge_versions AS next ON next.from_id = paths.end_id
+				JOIN edge_versions AS next INDEXED BY edge_versions_from_history
+				  ON next.from_id = paths.end_id
 				WHERE next.type = 'CHILD'
 				  AND MAX(paths.low_revision, next.valid_from)
 				      <= MIN(paths.high_revision, COALESCE(next.valid_to - 1, 9223372036854775807))
