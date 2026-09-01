@@ -150,11 +150,7 @@ func (e evaluator) expression(expression cypher.Expression, values row) (any, er
 		if err != nil {
 			return nil, err
 		}
-		result := make([]any, len(paths))
-		for index := range paths {
-			result[index] = paths[index]
-		}
-		return result, nil
+		return len(paths) > 0, nil
 	case *cypher.ExistsSubquery:
 		if e.subquery == nil {
 			return nil, evalError(expression, "EXISTS subquery requires a match context")
@@ -840,8 +836,8 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 		if err := require(1); err != nil {
 			return nil, err
 		}
-		if paths, ok := arguments[0].([]any); ok {
-			return len(paths) > 0, nil
+		if predicate, ok := arguments[0].(bool); ok {
+			return predicate, nil
 		}
 		return arguments[0] != nil, nil
 	case "shortestpath", "allshortestpaths":
@@ -1647,7 +1643,7 @@ func convertValue(expression cypher.Expression, name string, value any) (any, er
 			if number, _, ok := number(value); ok {
 				return strconv.FormatFloat(number, 'g', -1, 64), nil
 			}
-			return nil, nil
+			return nil, evalError(expression, "invalid value type %T for toString", value)
 		}
 	case "tointeger":
 		switch value := value.(type) {
@@ -1667,7 +1663,10 @@ func convertValue(expression cypher.Expression, name string, value any) (any, er
 				return integer, nil
 			}
 			number, _, ok := number(value)
-			if !ok || number > math.MaxInt64 || number < math.MinInt64 {
+			if !ok {
+				return nil, evalError(expression, "invalid value type %T for toInteger", value)
+			}
+			if number > math.MaxInt64 || number < math.MinInt64 {
 				return nil, nil
 			}
 			return int64(number), nil
@@ -1682,7 +1681,10 @@ func convertValue(expression cypher.Expression, name string, value any) (any, er
 				return parsed, nil
 			}
 		}
-		return nil, nil
+		if _, text := value.(string); text {
+			return nil, nil
+		}
+		return nil, evalError(expression, "invalid value type %T for toFloat", value)
 	case "toboolean":
 		if value, ok := value.(bool); ok {
 			return value, nil
@@ -1693,7 +1695,10 @@ func convertValue(expression cypher.Expression, name string, value any) (any, er
 				return parsed, nil
 			}
 		}
-		return nil, nil
+		if _, text := value.(string); text {
+			return nil, nil
+		}
+		return nil, evalError(expression, "invalid value type %T for toBoolean", value)
 	default:
 		return nil, evalError(expression, "unknown conversion %s", name)
 	}

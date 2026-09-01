@@ -220,6 +220,95 @@ func TestSemanticErrorsDoNotDependOnRows(t *testing.T) {
 	}
 }
 
+func TestPatternVariableTypeConflictsFailDuringValidation(t *testing.T) {
+	engine, _ := testEngine(t)
+	for _, query := range []string{
+		"WITH true AS n MATCH (n) RETURN n",
+		"MATCH ()-[r]-() MATCH (r) RETURN r",
+		"MATCH p = ()--() MATCH ()-[p]-() RETURN p",
+		"MATCH ()-[r*]-() MATCH (r) RETURN r",
+	} {
+		_, err := engine.Execute(context.Background(), app.ExecuteRequest{Query: "EXPLAIN " + query})
+		if err == nil || !strings.Contains(err.Error(), "type conflict") {
+			t.Errorf("pattern type conflict for %q = %v", query, err)
+		}
+	}
+	_, err := engine.Execute(context.Background(), app.ExecuteRequest{
+		Query: "EXPLAIN MATCH (p) MATCH p = ()--() RETURN p",
+	})
+	if err == nil || !strings.Contains(err.Error(), "already bound") {
+		t.Errorf("named path rebinding = %v", err)
+	}
+
+	if _, err := engine.Execute(context.Background(), app.ExecuteRequest{
+		Query: "EXPLAIN MATCH (n) MATCH (n) RETURN n",
+	}); err != nil {
+		t.Fatalf("compatible repeated node binding: %v", err)
+	}
+	if _, err := engine.Execute(context.Background(), app.ExecuteRequest{
+		Query: "EXPLAIN WITH null AS n OPTIONAL MATCH (n) RETURN n",
+	}); err != nil {
+		t.Fatalf("null-compatible node binding: %v", err)
+	}
+}
+
+func TestPatternPredicatesAreBooleanAndCannotIntroduceVariables(t *testing.T) {
+	engine, _ := testEngine(t)
+	execute(t, engine, "CREATE (a:A)-[:REL]->(b:B), (a)-[:REL]->(:C)", nil)
+	result := execute(t, engine, "MATCH (a:A), (b:B) WHERE (a)-[:REL]->(b) RETURN a", nil)
+	if len(result.Results[0].Rows) != 1 {
+		t.Fatalf("pattern predicate rows = %#v", result.Results[0].Rows)
+	}
+	for _, query := range []string{
+		"MATCH (n) WHERE (n)-[r]->() RETURN n",
+		"MATCH (n) RETURN (n)-->()",
+		"MATCH (n) RETURN size((n)--())",
+		"MATCH (n) SET n.value = head((n)--())",
+	} {
+		if _, err := engine.Execute(context.Background(), app.ExecuteRequest{Query: "EXPLAIN " + query}); err == nil {
+			t.Errorf("invalid pattern-expression context succeeded: %s", query)
+		}
+	}
+}
+
+func TestStaticScopeAndCompositionValidation(t *testing.T) {
+	engine, _ := testEngine(t)
+	for _, query := range []string{
+		"MATCH () RETURN *",
+		"RETURN 1 AS value UNION RETURN 2 AS value UNION ALL RETURN 3 AS value",
+		"MATCH (n $properties) RETURN n",
+		"MATCH ()-[r:TYPE $properties]->() RETURN r",
+		"MATCH (me)--(you) RETURN count(you) AS total ORDER BY me.name + count(you)",
+		"RETURN NOT 1",
+		"RETURN true AND 'false'",
+		"RETURN 1 IN 2",
+		"WITH 1 AS scalar RETURN scalar.value",
+		"MATCH p = ()-->() RETURN labels(p)",
+		"RETURN 1 SKIP -1",
+		"RETURN 1 LIMIT 1.5",
+		"DELETE 1 + 1",
+	} {
+		if _, err := engine.Execute(context.Background(), app.ExecuteRequest{Query: "EXPLAIN " + query}); err == nil {
+			t.Errorf("semantic-invalid query succeeded: %s", query)
+		}
+	}
+}
+
+func TestInvalidConversionValueTypesRaiseRuntimeErrors(t *testing.T) {
+	engine, _ := testEngine(t)
+	for _, query := range []string{
+		"RETURN toBoolean([])",
+		"RETURN toInteger({})",
+		"RETURN toFloat(true)",
+		"RETURN toString([])",
+	} {
+		_, err := engine.Execute(context.Background(), app.ExecuteRequest{Query: query})
+		if err == nil || !strings.Contains(err.Error(), "invalid value type") {
+			t.Errorf("invalid conversion for %q = %v", query, err)
+		}
+	}
+}
+
 func TestStarParticipatesInAggregateGrouping(t *testing.T) {
 	engine, _ := testEngine(t)
 	result := execute(t, engine, "UNWIND [1, 1, 2] AS x RETURN *, count(*) AS occurrences ORDER BY x", nil)
@@ -276,5 +365,27 @@ func TestCreateDoesNotSilentlyIgnoreDecorationsOnBoundNodes(t *testing.T) {
 	_, err := engine.Execute(context.Background(), app.ExecuteRequest{Query: "MATCH (n:Task) CREATE (n:NewLabel)"})
 	if err == nil || !strings.Contains(err.Error(), "bound node") {
 		t.Fatalf("bound decoration error = %v", err)
+	}
+}
+
+func TestCreateAndMergeRebindingFailsDuringValidation(t *testing.T) {
+	engine, _ := testEngine(t)
+	for _, query := range []string{
+		"MATCH (a) CREATE (a)",
+		"MATCH (a) CREATE (a {name: 'new'})",
+		"MATCH ()-[r]->() CREATE ()-[r]->()",
+		"MATCH (a) MERGE (a)",
+		"MATCH (a)-[r]->(b) MERGE (a)-[r]->(b)",
+		"CREATE (n:First), (n:Second)-[:LINK]->()",
+	} {
+		_, err := engine.Execute(context.Background(), app.ExecuteRequest{Query: "EXPLAIN " + query})
+		if err == nil || !strings.Contains(err.Error(), "already bound") {
+			t.Errorf("mutation rebinding for %q = %v", query, err)
+		}
+	}
+	if _, err := engine.Execute(context.Background(), app.ExecuteRequest{
+		Query: "EXPLAIN MATCH (a) CREATE (a)-[:LINK]->()",
+	}); err != nil {
+		t.Fatalf("bare bound endpoint should remain valid: %v", err)
 	}
 }

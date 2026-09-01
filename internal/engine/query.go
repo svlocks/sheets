@@ -109,7 +109,7 @@ func (e *queryExecution) clauses(clauses []cypher.Clause, rows []row) (app.Resul
 			addPatternVariables(known, clause.Patterns)
 		case *cypher.UnwindClause:
 			rows, err = e.unwind(rows, clause)
-			known[clause.Alias.Name] = struct{}{}
+			known[clause.Alias.Name] = variableUnknown
 		case *cypher.ProjectionClause:
 			inputKnown := known
 			rows, result, err = e.project(rows, clause, known)
@@ -438,7 +438,7 @@ func scopeFromRows(rows []row) variableScope {
 	for _, values := range rows {
 		for name := range values {
 			if name != internalPathKey && name != expressionPathKey {
-				result[name] = struct{}{}
+				result[name] = variableUnknown
 			}
 		}
 	}
@@ -448,7 +448,7 @@ func scopeFromRows(rows []row) variableScope {
 func scopeFromColumns(columns []string) variableScope {
 	result := make(variableScope, len(columns))
 	for _, column := range columns {
-		result[column] = struct{}{}
+		result[column] = variableUnknown
 	}
 	return result
 }
@@ -458,7 +458,9 @@ func projectionOutputScope(source string, items []cypher.ProjectionItem, input v
 	// static schema and include any concrete keys as a consistency fallback.
 	result := scopeFromColumns(projectionStaticColumns(source, items, input))
 	for name := range scopeFromRows(rows) {
-		result[name] = struct{}{}
+		if _, exists := result[name]; !exists {
+			result[name] = variableUnknown
+		}
 	}
 	return result
 }
