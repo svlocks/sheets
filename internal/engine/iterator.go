@@ -6,7 +6,6 @@ import (
 	"math"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/cypher"
@@ -589,13 +588,12 @@ func appendPushdown(current, next string) string {
 
 func storeExactPropertyValue(value any) bool {
 	switch value.(type) {
-	case bool, string, []byte, time.Duration, temporal.Date, temporal.LocalTime, temporal.Time, temporal.LocalDateTime, temporal.Duration:
+	case bool, string, []byte, temporal.Date, temporal.LocalTime, temporal.Time, temporal.LocalDateTime:
 		return true
 	default:
-		// Numeric equality is cross-type and legacy time.Time values compare by
-		// instant with exact DateTime values, while the store index is
-		// representation-exact. Lists and maps can contain those values, so leave
-		// them to the residual matcher too.
+		// Numeric and legacy temporal equality cross Go representations, while
+		// the store index is representation-exact. Lists and maps can contain
+		// those values, so leave them to the residual matcher too.
 		return false
 	}
 }

@@ -559,7 +559,7 @@ func graphProperties(snapshot engine.GraphSnapshot) map[string]map[string]string
 	for _, node := range snapshot.Nodes {
 		properties := make(map[string]string, len(node.Properties)+1)
 		for key, value := range node.Properties {
-			normalized, err := normalizeActual(value)
+			normalized, err := normalizeGraphValue(value)
 			if err == nil {
 				properties[key] = normalized.key(false)
 			}
@@ -572,7 +572,7 @@ func graphProperties(snapshot engine.GraphSnapshot) map[string]map[string]string
 	for _, edge := range snapshot.Edges {
 		properties := make(map[string]string, len(edge.Properties)+1)
 		for key, value := range edge.Properties {
-			normalized, err := normalizeActual(value)
+			normalized, err := normalizeGraphValue(value)
 			if err == nil {
 				properties[key] = normalized.key(false)
 			}

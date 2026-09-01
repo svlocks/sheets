@@ -205,13 +205,11 @@ func constructTemporal(name string, argument any) (any, error) {
 		case temporal.Date:
 			return temporal.NewDateTime(temporal.NewLocalDateTime(value, temporal.LocalTime{}), "Z")
 		case time.Time:
-			zone := "Z"
-			if value.Location() != time.UTC && value.Location().String() != "Local" {
-				zone = value.Location().String()
-			} else if _, offset := value.Zone(); offset != 0 {
-				zone = temporal.FormatOffset(offset)
+			converted, ok := dateTimeFromLegacy(value)
+			if !ok {
+				return nil, fmt.Errorf("legacy time has an offset outside the Cypher DateTime range")
 			}
-			return temporal.DateTimeFromEpoch(value.Unix(), int64(value.Nanosecond()), zone)
+			return converted, nil
 		}
 	}
 	return nil, fmt.Errorf("expected a string, compatible temporal value, or map, got %T", argument)

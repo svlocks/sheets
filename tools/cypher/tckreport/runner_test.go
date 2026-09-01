@@ -22,6 +22,25 @@ func TestGraphEffectsCountCreateAndDeleteInsteadOfNetting(t *testing.T) {
 	}
 }
 
+func TestNoSideEffectsDistinguishesTemporalValuesFromRenderedStrings(t *testing.T) {
+	instance := scenarioInstance{
+		ID: "temporal-type-change",
+		Steps: []tckStep{
+			{Text: "an empty graph", Line: 1},
+			{Text: "having executed:", Doc: "CREATE (:Val {value: date('1984-10-11')})", Line: 2},
+			{Text: "executing query:", Doc: "MATCH (n:Val) SET n.value = '1984-10-11'", Line: 3},
+			{Text: "no side effects", Line: 4},
+		},
+	}
+	result := runScenario(instance, nil, true)
+	if result.Status != statusSemanticFailure || result.Error != "unexpected side effects" {
+		t.Fatalf("result = %#v", result)
+	}
+	if result.Actual != "{+properties=1,-properties=1}" {
+		t.Fatalf("actual effects = %q", result.Actual)
+	}
+}
+
 func TestNamedGraphFixtureIsExecuted(t *testing.T) {
 	instance := scenarioInstance{
 		ID: "fixture",

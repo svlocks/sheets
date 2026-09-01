@@ -73,6 +73,17 @@ func TestTCKCapabilityCases(t *testing.T) {
 	}
 }
 
+func TestEscapedDottedFunctionDoesNotAliasNamespacedBuiltin(t *testing.T) {
+	if _, err := Parse("RETURN date.truncate('year', date('1984-10-11'))"); err != nil {
+		t.Fatalf("canonical namespaced function: %v", err)
+	}
+	_, err := Parse("RETURN `date.truncate`('year', date('1984-10-11'))")
+	var unsupported *UnsupportedFeatureError
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("escaped single-part function error = %v, want UnsupportedFeatureError", err)
+	}
+}
+
 func TestDocumentSplitterUsesGeneratedLexicalSyntax(t *testing.T) {
 	source := "RETURN ';' AS semi, 1 AS `a;b`; // comment ; is trivia\n" +
 		"RETURN \"x;y\" AS value /* block ; comment */; RETURN 3"

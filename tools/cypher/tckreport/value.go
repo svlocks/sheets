@@ -175,6 +175,60 @@ func normalizeActual(value any) (normalizedValue, error) {
 	return normalizedValue{}, fmt.Errorf("unsupported result value %T", value)
 }
 
+// normalizeGraphValue retains the runtime temporal type for before/after
+// graph comparisons. Result normalization deliberately renders temporals as
+// strings because that is the M23 TCK adapter representation; reusing those
+// keys for graph state would make a temporal and its rendered string appear
+// to be the same stored property value.
+func normalizeGraphValue(value any) (normalizedValue, error) {
+	switch value := value.(type) {
+	case time.Time:
+		scalar := value.Format(time.RFC3339Nano) + "[" + value.Location().String() + "]"
+		return normalizedValue{kind: "temporal", scalar: "time.Time:" + strconv.Quote(scalar)}, nil
+	case time.Duration:
+		return normalizedValue{kind: "duration", scalar: "time.Duration:" + strconv.FormatInt(int64(value), 10)}, nil
+	case temporal.Date:
+		return normalizedValue{kind: "temporal", scalar: "Date:" + strconv.Quote(value.String())}, nil
+	case temporal.LocalTime:
+		return normalizedValue{kind: "temporal", scalar: "LocalTime:" + strconv.Quote(value.String())}, nil
+	case temporal.Time:
+		return normalizedValue{kind: "temporal", scalar: "Time:" + strconv.Quote(value.String())}, nil
+	case temporal.LocalDateTime:
+		return normalizedValue{kind: "temporal", scalar: "LocalDateTime:" + strconv.Quote(value.String())}, nil
+	case temporal.DateTime:
+		return normalizedValue{kind: "temporal", scalar: "DateTime:" + strconv.Quote(value.String())}, nil
+	case temporal.Duration:
+		scalar := fmt.Sprintf("%d:%d:%d:%d", value.Months(), value.Days(), value.CanonicalSeconds(), value.NanosecondsPart())
+		return normalizedValue{kind: "duration", scalar: "Duration:" + scalar}, nil
+	}
+
+	reflected := reflect.ValueOf(value)
+	if reflected.IsValid() && (reflected.Kind() == reflect.Slice || reflected.Kind() == reflect.Array) {
+		items := make([]normalizedValue, reflected.Len())
+		for index := 0; index < reflected.Len(); index++ {
+			item, err := normalizeGraphValue(reflected.Index(index).Interface())
+			if err != nil {
+				return normalizedValue{}, err
+			}
+			items[index] = item
+		}
+		return normalizedValue{kind: "list", items: items}, nil
+	}
+	if reflected.IsValid() && reflected.Kind() == reflect.Map && reflected.Type().Key().Kind() == reflect.String {
+		properties := make(map[string]normalizedValue, reflected.Len())
+		iterator := reflected.MapRange()
+		for iterator.Next() {
+			item, err := normalizeGraphValue(iterator.Value().Interface())
+			if err != nil {
+				return normalizedValue{}, err
+			}
+			properties[iterator.Key().String()] = item
+		}
+		return normalizedValue{kind: "map", properties: properties}, nil
+	}
+	return normalizeActual(value)
+}
+
 func formatTCKTemporal(value time.Time) string {
 	clock := value.Format("15:04:05.999999999")
 	if value.Year() == 0 {

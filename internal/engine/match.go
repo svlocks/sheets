@@ -644,14 +644,15 @@ func candidateNodes(graph *memoryGraph, evaluator evaluator, values row, pattern
 		if value == nil {
 			return nil, nil
 		}
-		// Numeric equality is cross-type, and legacy time.Time values compare by
-		// instant with exact DateTime values, while the in-memory key preserves
-		// concrete representations. Leave those to the residual matcher so an
-		// equivalent representation cannot produce a false-negative lookup.
+		// Numeric and legacy temporal equality cross Go representations. Leave
+		// those values to the residual matcher so representation differences
+		// cannot produce a false-negative lookup.
 		_, numeric, _ := compareNumbers(value, value)
 		_, legacyTime := value.(time.Time)
 		_, exactDateTime := value.(temporal.DateTime)
-		if numeric || legacyTime || exactDateTime {
+		_, legacyDuration := value.(time.Duration)
+		_, exactDuration := value.(temporal.Duration)
+		if numeric || legacyTime || exactDateTime || legacyDuration || exactDuration {
 			continue
 		}
 		choose(graph.properties[key][valueKey(value)])

@@ -518,7 +518,7 @@ func (b *cstBinder) bindMapLiteral(ctx parsergen.IOC_MapLiteralContext) (Express
 func (b *cstBinder) bindFunctionInvocation(ctx parsergen.IOC_FunctionInvocationContext) (Expression, error) {
 	name := b.bindFunctionName(ctx.OC_FunctionName())
 	normalized := strings.ToLower(name.String())
-	if !supportedFunction(normalized) {
+	if !catalogFunctionName(name) || !supportedFunction(normalized) {
 		return nil, b.unsupported(ctx, "function invocation", "function "+name.String()+" is not in sheets's supported function catalog")
 	}
 	if ctx.DISTINCT() != nil && !aggregateFunction(normalized) {
@@ -533,6 +533,23 @@ func (b *cstBinder) bindFunctionInvocation(ctx parsergen.IOC_FunctionInvocationC
 		invocation.Arguments = append(invocation.Arguments, argument)
 	}
 	return invocation, nil
+}
+
+// catalogFunctionName rejects escaped single-part identifiers that merely
+// render like a qualified built-in (for example `date.truncate`). Qualified
+// names retain their parts in the AST, so collapsing such a name with
+// QualifiedName.String would otherwise alias a distinct function to a
+// namespaced built-in.
+func catalogFunctionName(name QualifiedName) bool {
+	if len(name.Parts) == 0 {
+		return false
+	}
+	for _, part := range name.Parts {
+		if strings.ContainsRune(part.Name, '.') {
+			return false
+		}
+	}
+	return true
 }
 
 // supportedFunction mirrors the executor's deliberately finite built-in

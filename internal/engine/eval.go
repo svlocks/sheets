@@ -387,6 +387,23 @@ func addValues(expression cypher.Expression, left, right any) (any, error) {
 }
 
 func temporalArithmetic(operator string, left, right any) (any, bool, error) {
+	if legacy, ok := left.(time.Duration); ok {
+		left = legacyDuration(legacy)
+	}
+	if legacy, ok := right.(time.Duration); ok {
+		right = legacyDuration(legacy)
+	}
+	if operator == "+" || operator == "-" {
+		if legacy, ok := left.(time.Time); ok {
+			if _, duration := right.(temporal.Duration); duration {
+				converted, valid := dateTimeFromLegacy(legacy)
+				if !valid {
+					return nil, true, fmt.Errorf("legacy time has an offset outside the Cypher DateTime range")
+				}
+				left = converted
+			}
+		}
+	}
 	duration, rightDuration := right.(temporal.Duration)
 	if operator == "+" || operator == "-" {
 		if rightDuration {
@@ -1202,6 +1219,14 @@ func property(value any, key string) any {
 			return nil
 		}
 		return component
+	case time.Time:
+		converted, ok := dateTimeFromLegacy(value)
+		if !ok {
+			return nil
+		}
+		return property(converted, key)
+	case time.Duration:
+		return property(legacyDuration(value), key)
 	case domain.Node:
 		if key == "body" {
 			return value.Body
@@ -1370,7 +1395,7 @@ func equalValues(left, right any) bool {
 	if leftTime, ok := left.(time.Time); ok {
 		switch rightTime := right.(type) {
 		case time.Time:
-			return leftTime.Equal(rightTime)
+			return legacyTimesEqual(leftTime, rightTime)
 		case temporal.DateTime:
 			return legacyTimeEqualsDateTime(leftTime, rightTime)
 		}
@@ -1379,6 +1404,46 @@ func equalValues(left, right any) bool {
 		if rightTime, legacy := right.(time.Time); legacy {
 			return legacyTimeEqualsDateTime(rightTime, leftTime)
 		}
+	}
+	if leftDuration, ok := left.(time.Duration); ok {
+		switch rightDuration := right.(type) {
+		case time.Duration:
+			return leftDuration == rightDuration
+		case temporal.Duration:
+			return legacyDuration(leftDuration).Equal(rightDuration)
+		}
+	}
+	if leftDuration, ok := left.(temporal.Duration); ok {
+		if rightDuration, legacy := right.(time.Duration); legacy {
+			return leftDuration.Equal(legacyDuration(rightDuration))
+		}
+	}
+	leftList, leftIsList := asList(left)
+	rightList, rightIsList := asList(right)
+	if leftIsList || rightIsList {
+		if !leftIsList || !rightIsList || len(leftList) != len(rightList) {
+			return false
+		}
+		for index := range leftList {
+			if !equalValues(leftList[index], rightList[index]) {
+				return false
+			}
+		}
+		return true
+	}
+	leftMap, leftIsMap := asMap(left)
+	rightMap, rightIsMap := asMap(right)
+	if leftIsMap || rightIsMap {
+		if !leftIsMap || !rightIsMap || len(leftMap) != len(rightMap) {
+			return false
+		}
+		for key, leftValue := range leftMap {
+			rightValue, exists := rightMap[key]
+			if !exists || !equalValues(leftValue, rightValue) {
+				return false
+			}
+		}
+		return true
 	}
 	return reflect.DeepEqual(left, right)
 }
@@ -1403,7 +1468,7 @@ func compareValues(left, right any) (int, bool) {
 	case time.Time:
 		switch right := right.(type) {
 		case time.Time:
-			return left.Compare(right), true
+			return compareLegacyTimes(left, right), true
 		case temporal.DateTime:
 			return compareLegacyTimeDateTime(left, right), true
 		}
@@ -1429,8 +1494,21 @@ func compareValues(left, right any) (int, bool) {
 		}
 		return 0, false
 	case temporal.Duration:
-		right, ok := right.(temporal.Duration)
-		return left.CompareForOrder(right), ok
+		switch right := right.(type) {
+		case temporal.Duration:
+			return left.CompareForOrder(right), true
+		case time.Duration:
+			return left.CompareForOrder(legacyDuration(right)), true
+		}
+		return 0, false
+	case time.Duration:
+		switch right := right.(type) {
+		case time.Duration:
+			return compare(int64(left), int64(right)), true
+		case temporal.Duration:
+			return legacyDuration(left).CompareForOrder(right), true
+		}
+		return 0, false
 	default:
 		return 0, false
 	}
@@ -1488,15 +1566,21 @@ func cypherEqual(left, right any) any {
 	case time.Time:
 		switch right := right.(type) {
 		case time.Time:
-			return left.Equal(right)
+			return legacyTimesEqual(left, right)
 		case temporal.DateTime:
 			return legacyTimeEqualsDateTime(left, right)
 		default:
 			return false
 		}
 	case time.Duration:
-		right, ok := right.(time.Duration)
-		return ok && left == right
+		switch right := right.(type) {
+		case time.Duration:
+			return left == right
+		case temporal.Duration:
+			return legacyDuration(left).Equal(right)
+		default:
+			return false
+		}
 	case temporal.Date:
 		right, ok := right.(temporal.Date)
 		return ok && left.Equal(right)
@@ -1519,8 +1603,14 @@ func cypherEqual(left, right any) any {
 			return false
 		}
 	case temporal.Duration:
-		right, ok := right.(temporal.Duration)
-		return ok && left.Equal(right)
+		switch right := right.(type) {
+		case temporal.Duration:
+			return left.Equal(right)
+		case time.Duration:
+			return left.Equal(legacyDuration(right))
+		default:
+			return false
+		}
 	case *domain.Node:
 		switch right := right.(type) {
 		case *domain.Node:
@@ -1646,7 +1736,7 @@ func compareCypherValues(left, right any) (comparison int, comparable, unordered
 	case time.Time:
 		switch right := right.(type) {
 		case time.Time:
-			return left.Compare(right), true, false
+			return compareLegacyTimes(left, right), true, false
 		case temporal.DateTime:
 			return compareLegacyTimeDateTime(left, right), true, false
 		}
@@ -1720,14 +1810,68 @@ func compareCypherValues(left, right any) (comparison int, comparable, unordered
 }
 
 func legacyTimeEqualsDateTime(legacy time.Time, exact temporal.DateTime) bool {
-	return legacy.Unix() == exact.EpochSecond() && legacy.Nanosecond() == exact.Nanosecond()
+	converted, ok := dateTimeFromLegacy(legacy)
+	return ok && converted.Equal(exact)
 }
 
 func compareLegacyTimeDateTime(legacy time.Time, exact temporal.DateTime) int {
+	if converted, ok := dateTimeFromLegacy(legacy); ok {
+		return converted.Compare(exact)
+	}
 	if comparison := compare(legacy.Unix(), exact.EpochSecond()); comparison != 0 {
 		return comparison
 	}
-	return compare(legacy.Nanosecond(), exact.Nanosecond())
+	if comparison := compare(legacy.Nanosecond(), exact.Nanosecond()); comparison != 0 {
+		return comparison
+	}
+	return strings.Compare(legacyTimeFallbackKey(legacy), exact.String())
+}
+
+func legacyTimesEqual(left, right time.Time) bool {
+	leftExact, leftOK := dateTimeFromLegacy(left)
+	rightExact, rightOK := dateTimeFromLegacy(right)
+	if leftOK && rightOK {
+		return leftExact.Equal(rightExact)
+	}
+	return !leftOK && !rightOK && legacyTimeFallbackKey(left) == legacyTimeFallbackKey(right)
+}
+
+func compareLegacyTimes(left, right time.Time) int {
+	leftExact, leftOK := dateTimeFromLegacy(left)
+	rightExact, rightOK := dateTimeFromLegacy(right)
+	if leftOK && rightOK {
+		return leftExact.Compare(rightExact)
+	}
+	return strings.Compare(legacyTimeFallbackKey(left), legacyTimeFallbackKey(right))
+}
+
+// dateTimeFromLegacy maps the historical Go representation onto one exact
+// DateTime value. Named IANA locations retain their name; arbitrary FixedZone
+// labels become numeric offsets so they cannot compare equal to every timezone
+// representation of the same instant.
+func dateTimeFromLegacy(value time.Time) (temporal.DateTime, bool) {
+	_, offset := value.Zone()
+	if location := value.Location(); location != time.UTC && location != time.Local {
+		name := location.String()
+		if converted, err := temporal.DateTimeFromEpoch(value.Unix(), int64(value.Nanosecond()), name); err == nil && converted.OffsetSeconds() == offset {
+			return converted, true
+		}
+	}
+	converted, err := temporal.DateTimeFromEpoch(value.Unix(), int64(value.Nanosecond()), temporal.FormatOffset(offset))
+	return converted, err == nil
+}
+
+func legacyTimeFallbackKey(value time.Time) string {
+	name, offset := value.Zone()
+	return fmt.Sprintf("%020d:%09d:%+07d:%s:%s", value.Unix(), value.Nanosecond(), offset, name, value.Location())
+}
+
+func legacyDuration(value time.Duration) temporal.Duration {
+	converted, err := temporal.NewDuration(0, 0, 0, int64(value))
+	if err != nil {
+		panic("time.Duration cannot exceed temporal.Duration seconds range")
+	}
+	return converted
 }
 
 func compareNumbers(left, right any) (comparison int, numeric, unordered bool) {
@@ -1816,7 +1960,7 @@ func compareOrderValues(left, right any) int {
 		case time.Time:
 			switch right := right.(type) {
 			case time.Time:
-				return left.Compare(right)
+				return compareLegacyTimes(left, right)
 			case temporal.DateTime:
 				return compareLegacyTimeDateTime(left, right)
 			}
@@ -1847,12 +1991,18 @@ func compareOrderValues(left, right any) int {
 	case 6: // durations
 		switch left := left.(type) {
 		case time.Duration:
-			if right, ok := right.(time.Duration); ok {
+			switch right := right.(type) {
+			case time.Duration:
 				return compare(int64(left), int64(right))
+			case temporal.Duration:
+				return legacyDuration(left).CompareForOrder(right)
 			}
 		case temporal.Duration:
-			if right, ok := right.(temporal.Duration); ok {
+			switch right := right.(type) {
+			case temporal.Duration:
 				return left.CompareForOrder(right)
+			case time.Duration:
+				return left.CompareForOrder(legacyDuration(right))
 			}
 		}
 	case 7:
@@ -2059,6 +2209,14 @@ func convertValue(expression cypher.Expression, name string, value any) (any, er
 			return value.String(), nil
 		case temporal.Duration:
 			return value.String(), nil
+		case time.Time:
+			converted, ok := dateTimeFromLegacy(value)
+			if !ok {
+				return nil, evalError(expression, "legacy time has an offset outside the Cypher DateTime range")
+			}
+			return converted.String(), nil
+		case time.Duration:
+			return legacyDuration(value).String(), nil
 		default:
 			if integer, ok := integer(value); ok {
 				return strconv.FormatInt(integer, 10), nil

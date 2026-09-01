@@ -60,11 +60,12 @@ CREATE (:Number {name:'float', value:1.0}),
        (:Number {name:'integer', value:1}),
 	       (:Document {name:'body', body:'stored outside the property map'}),
 	       (:Moment {name:'instant', at:datetime('2024-01-01T00:00:00Z')}),
+	       (:Estimate {name:'legacy-duration', amount:duration('PT1H')}),
 	       (:Endpoint {name:'from'})-[:CHILD {position:7}]->(:Endpoint {name:'to'}),
 	       (:NumericSource)-[:WEIGHTED {weight:1}]->(:NumericTarget),
 	       (:NumericSource)-[:WEIGHTED {weight:1.0}]->(:NumericTarget)`, nil)
 
-	equivalentInstant := time.Date(2023, 12, 31, 19, 0, 0, 0, time.FixedZone("query-zone", -5*60*60))
+	equivalentInstant := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	tests := []struct {
 		name   string
 		query  string
@@ -91,6 +92,12 @@ CREATE (:Number {name:'float', value:1.0}),
 			name:   "temporal instant equality",
 			query:  "MATCH (n:Moment {at:$at}) RETURN n.name AS name",
 			params: map[string]any{"at": equivalentInstant},
+			rows:   1,
+		},
+		{
+			name:   "legacy duration equality",
+			query:  "MATCH (n:Estimate {amount:$amount}) RETURN n.name AS name",
+			params: map[string]any{"amount": time.Hour},
 			rows:   1,
 		},
 	}

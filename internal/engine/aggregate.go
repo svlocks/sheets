@@ -7,8 +7,11 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/svlocks/sheets/internal/cypher"
+	"github.com/svlocks/sheets/internal/domain"
+	"github.com/svlocks/sheets/internal/domain/temporal"
 )
 
 func (e evaluator) aggregate(expression *cypher.FunctionInvocation, representative row) (any, error) {
@@ -182,9 +185,53 @@ func distinctValues(ctx context.Context, values []any) ([]any, error) {
 }
 
 func valueKey(value any) string {
-	encoded, err := json.Marshal(freezeValue(value))
+	canonical := canonicalKeyValue(value)
+	encoded, err := json.Marshal(freezeValue(canonical))
 	if err != nil {
-		return fmt.Sprintf("%T:%#v", value, value)
+		return fmt.Sprintf("%T:%#v", canonical, canonical)
 	}
-	return fmt.Sprintf("%T:%s", value, encoded)
+	return fmt.Sprintf("%T:%s", canonical, encoded)
+}
+
+func canonicalKeyValue(value any) any {
+	switch value := value.(type) {
+	case time.Time:
+		if converted, ok := dateTimeFromLegacy(value); ok {
+			return converted
+		}
+		return struct {
+			LegacyTime string `json:"legacy_time"`
+		}{legacyTimeFallbackKey(value)}
+	case time.Duration:
+		return legacyDuration(value)
+	case []any:
+		result := make([]any, len(value))
+		for index := range value {
+			result[index] = canonicalKeyValue(value[index])
+		}
+		return result
+	case map[string]any:
+		result := make(map[string]any, len(value))
+		for key, item := range value {
+			result[key] = canonicalKeyValue(item)
+		}
+		return result
+	case domain.Properties:
+		result := make(domain.Properties, len(value))
+		for key, item := range value {
+			result[key] = canonicalKeyValue(item)
+		}
+		return result
+	case temporal.Date, temporal.LocalTime, temporal.Time, temporal.LocalDateTime, temporal.DateTime, temporal.Duration:
+		return value
+	default:
+		if items, ok := asList(value); ok {
+			result := make([]any, len(items))
+			for index := range items {
+				result[index] = canonicalKeyValue(items[index])
+			}
+			return result
+		}
+		return value
+	}
 }
