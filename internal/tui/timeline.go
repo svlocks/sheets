@@ -26,6 +26,7 @@ type timelineModel struct {
 	list      list.Model
 	revisions []domain.RevisionInfo
 	live      domain.Revision
+	filterSeq uint64
 	width     int
 	height    int
 	dark      bool
@@ -115,6 +116,7 @@ func (m *timelineModel) setRevisions(revisions []domain.RevisionInfo, live domai
 			filter: "0 initial empty graph",
 		})
 	}
+	m.filterSeq++
 	cmd := m.list.SetItems(items)
 	if hadSelection {
 		if !m.selectRevision(selected) {
@@ -122,7 +124,7 @@ func (m *timelineModel) setRevisions(revisions []domain.RevisionInfo, live domai
 			m.restore = &value
 		}
 	}
-	return scopeListCmd(listTargetTimeline, 0, m.list.FilterValue(), cmd)
+	return scopeListCmd(listTargetTimeline, 0, m.filterSeq, m.list.FilterValue(), cmd)
 }
 
 func (m *timelineModel) setPaging(loading, older, end bool, err error) {
@@ -145,12 +147,16 @@ func (m *timelineModel) selectRevision(revision domain.Revision) bool {
 }
 
 func (m *timelineModel) update(msg tea.Msg) tea.Cmd {
+	beforeFilter := m.list.FilterValue()
 	updated, cmd := m.list.Update(msg)
 	m.list = updated
+	if beforeFilter != m.list.FilterValue() {
+		m.filterSeq++
+	}
 	if m.restore != nil {
 		m.selectRevision(*m.restore)
 	}
-	return scopeListCmd(listTargetTimeline, 0, m.list.FilterValue(), cmd)
+	return scopeListCmd(listTargetTimeline, 0, m.filterSeq, m.list.FilterValue(), cmd)
 }
 
 func (m *timelineModel) selectedRevision() (domain.Revision, bool) {

@@ -299,6 +299,68 @@ func TestTextInputMakesPastedPresentationControlsVisible(t *testing.T) {
 	}
 }
 
+func TestBracketedPasteIsSafeInEveryTextEntrySurface(t *testing.T) {
+	malicious := "safe\n\x1b[31m\u202ename"
+	assertSafe := func(t *testing.T, value string) {
+		t.Helper()
+		if strings.ContainsRune(value, '\x1b') || strings.ContainsRune(value, '\u202e') {
+			t.Fatalf("text entry retained a presentation control: %q", value)
+		}
+		if !strings.Contains(value, `\x1b`) || !strings.Contains(value, `\u202e`) {
+			t.Fatalf("text entry did not make controls visible: %q", value)
+		}
+	}
+
+	t.Run("query", func(t *testing.T) {
+		model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+		model.workspace = QueryWorkspace
+		model.query.focus = queryFocusCypher
+		model.query.cypher.SetValue("")
+		_ = model.query.focusCurrent()
+		_, _ = model.Update(tea.PasteMsg{Content: malicious})
+		assertSafe(t, model.query.cypher.Value())
+		if !strings.ContainsRune(model.query.cypher.Value(), '\n') {
+			t.Fatalf("query paste lost its newline: %q", model.query.cypher.Value())
+		}
+	})
+
+	t.Run("parameters", func(t *testing.T) {
+		model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+		model.workspace = QueryWorkspace
+		model.query.focus = queryFocusParams
+		model.query.params.SetValue("")
+		_ = model.query.focusCurrent()
+		_, _ = model.Update(tea.PasteMsg{Content: malicious})
+		assertSafe(t, model.query.params.Value())
+	})
+
+	t.Run("picker filter", func(t *testing.T) {
+		model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+		_ = model.openCommands()
+		_, _ = model.Update(tea.PasteMsg{Content: malicious})
+		assertSafe(t, model.overlay.picker.list.FilterInput.Value())
+	})
+
+	t.Run("form", func(t *testing.T) {
+		model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+		_ = model.openCreateForm()
+		_, _ = model.Update(tea.PasteMsg{Content: malicious})
+		assertSafe(t, model.form.data.(*nodeFormData).title)
+	})
+}
+
+func TestBracketedPasteNormalizesNewlinesAndUsesStableTabWidth(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.workspace = QueryWorkspace
+	model.query.focus = queryFocusCypher
+	model.query.cypher.SetValue("")
+	_ = model.query.focusCurrent()
+	_, _ = model.Update(tea.PasteMsg{Content: "one\r\ntwo\rthree\tfour"})
+	if got, want := model.query.cypher.Value(), "one\ntwo\nthree    four"; got != want {
+		t.Fatalf("normalized paste = %q, want %q", got, want)
+	}
+}
+
 func TestQueryPresentationCopiesAreBounded(t *testing.T) {
 	rows := make([][]any, maxQueryTableRows+1)
 	for index := range rows {
@@ -749,6 +811,17 @@ func TestNoColorActiveWorkspaceHasStructuralMarker(t *testing.T) {
 	}
 }
 
+func TestNoColorEnvironmentEnablesColorlessRendering(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0))
+	if !model.noColor {
+		t.Fatal("NO_COLOR presence did not enable colorless rendering")
+	}
+	if view := model.View().Content; containsANSIColor(view) {
+		t.Fatalf("NO_COLOR environment output contains ANSI color: %q", view)
+	}
+}
+
 func TestFinderUsesBubblesFilteringAndOpensSelectedNode(t *testing.T) {
 	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
 	model.graph = newGraphState([]domain.Node{task("a", "Alpha"), task("b", "Beta")}, nil)
@@ -810,6 +883,28 @@ func TestMouseCanSwitchVisibleWorkspaceTabs(t *testing.T) {
 	_, _ = model.Update(click)
 	if model.workspace != RelationshipsWorkspace {
 		t.Fatalf("mouse selected workspace %v", model.workspace)
+	}
+}
+
+func TestEveryVisibleWorkspaceTabHasAnExactMouseTarget(t *testing.T) {
+	for _, noColor := range []bool{false, true} {
+		model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(noColor))
+		model.width = 120
+		x := ansi.StringWidth(model.headerPrefix())
+		for workspace := WorkWorkspace; workspace <= TimelineWorkspace; workspace++ {
+			width := ansi.StringWidth(model.renderTab(workspace))
+			click := tea.MouseClickMsg{X: x + width/2, Y: 0, Button: tea.MouseLeft}
+			_, _ = model.Update(click)
+			if model.workspace != workspace {
+				t.Fatalf("noColor=%v click x=%d selected %v, want %v", noColor, click.X, model.workspace, workspace)
+			}
+			x += width
+		}
+		before := model.workspace
+		_, _ = model.Update(tea.MouseClickMsg{X: x + 1, Y: 0, Button: tea.MouseLeft})
+		if model.workspace != before {
+			t.Fatalf("noColor=%v click outside tabs changed workspace to %v", noColor, model.workspace)
+		}
 	}
 }
 
@@ -925,6 +1020,190 @@ func TestAsyncListFiltersAreRoutedToTheirOrigin(t *testing.T) {
 	if !strings.Contains(model.inspector.markdown, "# BLOCKS") {
 		t.Fatalf("filter selection left stale inspector content: %q", model.inspector.markdown)
 	}
+}
+
+func TestAsyncListFiltersRejectStaleSameValueGenerations(t *testing.T) {
+	t.Run("relationships after graph replacement", func(t *testing.T) {
+		model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+		model.workspace = RelationshipsWorkspace
+		oldGraph := newGraphState(
+			[]domain.Node{task("old-a", "Alpha old"), task("old-b", "Beta old")},
+			[]domain.Edge{{ID: "old-edge", From: "old-a", To: "old-b", Type: "ALPHA"}},
+		)
+		_ = model.relationships.setGraph(oldGraph)
+		_, _ = model.Update(keyPress("/"))
+		_, oldCmd := model.Update(keyPress("a"))
+		oldMessage := lastCommandMessage(t, oldCmd)
+
+		newGraph := newGraphState(
+			[]domain.Node{task("new-a", "Alpha new"), task("new-b", "Beta new")},
+			[]domain.Edge{{ID: "new-edge", From: "new-a", To: "new-b", Type: "ALPHA"}},
+		)
+		newCmd := model.relationships.setGraph(newGraph)
+		_, _ = model.Update(oldMessage)
+		for _, item := range model.relationships.list.VisibleItems() {
+			if item.(relationshipItem).edge.ID == "old-edge" {
+				t.Fatal("stale relationship filter restored an item from the replaced graph")
+			}
+		}
+		_, _ = model.Update(lastCommandMessage(t, newCmd))
+		visible := model.relationships.list.VisibleItems()
+		if len(visible) != 1 || visible[0].(relationshipItem).edge.ID != "new-edge" {
+			t.Fatalf("current relationship filter results = %#v", visible)
+		}
+	})
+
+	t.Run("timeline after revision replacement", func(t *testing.T) {
+		model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+		model.workspace = TimelineWorkspace
+		_ = model.timeline.setRevisions([]domain.RevisionInfo{{Revision: 1, Actor: "alpha old"}}, 1, false)
+		_, _ = model.Update(keyPress("/"))
+		_, oldCmd := model.Update(keyPress("a"))
+		oldMessage := lastCommandMessage(t, oldCmd)
+
+		newCmd := model.timeline.setRevisions([]domain.RevisionInfo{{Revision: 2, Actor: "alpha new"}}, 2, false)
+		_, _ = model.Update(oldMessage)
+		for _, item := range model.timeline.list.VisibleItems() {
+			if item.(revisionItem).info.Revision == 1 {
+				t.Fatal("stale timeline filter restored a replaced revision")
+			}
+		}
+		_, _ = model.Update(lastCommandMessage(t, newCmd))
+		visible := model.timeline.list.VisibleItems()
+		if len(visible) != 1 || visible[0].(revisionItem).info.Revision != 2 {
+			t.Fatalf("current timeline filter results = %#v", visible)
+		}
+	})
+
+	t.Run("picker repeated filter value", func(t *testing.T) {
+		model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+		_ = model.openCommands()
+		_, oldCmd := model.Update(keyPress("t"))
+		oldMessage := lastCommandMessage(t, oldCmd)
+		_, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
+		_, newCmd := model.Update(keyPress("t"))
+		if model.overlay.picker.list.FilterValue() != "t" {
+			t.Fatalf("current picker filter = %q", model.overlay.picker.list.FilterValue())
+		}
+		_, _ = model.Update(oldMessage)
+		if model.overlay.picker.filteredValue != "" {
+			t.Fatalf("stale picker result marked %q as current", model.overlay.picker.filteredValue)
+		}
+		_, _ = model.Update(lastCommandMessage(t, newCmd))
+		if model.overlay.picker.filteredValue != "t" {
+			t.Fatalf("current picker result was not applied: %q", model.overlay.picker.filteredValue)
+		}
+	})
+}
+
+func TestPickersOpenPopulatedBeforeTheFirstKeystroke(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	_ = model.openCommands()
+	if visible, all := len(model.overlay.picker.list.VisibleItems()), len(model.overlay.picker.list.Items()); visible != all || all == 0 {
+		t.Fatalf("command palette opened with %d/%d visible items", visible, all)
+	}
+	if _, ok := model.overlay.picker.selectedCommand(); !ok {
+		t.Fatal("command palette opened without an activatable selection")
+	}
+	if view := model.overlay.picker.view(); strings.Contains(view, "Nothing matched") {
+		t.Fatalf("command palette opened in a false empty state:\n%s", view)
+	}
+
+	model.overlay.kind = overlayNone
+	model.graph = newGraphState([]domain.Node{task("a", "Alpha"), task("b", "Beta")}, nil)
+	_ = model.openFinder()
+	if visible, all := len(model.overlay.picker.list.VisibleItems()), len(model.overlay.picker.list.Items()); visible != all || all != 2 {
+		t.Fatalf("finder opened with %d/%d visible items", visible, all)
+	}
+}
+
+func TestHistoricalCommandPaletteContainsNoDisabledMutations(t *testing.T) {
+	styles := makeStyles(true, true)
+	live := newCommandPicker(1, styles, true, 80, 24, false)
+	historical := newCommandPicker(2, styles, true, 80, 24, true)
+	mutation := map[commandID]bool{
+		commandCreate: true, commandEditNode: true, commandMoveNode: true, commandConnect: true,
+		commandDeleteNode: true, commandEditRelationship: true, commandDeleteRelationship: true,
+	}
+	liveMutations := 0
+	returnLive := false
+	for _, raw := range live.list.Items() {
+		item := raw.(commandItem)
+		if mutation[item.id] {
+			liveMutations++
+		}
+	}
+	if liveMutations != len(mutation) {
+		t.Fatalf("live palette contains %d mutation commands, want %d", liveMutations, len(mutation))
+	}
+	for _, raw := range historical.list.Items() {
+		item := raw.(commandItem)
+		if mutation[item.id] {
+			t.Fatalf("historical palette advertises disabled mutation %q", item.title)
+		}
+		returnLive = returnLive || item.id == commandReturnLive
+	}
+	if !returnLive {
+		t.Fatal("historical palette omitted Return to Live")
+	}
+}
+
+func TestSnapshotRefreshKeepsOpenPickersCurrentWithoutDroppingFilters(t *testing.T) {
+	t.Run("finder graph", func(t *testing.T) {
+		model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+		model.graph = newGraphState([]domain.Node{task("old", "Old node")}, nil)
+		model.work.setGraph(model.graph)
+		_ = model.openFinder()
+		_, oldCmd := model.Update(keyPress("n"))
+		oldMatch := lastCommandMessage(t, oldCmd)
+
+		model.loadSeq = 1
+		newGraph := newGraphState([]domain.Node{task("new", "New node")}, nil)
+		_ = model.applySnapshotLoaded(snapshotLoadedMsg{
+			serial: 1, loaded: snapshotLoad{graph: newGraph, revision: 2},
+		})
+		if model.overlay.kind != overlayFinder || model.overlay.picker.list.FilterInput.Value() != "n" {
+			t.Fatalf("snapshot refresh dropped finder state: overlay=%v filter=%q",
+				model.overlay.kind, model.overlay.picker.list.FilterInput.Value())
+		}
+		visible := model.overlay.picker.list.VisibleItems()
+		if len(visible) != 1 || visible[0].(nodePickerItem).id != "new" {
+			t.Fatalf("refreshed finder items = %#v", visible)
+		}
+		_, _ = model.Update(oldMatch)
+		visible = model.overlay.picker.list.VisibleItems()
+		if len(visible) != 1 || visible[0].(nodePickerItem).id != "new" {
+			t.Fatalf("stale finder match replaced refreshed items: %#v", visible)
+		}
+	})
+
+	t.Run("historical command capabilities", func(t *testing.T) {
+		model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+		revision := domain.Revision(1)
+		model.snapshot.Revision = &revision
+		model.loadedRevision = revision
+		_ = model.openCommands()
+		_, _ = model.Update(keyPress("c"))
+
+		model.loadSeq = 1
+		_ = model.applySnapshotLoaded(snapshotLoadedMsg{
+			serial: 1, loaded: snapshotLoad{graph: newGraphState(nil, nil), revision: 2},
+		})
+		if model.overlay.kind != overlayCommands || model.overlay.picker.list.FilterInput.Value() != "c" {
+			t.Fatalf("return to live dropped palette state: overlay=%v filter=%q",
+				model.overlay.kind, model.overlay.picker.list.FilterInput.Value())
+		}
+		if model.overlay.picker.historical {
+			t.Fatal("live palette retained historical capabilities")
+		}
+		createVisible := false
+		for _, raw := range model.overlay.picker.list.VisibleItems() {
+			createVisible = createVisible || raw.(commandItem).id == commandCreate
+		}
+		if !createVisible {
+			t.Fatal("live palette did not acquire mutation commands after snapshot mode changed")
+		}
+	})
 }
 
 func TestCommandPaletteFiltersAndActivatesWithOneEnter(t *testing.T) {
@@ -1542,6 +1821,132 @@ func TestWorkspaceNavigationNeverConsumesPrintableEditorOrFormInput(t *testing.T
 	_, _ = model.Update(keyPress("4"))
 	if data.title != "34" || model.workspace != RelationshipsWorkspace {
 		t.Fatalf("second form digit changed workspace or was lost: workspace=%v title=%q", model.workspace, data.title)
+	}
+}
+
+func TestWorkspaceNavigationPreservesPickerFiltersAndOverlayState(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	_ = model.openCommands()
+	_, _ = model.Update(keyPress("t"))
+	serial := model.overlay.picker.serial
+	filter := model.overlay.picker.list.FilterInput.Value()
+	_, _ = model.Update(keyPress("f4"))
+	if model.workspace != TimelineWorkspace || model.overlay.kind != overlayCommands ||
+		model.overlay.picker.serial != serial || model.overlay.picker.list.FilterInput.Value() != filter {
+		t.Fatalf("F4 dropped palette state: workspace=%v overlay=%v serial=%d filter=%q",
+			model.workspace, model.overlay.kind, model.overlay.picker.serial, model.overlay.picker.list.FilterInput.Value())
+	}
+	_, _ = model.Update(keyPress("ctrl+pgdown"))
+	if model.workspace != WorkWorkspace || model.overlay.kind != overlayCommands || model.overlay.picker.list.FilterInput.Value() != filter {
+		t.Fatalf("Ctrl+PageDown dropped palette state: workspace=%v overlay=%v filter=%q",
+			model.workspace, model.overlay.kind, model.overlay.picker.list.FilterInput.Value())
+	}
+
+	_, _ = model.Update(keyPress("f10"))
+	if model.overlay.kind != overlayHelp || model.overlayReturn != overlayCommands {
+		t.Fatalf("help did not stack over picker: overlay=%v return=%v", model.overlay.kind, model.overlayReturn)
+	}
+	_, _ = model.Update(keyPress("f2"))
+	_, _ = model.Update(keyPress("f10"))
+	if model.workspace != RelationshipsWorkspace || model.overlay.kind != overlayCommands ||
+		model.overlay.picker.list.FilterInput.Value() != filter {
+		t.Fatalf("navigation through help dropped picker state: workspace=%v overlay=%v filter=%q",
+			model.workspace, model.overlay.kind, model.overlay.picker.list.FilterInput.Value())
+	}
+}
+
+func TestWorkspaceNavigationPreservesFinderAndRetryDecision(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.graph = newGraphState([]domain.Node{task("a", "Alpha")}, nil)
+	_ = model.openFinder()
+	_, _ = model.Update(keyPress("a"))
+	_, _ = model.Update(keyPress("f3"))
+	if model.workspace != QueryWorkspace || model.overlay.kind != overlayFinder ||
+		model.overlay.picker.list.FilterInput.Value() != "a" {
+		t.Fatalf("F3 dropped finder state: workspace=%v overlay=%v filter=%q",
+			model.workspace, model.overlay.kind, model.overlay.picker.list.FilterInput.Value())
+	}
+
+	pending := &pendingOperation{kind: executionMutation}
+	model.overlay.kind = overlayOperationError
+	model.pending = pending
+	model.operationErr = errors.New("conflict")
+	_, _ = model.Update(keyPress("ctrl+pgup"))
+	if model.workspace != RelationshipsWorkspace || model.overlay.kind != overlayOperationError || model.pending != pending {
+		t.Fatalf("Ctrl+PageUp dropped retry state: workspace=%v overlay=%v pending=%v",
+			model.workspace, model.overlay.kind, model.pending != nil)
+	}
+}
+
+func TestWorkspaceNavigationWorksFromActiveRelationshipAndTimelineFilters(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	graph := newGraphState(
+		[]domain.Node{task("a", "Alpha"), task("b", "Beta")},
+		[]domain.Edge{{ID: "edge", From: "a", To: "b", Type: "BLOCKS"}},
+	)
+	_ = model.relationships.setGraph(graph)
+	model.workspace = RelationshipsWorkspace
+	_, _ = model.Update(keyPress("/"))
+	_, _ = model.Update(keyPress("1"))
+	_, _ = model.Update(keyPress("f3"))
+	if model.workspace != QueryWorkspace || model.relationships.list.FilterInput.Value() != "1" {
+		t.Fatalf("F3 from relationship filter lost state: workspace=%v filter=%q",
+			model.workspace, model.relationships.list.FilterInput.Value())
+	}
+	_, _ = model.Update(keyPress("f2"))
+	if !model.relationships.filtering() || model.relationships.list.FilterInput.Value() != "1" {
+		t.Fatalf("returning to Relationships lost active filter: state=%v filter=%q",
+			model.relationships.list.FilterState(), model.relationships.list.FilterInput.Value())
+	}
+
+	_ = model.timeline.setRevisions([]domain.RevisionInfo{{Revision: 1, Actor: "agent-2"}}, 1, false)
+	_, _ = model.Update(keyPress("f4"))
+	_, _ = model.Update(keyPress("/"))
+	_, _ = model.Update(keyPress("2"))
+	_, _ = model.Update(keyPress("ctrl+pgdown"))
+	if model.workspace != WorkWorkspace || model.timeline.list.FilterInput.Value() != "2" {
+		t.Fatalf("Ctrl+PageDown from timeline filter lost state: workspace=%v filter=%q",
+			model.workspace, model.timeline.list.FilterInput.Value())
+	}
+	_, _ = model.Update(keyPress("f4"))
+	if !model.timeline.filtering() || model.timeline.list.FilterInput.Value() != "2" {
+		t.Fatalf("returning to Timeline lost active filter: state=%v filter=%q",
+			model.timeline.list.FilterState(), model.timeline.list.FilterInput.Value())
+	}
+}
+
+func TestWorkspaceNavigationPreservesHuhSelectFiltering(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.graph = newGraphState([]domain.Node{task("a", "Alpha"), task("b", "Beta")}, nil)
+	_ = model.openCreateForm()
+	_, _ = model.Update(keyPress("x"))
+	_, command := model.Update(keyPress("tab"))
+	_, _ = model.Update(lastCommandMessage(t, command))
+	_, command = model.Update(keyPress("tab"))
+	_, _ = model.Update(lastCommandMessage(t, command))
+	_, _ = model.Update(keyPress("/"))
+	_, _ = model.Update(keyPress("a"))
+	if model.form.escapeCancels() {
+		t.Fatalf("Huh parent select did not enter filtering state; focused=%T\n%s", model.form.form.GetFocusedField(), model.form.view())
+	}
+	before := model.form.view()
+	_, _ = model.Update(keyPress("f4"))
+	if model.workspace != TimelineWorkspace || model.overlay.kind != overlayForm || model.form.escapeCancels() {
+		t.Fatalf("F4 dropped Huh filtering: workspace=%v overlay=%v escapeCancels=%v",
+			model.workspace, model.overlay.kind, model.form.escapeCancels())
+	}
+	if after := model.form.view(); after != before {
+		t.Fatalf("F4 changed Huh filter state:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	_, _ = model.Update(keyPress("f10"))
+	_, _ = model.Update(keyPress("ctrl+pgdown"))
+	_, _ = model.Update(keyPress("f10"))
+	if model.workspace != WorkWorkspace || model.overlay.kind != overlayForm || model.form.escapeCancels() {
+		t.Fatal("navigation through help dropped Huh select filtering")
+	}
+	_, _ = model.Update(keyPress("esc"))
+	if model.overlay.kind != overlayForm || model.form == nil || !model.form.escapeCancels() {
+		t.Fatal("Esc did not close only the Huh select filter")
 	}
 }
 

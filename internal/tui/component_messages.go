@@ -18,13 +18,14 @@ const (
 // has no component identity, so routing it by the currently visible workspace
 // can corrupt a different list after fast workspace or overlay navigation.
 type listFilterMatchesMsg struct {
-	target listMessageTarget
-	serial uint64
-	filter string
-	msg    list.FilterMatchesMsg
+	target     listMessageTarget
+	serial     uint64
+	generation uint64
+	filter     string
+	msg        list.FilterMatchesMsg
 }
 
-func scopeListCmd(target listMessageTarget, serial uint64, filter string, cmd tea.Cmd) tea.Cmd {
+func scopeListCmd(target listMessageTarget, serial, generation uint64, filter string, cmd tea.Cmd) tea.Cmd {
 	if cmd == nil {
 		return nil
 	}
@@ -34,13 +35,15 @@ func scopeListCmd(target listMessageTarget, serial uint64, filter string, cmd te
 		case tea.BatchMsg:
 			batch := make(tea.BatchMsg, 0, len(value))
 			for _, nested := range value {
-				if scoped := scopeListCmd(target, serial, filter, nested); scoped != nil {
+				if scoped := scopeListCmd(target, serial, generation, filter, nested); scoped != nil {
 					batch = append(batch, scoped)
 				}
 			}
 			return batch
 		case list.FilterMatchesMsg:
-			return listFilterMatchesMsg{target: target, serial: serial, filter: filter, msg: value}
+			return listFilterMatchesMsg{
+				target: target, serial: serial, generation: generation, filter: filter, msg: value,
+			}
 		default:
 			return msg
 		}

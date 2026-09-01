@@ -21,12 +21,13 @@ func (i relationshipItem) Description() string { return i.description }
 func (i relationshipItem) FilterValue() string { return i.filter }
 
 type relationshipsModel struct {
-	list   list.Model
-	graph  graphState
-	width  int
-	height int
-	dark   bool
-	styles styleSet
+	list      list.Model
+	graph     graphState
+	filterSeq uint64
+	width     int
+	height    int
+	dark      bool
+	styles    styleSet
 }
 
 func newRelationshipsModel(styles styleSet, dark bool) relationshipsModel {
@@ -91,6 +92,7 @@ func (m *relationshipsModel) setGraph(graph graphState) tea.Cmd {
 		})
 	}
 	m.graph = graph
+	m.filterSeq++
 	cmd := m.list.SetItems(items)
 	if selected != "" {
 		for index, item := range m.list.Items() {
@@ -100,13 +102,17 @@ func (m *relationshipsModel) setGraph(graph graphState) tea.Cmd {
 			}
 		}
 	}
-	return scopeListCmd(listTargetRelationships, 0, m.list.FilterValue(), cmd)
+	return scopeListCmd(listTargetRelationships, 0, m.filterSeq, m.list.FilterValue(), cmd)
 }
 
 func (m *relationshipsModel) update(msg tea.Msg) tea.Cmd {
+	beforeFilter := m.list.FilterValue()
 	updated, cmd := m.list.Update(msg)
 	m.list = updated
-	return scopeListCmd(listTargetRelationships, 0, m.list.FilterValue(), cmd)
+	if beforeFilter != m.list.FilterValue() {
+		m.filterSeq++
+	}
+	return scopeListCmd(listTargetRelationships, 0, m.filterSeq, m.list.FilterValue(), cmd)
 }
 
 func (m *relationshipsModel) selectedID() domain.EntityID {

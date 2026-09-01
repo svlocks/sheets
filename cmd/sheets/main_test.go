@@ -4,6 +4,8 @@ import (
 	"errors"
 	"syscall"
 	"testing"
+
+	"github.com/svlocks/sheets/internal/cli"
 )
 
 func TestCommandExitCode(t *testing.T) {
@@ -25,5 +27,14 @@ func TestCommandExitCode(t *testing.T) {
 				t.Fatalf("commandExitCode(%v, %d) = %d, want %d", test.err, test.signalCode, got, test.want)
 			}
 		})
+	}
+}
+
+func TestTUIRunOptionsDoNotOverrideNoColorEnvironmentByDefault(t *testing.T) {
+	if options := tuiRunOptions(cli.TUIOptions{}); len(options) != 0 {
+		t.Fatalf("default TUI options contain %d model overrides, want none", len(options))
+	}
+	if options := tuiRunOptions(cli.TUIOptions{NoColor: true}); len(options) != 1 {
+		t.Fatalf("--no-color produced %d model options, want one", len(options))
 	}
 }

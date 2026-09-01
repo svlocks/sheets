@@ -64,6 +64,9 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseWheelMsg:
 		return m, m.handleMouseWheel(msg)
 	}
+	if paste, ok := message.(tea.PasteMsg); ok {
+		message = terminalSafePaste(paste)
+	}
 
 	keyMessage, isKey := message.(tea.KeyPressMsg)
 	if !isKey {
@@ -211,7 +214,7 @@ func (m *Model) activatePickerSelection() tea.Cmd {
 func (m *Model) applyListFilterMatches(msg listFilterMatchesMsg) tea.Cmd {
 	switch msg.target {
 	case listTargetRelationships:
-		if msg.filter != m.relationships.list.FilterValue() {
+		if msg.generation != m.relationships.filterSeq || msg.filter != m.relationships.list.FilterValue() {
 			return nil
 		}
 		before := m.relationships.selectedID()
@@ -221,7 +224,7 @@ func (m *Model) applyListFilterMatches(msg listFilterMatchesMsg) tea.Cmd {
 		}
 		return cmd
 	case listTargetTimeline:
-		if msg.filter != m.timeline.list.FilterValue() {
+		if msg.generation != m.timeline.filterSeq || msg.filter != m.timeline.list.FilterValue() {
 			return nil
 		}
 		before, _ := m.timeline.selectedRevision()
@@ -232,7 +235,8 @@ func (m *Model) applyListFilterMatches(msg listFilterMatchesMsg) tea.Cmd {
 		}
 		return cmd
 	case listTargetPicker:
-		if msg.serial != m.overlay.picker.serial || msg.filter != m.overlay.picker.list.FilterValue() {
+		if msg.serial != m.overlay.picker.serial || msg.generation != m.overlay.picker.filterSeq ||
+			msg.filter != m.overlay.picker.list.FilterValue() {
 			return nil
 		}
 		cmd := m.overlay.picker.update(msg.msg)
@@ -441,6 +445,7 @@ func (m *Model) applySnapshotLoaded(msg snapshotLoadedMsg) tea.Cmd {
 		m.selectAfterLoad = ""
 	}
 	relationshipCmd := m.relationships.setGraph(m.graph)
+	pickerCmd := m.refreshSnapshotPicker()
 	var timelineCmd tea.Cmd
 	if m.historyReady {
 		timelineCmd = m.timeline.setRevisions(m.revisions, m.liveRevision, m.includeInitialRevision())
@@ -454,7 +459,30 @@ func (m *Model) applySnapshotLoaded(msg snapshotLoadedMsg) tea.Cmd {
 	} else {
 		mode += " · read-only"
 	}
-	return tea.Batch(relationshipCmd, timelineCmd, m.layoutComponents(), m.refreshInspector(), m.setNotice(noticeSuccess, mode))
+	return tea.Batch(relationshipCmd, timelineCmd, pickerCmd, m.layoutComponents(), m.refreshInspector(), m.setNotice(noticeSuccess, mode))
+}
+
+func (m *Model) refreshSnapshotPicker() tea.Cmd {
+	effectiveOverlay := m.overlay.kind
+	if effectiveOverlay == overlayHelp {
+		effectiveOverlay = m.overlayReturn
+	}
+	switch effectiveOverlay {
+	case overlayFinder:
+		m.overlay.picker.replaceItems(nodePickerItems(m.graph))
+	case overlayCommands:
+		if m.overlay.picker.historical != m.historical() {
+			m.overlay.picker.historical = m.historical()
+			m.overlay.picker.replaceItems(commandPickerItems(m.historical()))
+		}
+	default:
+		return nil
+	}
+	if m.overlay.kind != overlayHelp && m.overlay.picker.openWhenReady {
+		m.overlay.picker.openWhenReady = false
+		return m.activatePickerSelection()
+	}
+	return nil
 }
 
 func (m *Model) applyHistoryLoaded(msg historyLoadedMsg) tea.Cmd {

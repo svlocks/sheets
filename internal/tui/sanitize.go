@@ -34,6 +34,18 @@ func terminalSafeKeyPress(message tea.KeyPressMsg) tea.KeyPressMsg {
 	return tea.KeyPressMsg(key)
 }
 
+func terminalSafePaste(message tea.PasteMsg) tea.PasteMsg {
+	// Terminals and clipboards commonly supply CRLF. Treat both CRLF and lone
+	// CR as line boundaries before making other controls visible; otherwise a
+	// normal Windows paste would gain a literal "\\r" in the editor. Tabs are
+	// intentionally expanded to four spaces, matching Bubbles textarea's own
+	// paste sanitizer and keeping cursor/layout width deterministic.
+	message.Content = strings.ReplaceAll(message.Content, "\r\n", "\n")
+	message.Content = strings.ReplaceAll(message.Content, "\r", "\n")
+	message.Content = sanitizeTerminalText(message.Content, true)
+	return message
+}
+
 // terminalBlock is terminalLine's multiline counterpart for Markdown bodies
 // and error details. Newlines are retained, while every other terminal control
 // is rendered as visible ASCII.

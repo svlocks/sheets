@@ -28,15 +28,14 @@ func (m *Model) setWorkspace(workspace Workspace) tea.Cmd {
 	return tea.Batch(m.layoutComponents(), m.refreshInspector())
 }
 
-// navigateWorkspace is the global, non-text navigation path. A form, error,
-// or help overlay remains visible so changing the underlying destination never
-// discards entered data or hides a retry decision.
+// navigateWorkspace is the global, non-text navigation path. An active overlay
+// remains visible so changing the underlying destination never discards typed
+// filters, form data, help position, or a retry decision.
 func (m *Model) navigateWorkspace(workspace Workspace) tea.Cmd {
 	if workspace > TimelineWorkspace {
 		return nil
 	}
-	switch m.overlay.kind {
-	case overlayForm, overlayOperationError, overlayHelp:
+	if m.overlay.kind != overlayNone {
 		m.workspace = workspace
 		m.focus = focusPrimary
 		commands := []tea.Cmd{m.layoutComponents(), m.refreshInspector()}
@@ -44,9 +43,8 @@ func (m *Model) navigateWorkspace(workspace Workspace) tea.Cmd {
 			commands = append(commands, m.query.focusCurrent())
 		}
 		return tea.Batch(commands...)
-	default:
-		return m.setWorkspace(workspace)
 	}
+	return m.setWorkspace(workspace)
 }
 
 func (m *Model) openFinder() tea.Cmd {

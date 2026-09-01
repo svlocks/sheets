@@ -113,8 +113,16 @@ func (b tuiBackend) ListRevisionPage(ctx context.Context, page domain.RevisionPa
 
 func runTUI(ctx context.Context, found project.Project, executor *engine.Engine, options cli.TUIOptions) error {
 	backend := tuiBackend{root: found.Root, engine: executor}
-	if err := tui.Run(ctx, backend, tui.WithNoColor(options.NoColor)); err != nil {
+	if err := tui.Run(ctx, backend, tuiRunOptions(options)...); err != nil {
 		return fmt.Errorf("run terminal UI: %w", err)
 	}
 	return nil
+}
+
+func tuiRunOptions(options cli.TUIOptions) []tui.Option {
+	tuiOptions := make([]tui.Option, 0, 1)
+	if options.NoColor {
+		tuiOptions = append(tuiOptions, tui.WithNoColor(true))
+	}
+	return tuiOptions
 }
