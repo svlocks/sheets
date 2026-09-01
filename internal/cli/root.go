@@ -55,6 +55,7 @@ func New(options Options) *cobra.Command {
 		environment.queryCommand(false),
 		environment.historyCommand(),
 		environment.statusCommand(),
+		environment.skillCommand(),
 		environment.tuiCommand(),
 	)
 	return root
