@@ -137,11 +137,9 @@ func (t LocalTime) Add(duration Duration) (LocalTime, error) {
 
 // Subtract subtracts only the seconds component group of a duration.
 func (t LocalTime) Subtract(duration Duration) (LocalTime, error) {
-	negated, err := duration.Negate()
-	if err != nil {
-		return LocalTime{}, err
-	}
-	return t.Add(negated)
+	seconds := floorMod(duration.seconds, secondsPerDay)
+	delta := seconds*nanosecondsPerSecond + int64(duration.nanoseconds)
+	return localTimeFromNanoOfDay(floorMod(t.nanoOfDay-delta, nanosecondsPerDay))
 }
 
 // Compare returns -1, 0, or 1 in wall-clock order.

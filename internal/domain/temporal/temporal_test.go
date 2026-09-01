@@ -81,6 +81,28 @@ func TestDateParsingComponentsAndArithmetic(t *testing.T) {
 	}
 }
 
+func TestISOWeekAtDurableDateBounds(t *testing.T) {
+	for _, fields := range []struct {
+		year  int64
+		month int
+		day   int
+	}{
+		{MinYear, 1, 1},
+		{MinYear, 12, 31},
+		{MaxYear, 1, 1},
+		{MaxYear, 12, 31},
+	} {
+		date, err := NewDate(fields.year, fields.month, fields.day)
+		if err != nil {
+			t.Fatal(err)
+		}
+		weekYear, week := date.ISOWeek()
+		if weekYear < fields.year-1 || weekYear > fields.year+1 || week < 1 || week > 53 {
+			t.Errorf("%s ISO week = %d-W%02d", date, weekYear, week)
+		}
+	}
+}
+
 func TestTimeParsingComponentsComparisonAndWrap(t *testing.T) {
 	localTests := map[string]string{
 		"21:40:32.142": "21:40:32.142",
@@ -188,6 +210,68 @@ func TestDurationConstructionParsingArithmeticAndAccessors(t *testing.T) {
 	}
 }
 
+func TestDurationParsingRejectsNonM23Forms(t *testing.T) {
+	for _, input := range []string{
+		"P1DT", "PT1Y", "PT1W", "PT1D", "P1H", "P1Q",
+		"P1D1Y", "P1M1Y", "PT1S1H", "PT1M1H",
+		"P2011-02-29T12:00:00", "P2012-13-01T00:00:00",
+		"P2012-01-01T24:00:00", "P2012-01-01T00:60:00",
+		"P2012-01-01T00:00:60",
+	} {
+		if _, err := ParseDuration(input); !errors.Is(err, ErrInvalid) {
+			t.Errorf("ParseDuration(%q) error = %v, want ErrInvalid", input, err)
+		}
+	}
+	for _, input := range []string{
+		"P-1Y-2M-3DT-4H-5M-6.000000007S",
+		"P2012Y-2M-2DT14H37M21S",
+		"P-0001-02-03T04:05:06.000000007",
+	} {
+		value, err := ParseDuration(input)
+		if err != nil {
+			t.Errorf("ParseDuration(%q): %v", input, err)
+			continue
+		}
+		roundTrip, err := ParseDuration(value.String())
+		if err != nil || !roundTrip.Equal(value) {
+			t.Errorf("duration text round trip %q -> %s -> %s, %v", input, value, roundTrip, err)
+		}
+	}
+}
+
+func TestDurationSubtractionAtIntegerBounds(t *testing.T) {
+	extreme, err := NewDuration(math.MinInt64, math.MinInt64, math.MinInt64, 123)
+	if err != nil {
+		t.Fatal(err)
+	}
+	difference, err := extreme.Subtract(extreme)
+	if err != nil || difference.String() != "PT0S" {
+		t.Fatalf("extreme duration minus itself = %s, %v", difference, err)
+	}
+	roundTrip, err := ParseDuration(extreme.String())
+	if err != nil || !roundTrip.Equal(extreme) {
+		t.Fatalf("extreme duration text round trip %s -> %s, %v", extreme, roundTrip, err)
+	}
+
+	date, _ := ParseDate("2026-08-31")
+	ignoredSeconds, _ := NewDuration(0, 0, math.MinInt64, 0)
+	if result, err := date.Subtract(ignoredSeconds); err != nil || !result.Equal(date) {
+		t.Fatalf("date subtraction inspected ignored seconds: %s, %v", result, err)
+	}
+	localTime, _ := ParseLocalTime("12:34:56.789")
+	ignoredCalendar, _ := NewDuration(math.MinInt64, math.MinInt64, 0, 0)
+	if result, err := localTime.Subtract(ignoredCalendar); err != nil || !result.Equal(localTime) {
+		t.Fatalf("local-time subtraction inspected ignored calendar groups: %s, %v", result, err)
+	}
+	offsetTime, _ := ParseTime("12:34:56.789-05:00")
+	if result, err := offsetTime.Subtract(ignoredCalendar); err != nil || !result.Equal(offsetTime) {
+		t.Fatalf("offset-time subtraction inspected ignored calendar groups: %s, %v", result, err)
+	}
+	if _, err := localTime.Subtract(ignoredSeconds); err != nil {
+		t.Fatalf("local-time modular subtraction of minimum seconds: %v", err)
+	}
+}
+
 func TestDateTimeNamedZonesDSTAndNegativeEpoch(t *testing.T) {
 	tests := map[string]string{
 		"2015-07-21T21:40:32.142+0100":                    "2015-07-21T21:40:32.142+01:00",
@@ -233,6 +317,44 @@ func TestDateTimeNamedZonesDSTAndNegativeEpoch(t *testing.T) {
 	truncated, err := after.Truncate("week")
 	if err != nil || truncated.String() != "2017-10-23T00:00+02:00[Europe/Stockholm]" {
 		t.Fatalf("zoned week truncation = %s, %v", truncated, err)
+	}
+}
+
+func TestDateTimeNamedZoneNonHourTransitionsAndDurableBounds(t *testing.T) {
+	gap, err := ParseDateTime("2017-10-01T02:15[Australia/Lord_Howe]")
+	if err != nil || gap.String() != "2017-10-01T02:45+11:00[Australia/Lord_Howe]" {
+		t.Fatalf("half-hour gap = %s, %v", gap, err)
+	}
+	overlap, err := ParseDateTime("2018-04-01T01:45[Australia/Lord_Howe]")
+	if err != nil || overlap.Offset() != "+11:00" {
+		t.Fatalf("half-hour overlap default = %s, %v", overlap, err)
+	}
+	overlapLate, err := ParseDateTime("2018-04-01T01:45+10:30[Australia/Lord_Howe]")
+	if err != nil || overlapLate.EpochSecond()-overlap.EpochSecond() != 30*60 {
+		t.Fatalf("half-hour overlap explicit = %s, %v", overlapLate, err)
+	}
+	skippedDay, err := ParseDateTime("2011-12-30T12:00[Pacific/Apia]")
+	if err != nil || skippedDay.String() != "2011-12-31T12:00+14:00[Pacific/Apia]" {
+		t.Fatalf("skipped-day gap = %s, %v", skippedDay, err)
+	}
+
+	for _, year := range []int64{MinYear, MaxYear} {
+		date, err := NewDate(year, 6, 15)
+		if err != nil {
+			t.Fatal(err)
+		}
+		value, err := NewDateTime(NewLocalDateTime(date, LocalTime{}), "Europe/Stockholm")
+		if err != nil {
+			t.Fatalf("named date-time at year %d: %v", year, err)
+		}
+		payload, err := value.MarshalBinary()
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := DateTimeFromBinary(payload)
+		if err != nil || !decoded.Equal(value) {
+			t.Fatalf("named date-time binary round trip at year %d: %s, %v", year, decoded, err)
+		}
 	}
 }
 
@@ -333,5 +455,34 @@ func FuzzTemporalBinaryDecodersDoNotPanic(f *testing.F) {
 		_, _ = LocalDateTimeFromBinary(input)
 		_, _ = DateTimeFromBinary(input)
 		_, _ = DurationFromBinary(input)
+	})
+}
+
+func FuzzDurationCanonicalRoundTrip(f *testing.F) {
+	for _, seed := range [][4]int64{
+		{0, 0, 0, 0},
+		{math.MinInt64, math.MinInt64, math.MinInt64, 123},
+		{math.MaxInt64, math.MaxInt64, math.MaxInt64 - 1, 1_999_999_999},
+		{-7, 14, -4, 500_000_000},
+	} {
+		f.Add(seed[0], seed[1], seed[2], seed[3])
+	}
+	f.Fuzz(func(t *testing.T, months, days, seconds, nanoseconds int64) {
+		value, err := NewDuration(months, days, seconds, nanoseconds)
+		if err != nil {
+			return
+		}
+		payload, err := value.MarshalBinary()
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := DurationFromBinary(payload)
+		if err != nil || !decoded.Equal(value) {
+			t.Fatalf("binary round trip = %s, %v; want %s", decoded, err, value)
+		}
+		parsed, err := ParseDuration(value.String())
+		if err != nil || !parsed.Equal(value) {
+			t.Fatalf("text round trip %s = %s, %v", value, parsed, err)
+		}
 	})
 }

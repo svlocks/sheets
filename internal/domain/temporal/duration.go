@@ -149,8 +149,10 @@ func ParseDuration(input string) (Duration, error) {
 	}
 	components := make(ComponentMap)
 	inTime := false
+	timeComponentSeen := false
 	fractionSeen := false
 	componentSeen := false
+	lastRank := 0
 	for index := 1; index < len(input); {
 		if input[index] == 'T' {
 			if inTime {
@@ -188,32 +190,40 @@ func ParseDuration(input string) (Duration, error) {
 		designator := input[index]
 		index++
 		name := ""
+		rank := 0
 		switch designator {
 		case 'Y':
-			name = "years"
-		case 'Q':
-			name = "quarters"
+			if !inTime {
+				name, rank = "years", 1
+			}
 		case 'M':
 			if inTime {
-				name = "minutes"
+				name, rank = "minutes", 6
 			} else {
-				name = "months"
+				name, rank = "months", 2
 			}
 		case 'W':
-			name = "weeks"
+			if !inTime {
+				name, rank = "weeks", 3
+			}
 		case 'D':
-			name = "days"
+			if !inTime {
+				name, rank = "days", 4
+			}
 		case 'H':
 			if inTime {
-				name = "hours"
+				name, rank = "hours", 5
 			}
 		case 'S':
 			if inTime {
-				name = "seconds"
+				name, rank = "seconds", 7
 			}
 		}
 		if name == "" {
 			return Duration{}, fmt.Errorf("%w: invalid duration designator %q", ErrInvalid, designator)
+		}
+		if rank <= lastRank {
+			return Duration{}, fmt.Errorf("%w: duration components are out of order", ErrInvalid)
 		}
 		if _, exists := components[name]; exists {
 			return Duration{}, fmt.Errorf("%w: duplicate duration component %s", ErrInvalid, name)
@@ -221,6 +231,8 @@ func ParseDuration(input string) (Duration, error) {
 		text := strings.ReplaceAll(input[start:index-1], ",", ".")
 		components[name] = text
 		componentSeen = true
+		timeComponentSeen = timeComponentSeen || inTime
+		lastRank = rank
 		if fractionSeen || hasFraction && index != len(input) {
 			return Duration{}, fmt.Errorf("%w: only the final duration component may be fractional", ErrInvalid)
 		}
@@ -228,6 +240,9 @@ func ParseDuration(input string) (Duration, error) {
 	}
 	if !componentSeen {
 		return Duration{}, fmt.Errorf("%w: duration contains no components", ErrInvalid)
+	}
+	if inTime && !timeComponentSeen {
+		return Duration{}, fmt.Errorf("%w: duration time part contains no components", ErrInvalid)
 	}
 	return DurationFromComponents(components)
 }
@@ -238,8 +253,13 @@ func parseDateTimeDuration(input string) (Duration, bool, error) {
 		return Duration{}, false, nil
 	}
 	dateText := input[1:separator]
-	parts := strings.Split(dateText, "-")
-	if len(parts) != 3 || parts[0] == "" || len(parts[1]) != 2 || len(parts[2]) != 2 {
+	dateBody := dateText
+	if strings.HasPrefix(dateBody, "+") || strings.HasPrefix(dateBody, "-") {
+		dateBody = dateBody[1:]
+	}
+	parts := strings.Split(dateBody, "-")
+	if len(parts) != 3 || len(parts[0]) < 4 || len(parts[1]) != 2 || len(parts[2]) != 2 ||
+		!decimalDigits(parts[0]) || !decimalDigits(parts[1]) || !decimalDigits(parts[2]) {
 		return Duration{}, false, nil
 	}
 	timeText := input[separator+1:]
@@ -247,13 +267,29 @@ func parseDateTimeDuration(input string) (Duration, bool, error) {
 	if len(timeParts) != 3 {
 		return Duration{}, true, fmt.Errorf("%w: malformed date-time duration", ErrInvalid)
 	}
+	local, err := ParseLocalDateTime(dateText + "T" + timeText)
+	if err != nil {
+		return Duration{}, true, fmt.Errorf("%w: malformed date-time duration: %v", ErrInvalid, err)
+	}
 	components := ComponentMap{
-		"years": parts[0], "months": parts[1], "days": parts[2],
-		"hours": timeParts[0], "minutes": timeParts[1],
-		"seconds": strings.ReplaceAll(timeParts[2], ",", "."),
+		"years": local.Year(), "months": local.Month(), "days": local.Day(),
+		"hours": local.Hour(), "minutes": local.Minute(), "seconds": local.Second(),
+		"nanoseconds": local.Nanosecond(),
 	}
 	duration, err := DurationFromComponents(components)
 	return duration, true, err
+}
+
+func decimalDigits(text string) bool {
+	if text == "" {
+		return false
+	}
+	for _, character := range text {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func numberRat(value any) (*big.Rat, error) {
@@ -373,11 +409,17 @@ func (d Duration) Add(other Duration) (Duration, error) {
 
 // Subtract performs checked component-wise subtraction.
 func (d Duration) Subtract(other Duration) (Duration, error) {
-	negated, err := other.Negate()
+	months, err := checkedSub(d.months, other.months)
 	if err != nil {
-		return Duration{}, err
+		return Duration{}, fmt.Errorf("%w: subtract duration months", ErrOverflow)
 	}
-	return d.Add(negated)
+	days, err := checkedSub(d.days, other.days)
+	if err != nil {
+		return Duration{}, fmt.Errorf("%w: subtract duration days", ErrOverflow)
+	}
+	seconds := d.secondsGroupNanoseconds()
+	seconds.Sub(seconds, other.secondsGroupNanoseconds())
+	return durationFromTotalNanoseconds(months, days, seconds)
 }
 
 // Negate returns the exact additive inverse.

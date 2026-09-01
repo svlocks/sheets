@@ -394,17 +394,17 @@ func (s *decodeState) decodeValue(v encodedValue, depth int) (any, error) {
 		}
 		return data, nil
 	case "date":
-		return decodeTemporalBinary(v.Text, "date", func(data []byte) (any, error) { return temporal.DateFromBinary(data) })
+		return decodeTemporalBinary(v.Text, "date", 7, 7, func(data []byte) (any, error) { return temporal.DateFromBinary(data) })
 	case "local_time":
-		return decodeTemporalBinary(v.Text, "local_time", func(data []byte) (any, error) { return temporal.LocalTimeFromBinary(data) })
+		return decodeTemporalBinary(v.Text, "local_time", 9, 9, func(data []byte) (any, error) { return temporal.LocalTimeFromBinary(data) })
 	case "offset_time":
-		return decodeTemporalBinary(v.Text, "offset_time", func(data []byte) (any, error) { return temporal.TimeFromBinary(data) })
+		return decodeTemporalBinary(v.Text, "offset_time", 13, 13, func(data []byte) (any, error) { return temporal.TimeFromBinary(data) })
 	case "local_datetime":
-		return decodeTemporalBinary(v.Text, "local_datetime", func(data []byte) (any, error) { return temporal.LocalDateTimeFromBinary(data) })
+		return decodeTemporalBinary(v.Text, "local_datetime", 15, 15, func(data []byte) (any, error) { return temporal.LocalDateTimeFromBinary(data) })
 	case "zoned_datetime":
-		return decodeTemporalBinary(v.Text, "zoned_datetime", func(data []byte) (any, error) { return temporal.DateTimeFromBinary(data) })
+		return decodeTemporalBinary(v.Text, "zoned_datetime", 20, 20+math.MaxUint16, func(data []byte) (any, error) { return temporal.DateTimeFromBinary(data) })
 	case "cypher_duration":
-		return decodeTemporalBinary(v.Text, "cypher_duration", func(data []byte) (any, error) { return temporal.DurationFromBinary(data) })
+		return decodeTemporalBinary(v.Text, "cypher_duration", 29, 29, func(data []byte) (any, error) { return temporal.DurationFromBinary(data) })
 	case "time":
 		data, err := base64.StdEncoding.DecodeString(v.Text)
 		if err != nil {
@@ -475,7 +475,10 @@ func (s *decodeState) decodeValue(v encodedValue, depth int) (any, error) {
 	}
 }
 
-func decodeTemporalBinary(text, kind string, decode func([]byte) (any, error)) (any, error) {
+func decodeTemporalBinary(text, kind string, minimumBytes, maximumBytes int, decode func([]byte) (any, error)) (any, error) {
+	if len(text) < base64.StdEncoding.EncodedLen(minimumBytes) || len(text) > base64.StdEncoding.EncodedLen(maximumBytes) {
+		return nil, fmt.Errorf("decode %s: binary payload length is outside [%d,%d] bytes", kind, minimumBytes, maximumBytes)
+	}
 	data, err := base64.StdEncoding.DecodeString(text)
 	if err != nil {
 		return nil, fmt.Errorf("decode %s: %w", kind, err)

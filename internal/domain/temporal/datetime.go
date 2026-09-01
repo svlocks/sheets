@@ -170,11 +170,15 @@ func (d Date) Add(duration Duration) (Date, error) {
 
 // Subtract subtracts only a duration's calendar groups from a Date.
 func (d Date) Subtract(duration Duration) (Date, error) {
-	negated, err := duration.Negate()
+	months, err := checkedSub(0, duration.months)
 	if err != nil {
 		return Date{}, err
 	}
-	return d.Add(negated)
+	days, err := checkedSub(0, duration.days)
+	if err != nil {
+		return Date{}, err
+	}
+	return d.Add(Duration{months: months, days: days})
 }
 
 // ZoneKind distinguishes numeric UTC offsets from named IANA zones.

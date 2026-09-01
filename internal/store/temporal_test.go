@@ -85,6 +85,18 @@ func TestTemporalCodecRoundTripGoldenTagsAndLegacyValues(t *testing.T) {
 	}
 }
 
+func TestTemporalCodecRejectsOversizedPayloadBeforeDecode(t *testing.T) {
+	called := false
+	text := strings.Repeat("A", base64.StdEncoding.EncodedLen(20+65535)+4)
+	_, err := decodeTemporalBinary(text, "zoned_datetime", 20, 20+65535, func([]byte) (any, error) {
+		called = true
+		return nil, nil
+	})
+	if err == nil || called {
+		t.Fatalf("oversized temporal decode error=%v decoder-called=%t", err, called)
+	}
+}
+
 func TestTemporalPropertiesIndexedAcrossHistoryAndKinds(t *testing.T) {
 	ctx := context.Background()
 	database := openTestStore(t, filepath.Join(t.TempDir(), "temporal.db"))
