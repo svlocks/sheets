@@ -266,6 +266,9 @@ func (e *queryExecution) setAssignment(values row, item cypher.SetItem) error {
 		if err != nil {
 			return err
 		}
+		if e.evaluator.deletedEntity(assigned) {
+			return evalError(item.Value, "cannot copy properties from a deleted entity")
+		}
 		properties, ok := toProperties(assigned)
 		if !ok {
 			properties, ok = entityProperties(assigned)

@@ -134,4 +134,46 @@ func TestExpectedErrorCategoryDoesNotAcceptGenericContextMessage(t *testing.T) {
 	if matched, supported := matchExpectedError(expectation, errors.New("pattern expression is not allowed in this context")); !matched || !supported {
 		t.Fatalf("pattern placement error did not match: matched=%v supported=%v", matched, supported)
 	}
+
+	expectation = "a SyntaxError should be raised at compile time: NonConstantExpression"
+	if matched, supported := matchExpectedError(expectation, errors.New(`variable "n" is not defined`)); matched || !supported {
+		t.Fatalf("undefined-variable error matched non-constant expression: matched=%v supported=%v", matched, supported)
+	}
+	if matched, supported := matchExpectedError(expectation, errors.New("non-constant expression is not allowed")); !matched || !supported {
+		t.Fatalf("non-constant error did not match: matched=%v supported=%v", matched, supported)
+	}
+
+	for _, test := range []struct {
+		code   string
+		actual string
+	}{
+		{"InvalidArgumentType", "LIMIT must be a non-negative integer"},
+		{"NegativeIntegerArgument", "LIMIT expects an integer, got float64"},
+		{"InvalidArgumentType", "range expects integers and a non-zero step"},
+		{"NumberOutOfRange", "range expects integers and a non-zero step"},
+		{"InvalidArgumentValue", "property access expects a node, relationship, or map; got integer"},
+		{"InvalidParameterUse", `parameter "value" was not supplied`},
+		{"InvalidAggregation", "aggregate functions cannot be nested"},
+		{"DeleteConnectedNode", "type expects a relationship"},
+	} {
+		expectation := "an Error should be raised at runtime: " + test.code
+		if matched, supported := matchExpectedError(expectation, errors.New(test.actual)); matched || !supported {
+			t.Errorf("%s accepted %q: matched=%v supported=%v", test.code, test.actual, matched, supported)
+		}
+	}
+}
+
+func TestEscapedDottedFunctionBindsThenRaisesUnknownFunction(t *testing.T) {
+	instance := scenarioInstance{
+		ID: "escaped-dotted-function",
+		Steps: []tckStep{
+			{Text: "an empty graph", Line: 1},
+			{Text: "executing query:", Doc: "RETURN `date.truncate`('year', date('1984-10-11'))", Line: 2},
+			{Text: "a SyntaxError should be raised at compile time: UnknownFunction", Line: 3},
+		},
+	}
+	result := runScenario(instance, nil, true)
+	if result.Status != statusPass || result.FrontendStatus != frontendBound || result.ErrorPhase != "compile time" {
+		t.Fatalf("result = %#v", result)
+	}
 }

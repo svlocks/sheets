@@ -962,10 +962,16 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 		case domain.Node:
 			return string(value.ID), nil
 		case *domain.Node:
+			if value == nil {
+				return nil, nil
+			}
 			return string(value.ID), nil
 		case domain.Edge:
 			return string(value.ID), nil
 		case *domain.Edge:
+			if value == nil {
+				return nil, nil
+			}
 			return string(value.ID), nil
 		case nil:
 			return nil, nil
@@ -1006,6 +1012,9 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 		case domain.Edge:
 			return value.Type, nil
 		case *domain.Edge:
+			if value == nil {
+				return nil, nil
+			}
 			return value.Type, nil
 		case nil:
 			return nil, nil
@@ -1048,10 +1057,16 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 		if err := require(1); err != nil {
 			return nil, err
 		}
+		if e.deletedEntity(arguments[0]) {
+			return nil, evalError(expression, "cannot access the body of a deleted entity")
+		}
 		switch value := arguments[0].(type) {
 		case domain.Node:
 			return value.Body, nil
 		case *domain.Node:
+			if value == nil {
+				return nil, nil
+			}
 			return value.Body, nil
 		case nil:
 			return nil, nil
@@ -1087,7 +1102,7 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 		}
 		edge, ok := arguments[0].(*domain.Edge)
 		if !ok || edge == nil {
-			if arguments[0] == nil {
+			if arguments[0] == nil || isNilEntity(arguments[0]) {
 				return nil, nil
 			}
 			return nil, evalError(expression, "%s expects a relationship", name)
@@ -1239,6 +1254,9 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 		if len(arguments) != 3 {
 			return nil, evalError(expression, "replace expects 3 arguments")
 		}
+		if arguments[0] == nil || arguments[1] == nil || arguments[2] == nil {
+			return nil, nil
+		}
 		text, okText := arguments[0].(string)
 		old, okOld := arguments[1].(string)
 		newValue, okNew := arguments[2].(string)
@@ -1267,7 +1285,7 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 	case "substring":
 		return substring(expression, arguments)
 	case "range":
-		return integerRange(expression, arguments)
+		return integerRange(e.ctx, expression, arguments)
 	case "abs", "ceil", "sqrt", "sign":
 		return numericFunction(expression, name, arguments)
 	case "rand":
@@ -2458,7 +2476,7 @@ func substring(expression cypher.Expression, arguments []any) (any, error) {
 	if len(arguments) != 2 && len(arguments) != 3 {
 		return nil, evalError(expression, "substring expects 2 or 3 arguments")
 	}
-	if arguments[0] == nil || arguments[1] == nil {
+	if arguments[0] == nil {
 		return nil, nil
 	}
 	text, ok := arguments[0].(string)
@@ -2466,35 +2484,52 @@ func substring(expression cypher.Expression, arguments []any) (any, error) {
 		return nil, evalError(expression, "substring expects a string first argument")
 	}
 	start, ok := integer(arguments[1])
-	if !ok {
-		return nil, evalError(expression, "substring offset must be an integer")
+	if !ok || start < 0 {
+		return nil, evalError(expression, "substring offset must be a non-negative integer")
 	}
 	runes := []rune(text)
-	start = normalizedIndex(start, int64(len(runes)))
-	start = max(0, min(start, int64(len(runes))))
+	start = min(start, int64(len(runes)))
 	end := int64(len(runes))
 	if len(arguments) == 3 {
 		length, ok := integer(arguments[2])
 		if !ok || length < 0 {
 			return nil, evalError(expression, "substring length must be a non-negative integer")
 		}
-		end = min(end, start+length)
+		// Compare before adding: start+length may overflow even though the
+		// requested substring simply extends past the end of the input.
+		remaining := end - start
+		if length < remaining {
+			end = start + length
+		}
 	}
 	return string(runes[start:end]), nil
 }
 
-func integerRange(expression cypher.Expression, arguments []any) (any, error) {
+func integerRange(ctx context.Context, expression cypher.Expression, arguments []any) (any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(arguments) != 2 && len(arguments) != 3 {
 		return nil, evalError(expression, "range expects 2 or 3 arguments")
 	}
 	start, startOK := integer(arguments[0])
 	end, endOK := integer(arguments[1])
+	if !startOK {
+		return nil, evalError(expression, "range start expects an integer, got %T", arguments[0])
+	}
+	if !endOK {
+		return nil, evalError(expression, "range end expects an integer, got %T", arguments[1])
+	}
 	step := int64(1)
 	if len(arguments) == 3 {
-		step, _ = integer(arguments[2])
+		var stepOK bool
+		step, stepOK = integer(arguments[2])
+		if !stepOK {
+			return nil, evalError(expression, "range step expects an integer, got %T", arguments[2])
+		}
 	}
-	if !startOK || !endOK || step == 0 {
-		return nil, evalError(expression, "range expects integers and a non-zero step")
+	if step == 0 {
+		return nil, evalError(expression, "range step must be non-zero")
 	}
 	if (step > 0 && start > end) || (step < 0 && start < end) {
 		return []any{}, nil
@@ -2515,6 +2550,11 @@ func integerRange(expression cypher.Expression, arguments []any) (any, error) {
 	result := make([]any, 0, count)
 	current := start
 	for index := int64(0); index < count; index++ {
+		if index&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		result = append(result, current)
 		if index+1 < count {
 			current += step

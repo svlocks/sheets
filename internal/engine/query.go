@@ -284,7 +284,10 @@ func (e *queryExecution) safeImmediateProjectionLimit(clause cypher.Clause) (int
 		return 0, err
 	}
 	limit, ok := integer(value)
-	if !ok || limit < 0 {
+	if !ok {
+		return 0, evalError(projection.Limit, "LIMIT expects an integer, got %T", value)
+	}
+	if limit < 0 {
 		return 0, evalError(projection.Limit, "LIMIT must be a non-negative integer")
 	}
 	return limit, nil
@@ -751,7 +754,10 @@ func (e *queryExecution) paginateProjection(rows []row, table [][]any, skipExpre
 		}
 		var ok bool
 		skip, ok = integer(value)
-		if !ok || skip < 0 {
+		if !ok {
+			return nil, nil, evalError(skipExpression, "SKIP expects an integer, got %T", value)
+		}
+		if skip < 0 {
 			return nil, nil, evalError(skipExpression, "SKIP must be a non-negative integer")
 		}
 	}
@@ -762,7 +768,10 @@ func (e *queryExecution) paginateProjection(rows []row, table [][]any, skipExpre
 		}
 		var ok bool
 		limit, ok = integer(value)
-		if !ok || limit < 0 {
+		if !ok {
+			return nil, nil, evalError(limitExpression, "LIMIT expects an integer, got %T", value)
+		}
+		if limit < 0 {
 			return nil, nil, evalError(limitExpression, "LIMIT must be a non-negative integer")
 		}
 	}

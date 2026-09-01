@@ -35,6 +35,25 @@ docker run --rm --user "$(id -u):$(id -g)" \
 	-Dlanguage=Go -package parsergen -visitor -no-listener -Xexact-output-dir \
 	-o /out Cypher.g4
 
+# ANTLR 4.13.1 emits a dead jump after every generated rule return solely to
+# keep errorExit labels referenced in rules that never jump there. Go's
+# unreachable analyzer rejects the sentinel itself. Remove only that exact,
+# semantically dead line, and remove the label when no real jump uses it.
+parser_file="$generated_dir/cypher_parser.go"
+filtered_parser="$generated_dir/cypher_parser.filtered.go"
+awk '
+function emit() {
+	if (section == "") return
+	gsub(/\n[ \t]*goto errorExit \/\/ Trick to prevent compiler error if the label is not used\n/, "\n", section)
+	if (section !~ /goto errorExit/) sub(/\nerrorExit:\n/, "\n", section)
+	printf "%s", section
+}
+/^func / && section != "" { emit(); section = "" }
+{ section = section $0 ORS }
+END { emit() }
+' "$parser_file" > "$filtered_parser"
+mv "$filtered_parser" "$parser_file"
+
 cp "$generated_dir/cypher_lexer.go" "$output_dir/cypher_lexer.go"
 cp "$generated_dir/cypher_parser.go" "$output_dir/cypher_parser.go"
 cp "$generated_dir/cypher_visitor.go" "$output_dir/cypher_visitor.go"

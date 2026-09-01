@@ -157,6 +157,118 @@ CREATE (:Number {name:'float', value:1.0}),
 	}
 }
 
+func TestBidirectionalIteratorAndPatternComprehensionRandomizedSmallGraphs(t *testing.T) {
+	for seed := int64(1); seed <= 12; seed++ {
+		t.Run(fmt.Sprintf("seed-%d", seed), func(t *testing.T) {
+			executor, database := testEngine(t)
+			random := rand.New(rand.NewSource(seed))
+			const nodeCount = 6
+			type endpoints struct{ from, to int }
+			edges := make([]endpoints, 0, 12)
+			for index := 0; index < nodeCount-1; index++ {
+				edges = append(edges, endpoints{from: index, to: index + 1})
+			}
+			// Always include a self-loop, then add deterministic pseudo-random
+			// directions, parallel relationships, and cycles.
+			edges = append(edges, endpoints{from: int(seed % nodeCount), to: int(seed % nodeCount)})
+			for len(edges) < 12 {
+				edges = append(edges, endpoints{from: random.Intn(nodeCount), to: random.Intn(nodeCount)})
+			}
+
+			var nodeIDs []domain.EntityID
+			_, err := database.Write(context.Background(), store.RevisionMeta{}, func(tx *store.WriteTx) error {
+				for index := 0; index < nodeCount; index++ {
+					node, createErr := tx.CreateNode(store.NodeInput{
+						Labels: []string{"Audit"}, Properties: domain.Properties{"idx": int64(index)},
+					})
+					if createErr != nil {
+						return createErr
+					}
+					nodeIDs = append(nodeIDs, node.ID)
+				}
+				for index, edge := range edges {
+					if _, createErr := tx.CreateEdge(store.EdgeInput{
+						From: nodeIDs[edge.from], To: nodeIDs[edge.to], Type: "R",
+						Properties: domain.Properties{"idx": int64(index)},
+					}); createErr != nil {
+						return createErr
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			degree := make([]int64, nodeCount)
+			adjacent := make([][]int, nodeCount)
+			for edgeIndex, edge := range edges {
+				degree[edge.from]++
+				adjacent[edge.from] = append(adjacent[edge.from], edgeIndex)
+				if edge.to != edge.from {
+					degree[edge.to]++
+					adjacent[edge.to] = append(adjacent[edge.to], edgeIndex)
+				}
+			}
+
+			comprehension := execute(t, executor, `
+MATCH (a:Audit)
+RETURN a.idx AS idx, size([(a)<-[r:R]->(b) | r]) AS degree
+ORDER BY idx`, nil)
+			if len(comprehension.Results[0].Rows) != nodeCount {
+				t.Fatalf("degree rows = %#v", comprehension.Results[0].Rows)
+			}
+			for index, values := range comprehension.Results[0].Rows {
+				if values[0] != int64(index) || values[1] != degree[index] {
+					t.Fatalf("node %d degree row = %#v, want %d", index, values, degree[index])
+				}
+			}
+
+			// Count every relationship trail of length zero through two from node
+			// zero. A self-loop occurs once in an undirected adjacency list.
+			trailCount := int64(1)
+			for _, first := range adjacent[0] {
+				trailCount++
+				edge := edges[first]
+				next := edge.from
+				if next == 0 {
+					next = edge.to
+				}
+				for _, second := range adjacent[next] {
+					if second != first {
+						trailCount++
+					}
+				}
+			}
+			paths := execute(t, executor, `
+MATCH (a:Audit {idx:0})
+RETURN size([p = (a)<-[:R*0..2]->(b) | p]) AS paths`, nil)
+			if got := paths.Results[0].Rows[0][0]; got != trailCount {
+				t.Fatalf("trail count = %v, want %d", got, trailCount)
+			}
+
+			optional := execute(t, executor, `
+OPTIONAL MATCH (missing:Absent)
+RETURN size([(missing)<-[:R]->(other) | other]) AS degree`, nil)
+			if got := optional.Results[0].Rows[0][0]; got != int64(0) {
+				t.Fatalf("optional null correlation = %v, want 0", got)
+			}
+
+			for _, query := range []string{
+				"MATCH (a:Audit)<-[:R]->(b:Audit) RETURN a.idx, b.idx ORDER BY a.idx, b.idx",
+				"MATCH (a:Audit)<-[:R]->(b:Audit)<-[:R]->(c:Audit) RETURN count(*)",
+				"MATCH (a:Audit)<-[:R*0..3]->(b:Audit) RETURN count(*)",
+				"MATCH (a:Audit)<-[:R]->(b:Audit)<-[:R]->(a) RETURN count(*)",
+			} {
+				assertIteratorEqualsFullSnapshot(t, executor, app.ExecuteRequest{Query: query})
+				if plan := executor.lastPlan(); plan.Fallback != "" {
+					t.Fatalf("bidirectional query unexpectedly fell back for %q: %#v", query, plan)
+				}
+			}
+		})
+	}
+}
+
 func TestIteratorNumericAlternativeBoundaries(t *testing.T) {
 	executor, database := testEngine(t)
 	values := []struct {

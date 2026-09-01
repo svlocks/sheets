@@ -4,6 +4,8 @@
 // it further, or translate it to a plan.
 package cypher
 
+import "strings"
+
 // Position identifies a byte position in the input. Lines and columns are
 // one-based; Offset is zero-based.
 type Position struct {
@@ -275,14 +277,24 @@ type QualifiedName struct {
 
 func (n QualifiedName) Location() Span { return n.Span }
 func (n QualifiedName) String() string {
-	result := ""
+	var result strings.Builder
 	for i, part := range n.Parts {
 		if i > 0 {
-			result += "."
+			result.WriteByte('.')
 		}
-		result += part.Name
+		// A literal dot inside one escaped identifier is not a namespace
+		// separator. Preserve that structure in the canonical rendering so a
+		// single `date.truncate` part cannot alias date.truncate's two parts in
+		// function and procedure catalog lookups.
+		if strings.ContainsRune(part.Name, '.') {
+			result.WriteByte('`')
+			result.WriteString(strings.ReplaceAll(part.Name, "`", "``"))
+			result.WriteByte('`')
+			continue
+		}
+		result.WriteString(part.Name)
 	}
-	return result
+	return result.String()
 }
 
 // PatternPart is an optionally named graph pattern (for example p = (a)-->(b)).

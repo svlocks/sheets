@@ -65,10 +65,20 @@ func TestEscapedDottedFunctionDoesNotAliasNamespacedBuiltin(t *testing.T) {
 	if _, err := Parse("RETURN date.truncate('year', date('1984-10-11'))"); err != nil {
 		t.Fatalf("canonical namespaced function: %v", err)
 	}
-	_, err := Parse("RETURN `date.truncate`('year', date('1984-10-11'))")
+	document, err := Parse("RETURN `date.truncate`('year', date('1984-10-11'))")
+	if err != nil {
+		t.Fatalf("escaped single-part function did not bind: %v", err)
+	}
+	query := document.Statements[0].(*QueryStatement)
+	invocation := query.Clauses[0].(*ProjectionClause).Items[0].Expression.(*FunctionInvocation)
+	if len(invocation.Name.Parts) != 1 || invocation.Name.String() == "date.truncate" {
+		t.Fatalf("escaped single-part name aliases qualified builtin: %#v / %q", invocation.Name, invocation.Name.String())
+	}
+
+	_, err = Parse("CALL `db.labels`()")
 	var unsupported *UnsupportedFeatureError
-	if !errors.As(err, &unsupported) {
-		t.Fatalf("escaped single-part function error = %v, want UnsupportedFeatureError", err)
+	if !errors.As(err, &unsupported) || unsupported.Feature != "procedure invocation" {
+		t.Fatalf("escaped single-part procedure error = %v, want unsupported procedure", err)
 	}
 }
 

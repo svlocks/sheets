@@ -788,6 +788,9 @@ func validateStaticPagination(source string, expression cypher.Expression, name 
 		return nil
 	}
 	if err := validateNonAggregateExpression(source, expression, variableScope{}, name); err != nil {
+		if validation, ok := err.(*evaluationError); ok && strings.Contains(validation.Message, "is not defined") {
+			return semanticError(expression, "%s requires a constant expression; row-dependent variables are non-constant", name)
+		}
 		return err
 	}
 	kind := expressionKind(expression, variableScope{})
@@ -1320,11 +1323,35 @@ func validateAggregateShape(expression cypher.Expression, insideAggregate bool) 
 			if containsAggregate(inner) {
 				return semanticError(inner, "aggregate functions are not allowed inside a list comprehension")
 			}
+			if err := validateAggregateShape(inner, insideAggregate); err != nil {
+				return err
+			}
 		}
 	case *cypher.PatternComprehension:
+		for _, node := range expression.Pattern.Nodes {
+			if err := validateAggregateShape(node.Properties, insideAggregate); err != nil {
+				return err
+			}
+		}
+		for _, relationship := range expression.Pattern.Relationships {
+			if err := validateAggregateShape(relationship.Properties, insideAggregate); err != nil {
+				return err
+			}
+			if relationship.Length != nil {
+				if err := validateAggregateShape(relationship.Length.Lower, insideAggregate); err != nil {
+					return err
+				}
+				if err := validateAggregateShape(relationship.Length.Upper, insideAggregate); err != nil {
+					return err
+				}
+			}
+		}
 		for _, inner := range []cypher.Expression{expression.Where, expression.Projection} {
 			if containsAggregate(inner) {
 				return semanticError(inner, "aggregate functions are not allowed inside a pattern comprehension")
+			}
+			if err := validateAggregateShape(inner, insideAggregate); err != nil {
+				return err
 			}
 		}
 	case *cypher.ListPredicate:
@@ -1334,6 +1361,7 @@ func validateAggregateShape(expression cypher.Expression, insideAggregate bool) 
 		if containsAggregate(expression.Where) {
 			return semanticError(expression.Where, "aggregate functions are not allowed inside a list predicate")
 		}
+		return validateAggregateShape(expression.Where, insideAggregate)
 	case *cypher.ReduceExpression:
 		for _, outer := range []cypher.Expression{expression.Initial, expression.List} {
 			if err := validateAggregateShape(outer, insideAggregate); err != nil {
@@ -1343,6 +1371,7 @@ func validateAggregateShape(expression cypher.Expression, insideAggregate bool) 
 		if containsAggregate(expression.Expression) {
 			return semanticError(expression.Expression, "aggregate functions are not allowed inside reduce")
 		}
+		return validateAggregateShape(expression.Expression, insideAggregate)
 	}
 	return nil
 }
