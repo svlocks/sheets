@@ -1,8 +1,15 @@
 .git
 .github
+.cache
 .sheets
+.env
+.env.*
+.DS_Store
 bin
 coverage
 dist
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
 *.prof
-
