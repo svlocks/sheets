@@ -10,6 +10,7 @@ import (
 
 	"github.com/svlocks/sheets/internal/cypher"
 	"github.com/svlocks/sheets/internal/domain"
+	"github.com/svlocks/sheets/internal/domain/temporal"
 )
 
 // Path is the runtime representation of a matched graph path.
@@ -643,12 +644,14 @@ func candidateNodes(graph *memoryGraph, evaluator evaluator, values row, pattern
 		if value == nil {
 			return nil, nil
 		}
-		// Numeric equality is cross-type and time.Time equality is instant-based,
-		// while the in-memory key preserves their concrete representations. Leave
-		// both to the residual matcher so an equal integer/float or equivalent
-		// temporal location cannot produce a false-negative index lookup.
+		// Numeric equality is cross-type, and legacy time.Time values compare by
+		// instant with exact DateTime values, while the in-memory key preserves
+		// concrete representations. Leave those to the residual matcher so an
+		// equivalent representation cannot produce a false-negative lookup.
 		_, numeric, _ := compareNumbers(value, value)
-		if _, temporal := value.(time.Time); numeric || temporal {
+		_, legacyTime := value.(time.Time)
+		_, exactDateTime := value.(temporal.DateTime)
+		if numeric || legacyTime || exactDateTime {
 			continue
 		}
 		choose(graph.properties[key][valueKey(value)])

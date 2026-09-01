@@ -10,6 +10,7 @@ import (
 
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/domain"
+	"github.com/svlocks/sheets/internal/domain/temporal"
 	"github.com/svlocks/sheets/internal/store"
 )
 
@@ -248,11 +249,15 @@ SET n.obsolete = 'yes', n.obsolete = null`, nil)
 MATCH (n:Task {title:'temporal'})
 RETURN n.created AS created, n.estimate AS estimate, n.obsolete AS obsolete`, nil)
 	row := result.Results[0].Rows[0]
-	created, ok := row[0].(time.Time)
-	if !ok || !created.Equal(time.Date(2026, 8, 31, 12, 30, 0, 0, time.UTC)) {
+	created, ok := row[0].(temporal.DateTime)
+	if !ok || created.String() != "2026-08-31T12:30Z" {
 		t.Fatalf("created = %#v", row[0])
 	}
-	if row[1] != 90*time.Minute || row[2] != nil {
+	estimate, err := temporal.ParseDuration("PT1H30M")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row[1] != estimate || row[2] != nil {
 		t.Fatalf("temporal row = %#v", row)
 	}
 }
@@ -265,12 +270,12 @@ RETURN n.at AS at`, nil)
 	if len(result.Results) != 1 || len(result.Results[0].Rows) != 1 {
 		t.Fatalf("create fixed-offset datetime result = %#v", result)
 	}
-	want, err := time.Parse(time.RFC3339Nano, "2026-08-31T12:34:56.123456789-05:00")
+	want, err := temporal.ParseDateTime("2026-08-31T12:34:56.123456789-05:00")
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, ok := result.Results[0].Rows[0][0].(time.Time)
-	if !ok || !got.Equal(want) || got.Nanosecond() != want.Nanosecond() {
+	got, ok := result.Results[0].Rows[0][0].(temporal.DateTime)
+	if !ok || !got.Equal(want) {
 		t.Fatalf("created fixed-offset datetime = %#v, want %s", result.Results[0].Rows[0][0], want)
 	}
 	matched := execute(t, executor, `
@@ -285,11 +290,11 @@ RETURN count(n) AS count`, nil)
 func TestEngineRejectsDurationOverflow(t *testing.T) {
 	engine, _ := testEngine(t)
 	for _, query := range []string{
-		"RETURN duration('P999999999999999999D')",
-		"RETURN duration('PT999999999999999999S')",
+		"RETURN duration('P9999999999999999999M')",
+		"RETURN duration('PT9999999999999999999S')",
 	} {
 		_, err := engine.Execute(context.Background(), app.ExecuteRequest{Query: query})
-		if err == nil || !strings.Contains(err.Error(), "exceeds the supported range") {
+		if err == nil || !strings.Contains(err.Error(), "overflow") {
 			t.Fatalf("expected duration range error for %s, got %v", query, err)
 		}
 	}

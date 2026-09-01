@@ -546,7 +546,9 @@ func supportedFunction(name string) bool {
 		"startnode", "endnode", "exists", "shortestpath", "allshortestpaths", "size", "length", "head", "last", "tail",
 		"tostring", "tointeger", "tofloat", "toboolean", "tolower", "lower", "toupper", "upper", "trim", "ltrim", "rtrim",
 		"reverse", "replace", "substring", "range", "timestamp", "datetime", "localdatetime", "date", "time", "localtime",
-		"duration", "randomuuid":
+		"duration", "datetime.fromepoch", "datetime.fromepochmillis", "date.truncate", "datetime.truncate",
+		"localdatetime.truncate", "time.truncate", "localtime.truncate", "duration.between", "duration.inmonths",
+		"duration.indays", "duration.inseconds", "randomuuid":
 		return true
 	default:
 		return false

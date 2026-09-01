@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/svlocks/sheets/internal/domain"
+	"github.com/svlocks/sheets/internal/domain/temporal"
 	"github.com/svlocks/sheets/internal/engine"
 )
 
@@ -117,6 +118,18 @@ func normalizeActual(value any) (normalizedValue, error) {
 		return normalizedValue{kind: "string", scalar: strconv.Quote(formatTCKTemporal(value))}, nil
 	case time.Duration:
 		return normalizedValue{kind: "string", scalar: strconv.Quote(formatTCKDuration(value))}, nil
+	case temporal.Date:
+		return normalizedValue{kind: "string", scalar: strconv.Quote(value.String())}, nil
+	case temporal.LocalTime:
+		return normalizedValue{kind: "string", scalar: strconv.Quote(value.String())}, nil
+	case temporal.Time:
+		return normalizedValue{kind: "string", scalar: strconv.Quote(value.String())}, nil
+	case temporal.LocalDateTime:
+		return normalizedValue{kind: "string", scalar: strconv.Quote(value.String())}, nil
+	case temporal.DateTime:
+		return normalizedValue{kind: "string", scalar: strconv.Quote(value.String())}, nil
+	case temporal.Duration:
+		return normalizedValue{kind: "string", scalar: strconv.Quote(value.String())}, nil
 	case domain.Node:
 		return normalizeNode(value)
 	case *domain.Node:

@@ -11,6 +11,7 @@ import (
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/cypher"
 	"github.com/svlocks/sheets/internal/domain"
+	"github.com/svlocks/sheets/internal/domain/temporal"
 	"github.com/svlocks/sheets/internal/store"
 )
 
@@ -588,12 +589,13 @@ func appendPushdown(current, next string) string {
 
 func storeExactPropertyValue(value any) bool {
 	switch value.(type) {
-	case bool, string, []byte, time.Duration:
+	case bool, string, []byte, time.Duration, temporal.Date, temporal.LocalTime, temporal.Time, temporal.LocalDateTime, temporal.Duration:
 		return true
 	default:
-		// Numeric equality is cross-type and time equality is instant-based in
-		// the evaluator, while the store index is representation-exact. Lists and
-		// maps can contain those values, so leave them to the residual matcher too.
+		// Numeric equality is cross-type and legacy time.Time values compare by
+		// instant with exact DateTime values, while the store index is
+		// representation-exact. Lists and maps can contain those values, so leave
+		// them to the residual matcher too.
 		return false
 	}
 }

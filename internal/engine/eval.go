@@ -17,6 +17,7 @@ import (
 
 	"github.com/svlocks/sheets/internal/cypher"
 	"github.com/svlocks/sheets/internal/domain"
+	"github.com/svlocks/sheets/internal/domain/temporal"
 )
 
 type row map[string]any
@@ -35,7 +36,8 @@ type evaluator struct {
 }
 
 func newEvaluator(params map[string]any) evaluator {
-	return evaluator{ctx: context.Background(), params: params, now: time.Now}
+	queryTime := time.Now()
+	return evaluator{ctx: context.Background(), params: params, now: func() time.Time { return queryTime }}
 }
 
 // evaluationError adds a Cypher source location to a runtime expression error.
@@ -294,7 +296,23 @@ func (e evaluator) binary(expression *cypher.BinaryExpression, values row) (any,
 		return compiled.MatchString(text), nil
 	case "+":
 		return addValues(expression, left, right)
-	case "-", "*", "/", "%", "^":
+	case "-":
+		if result, handled, err := temporalArithmetic("-", left, right); handled {
+			if err != nil {
+				return nil, evalError(expression, "temporal subtraction failed: %v", err)
+			}
+			return result, nil
+		}
+		return numericBinary(expression, operator, left, right)
+	case "*", "/":
+		if result, handled, err := temporalArithmetic(operator, left, right); handled {
+			if err != nil {
+				return nil, evalError(expression, "temporal %s failed: %v", operator, err)
+			}
+			return result, nil
+		}
+		return numericBinary(expression, operator, left, right)
+	case "%", "^":
 		return numericBinary(expression, operator, left, right)
 	default:
 		return nil, evalError(expression, "unsupported operator %q", expression.Operator)
@@ -340,6 +358,12 @@ func addValues(expression cypher.Expression, left, right any) (any, error) {
 	if left == nil || right == nil {
 		return nil, nil
 	}
+	if result, handled, err := temporalArithmetic("+", left, right); handled {
+		if err != nil {
+			return nil, evalError(expression, "temporal addition failed: %v", err)
+		}
+		return result, nil
+	}
 	if leftString, ok := left.(string); ok {
 		rightString, ok := right.(string)
 		if !ok {
@@ -360,6 +384,104 @@ func addValues(expression cypher.Expression, left, right any) (any, error) {
 		return append([]any{left}, rightList...), nil
 	}
 	return numericBinary(expression, "+", left, right)
+}
+
+func temporalArithmetic(operator string, left, right any) (any, bool, error) {
+	duration, rightDuration := right.(temporal.Duration)
+	if operator == "+" || operator == "-" {
+		if rightDuration {
+			switch left := left.(type) {
+			case temporal.Date:
+				duration, err := dateArithmeticDuration(duration)
+				if err != nil {
+					return nil, true, err
+				}
+				if operator == "+" {
+					value, err := left.Add(duration)
+					return value, true, err
+				}
+				value, err := left.Subtract(duration)
+				return value, true, err
+			case temporal.LocalTime:
+				if operator == "+" {
+					value, err := left.Add(duration)
+					return value, true, err
+				}
+				value, err := left.Subtract(duration)
+				return value, true, err
+			case temporal.Time:
+				if operator == "+" {
+					value, err := left.Add(duration)
+					return value, true, err
+				}
+				value, err := left.Subtract(duration)
+				return value, true, err
+			case temporal.LocalDateTime:
+				if operator == "+" {
+					value, err := left.Add(duration)
+					return value, true, err
+				}
+				value, err := left.Subtract(duration)
+				return value, true, err
+			case temporal.DateTime:
+				if operator == "+" {
+					value, err := left.Add(duration)
+					return value, true, err
+				}
+				value, err := left.Subtract(duration)
+				return value, true, err
+			case temporal.Duration:
+				if operator == "+" {
+					value, err := left.Add(duration)
+					return value, true, err
+				}
+				value, err := left.Subtract(duration)
+				return value, true, err
+			}
+		}
+		if operator == "+" {
+			if leftDuration, ok := left.(temporal.Duration); ok {
+				switch right := right.(type) {
+				case temporal.Date:
+					adjusted, err := dateArithmeticDuration(leftDuration)
+					if err != nil {
+						return nil, true, err
+					}
+					value, err := right.Add(adjusted)
+					return value, true, err
+				case temporal.LocalTime:
+					value, err := right.Add(leftDuration)
+					return value, true, err
+				case temporal.Time:
+					value, err := right.Add(leftDuration)
+					return value, true, err
+				case temporal.LocalDateTime:
+					value, err := right.Add(leftDuration)
+					return value, true, err
+				case temporal.DateTime:
+					value, err := right.Add(leftDuration)
+					return value, true, err
+				}
+			}
+		}
+	}
+	if operator == "*" {
+		if leftDuration, ok := left.(temporal.Duration); ok && isNumber(right) {
+			value, err := leftDuration.Multiply(right)
+			return value, true, err
+		}
+		if rightDuration && isNumber(left) {
+			value, err := duration.Multiply(left)
+			return value, true, err
+		}
+	}
+	if operator == "/" {
+		if leftDuration, ok := left.(temporal.Duration); ok && isNumber(right) {
+			value, err := leftDuration.Divide(right)
+			return value, true, err
+		}
+	}
+	return nil, false, nil
 }
 
 func numericBinary(expression cypher.Expression, operator string, left, right any) (any, error) {
@@ -971,6 +1093,43 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 		return temporalValue(expression, name, arguments, e.now())
 	case "duration":
 		return durationValue(expression, arguments)
+	case "datetime.fromepoch":
+		if len(arguments) != 2 {
+			return nil, evalError(expression, "datetime.fromepoch expects 2 arguments")
+		}
+		if arguments[0] == nil || arguments[1] == nil {
+			return nil, nil
+		}
+		seconds, secondsOK := integer(arguments[0])
+		nanoseconds, nanosecondsOK := integer(arguments[1])
+		if !secondsOK || !nanosecondsOK {
+			return nil, evalError(expression, "datetime.fromepoch expects integer seconds and nanoseconds")
+		}
+		value, err := temporal.DateTimeFromEpoch(seconds, nanoseconds, "Z")
+		if err != nil {
+			return nil, evalError(expression, "invalid epoch datetime: %v", err)
+		}
+		return value, nil
+	case "datetime.fromepochmillis":
+		if len(arguments) != 1 {
+			return nil, evalError(expression, "datetime.fromepochmillis expects 1 argument")
+		}
+		if arguments[0] == nil {
+			return nil, nil
+		}
+		milliseconds, ok := integer(arguments[0])
+		if !ok {
+			return nil, evalError(expression, "datetime.fromepochmillis expects an integer")
+		}
+		value, err := temporal.DateTimeFromEpochMillis(milliseconds)
+		if err != nil {
+			return nil, evalError(expression, "invalid epoch-millisecond datetime: %v", err)
+		}
+		return value, nil
+	case "date.truncate", "datetime.truncate", "localdatetime.truncate", "time.truncate", "localtime.truncate":
+		return truncateTemporalValue(expression, name, arguments)
+	case "duration.between", "duration.inmonths", "duration.indays", "duration.inseconds":
+		return durationBetweenValue(expression, name, arguments)
 	case "randomuuid":
 		if err := require(0); err != nil {
 			return nil, err
@@ -992,6 +1151,57 @@ func isAggregate(name string) bool {
 
 func property(value any, key string) any {
 	switch value := value.(type) {
+	case temporal.Date:
+		return dateProperty(value, key)
+	case temporal.LocalTime:
+		return localTimeProperty(value, key)
+	case temporal.Time:
+		if result, ok := offsetProperty(value.Offset(), value.OffsetMinutes(), value.OffsetSeconds(), key); ok {
+			return result
+		}
+		return localTimeProperty(value.LocalTime(), key)
+	case temporal.LocalDateTime:
+		if result := dateProperty(value.Date(), key); result != nil {
+			return result
+		}
+		return localTimeProperty(value.LocalTime(), key)
+	case temporal.DateTime:
+		if result, ok := offsetProperty(value.Offset(), value.OffsetMinutes(), value.OffsetSeconds(), key); ok {
+			if key == "timezone" {
+				return value.Timezone()
+			}
+			return result
+		}
+		switch key {
+		case "epochSeconds":
+			return value.EpochSecond()
+		case "epochMillis":
+			milliseconds, err := value.EpochMillis()
+			if err == nil {
+				return milliseconds
+			}
+			return nil
+		}
+		if result := dateProperty(value.Date(), key); result != nil {
+			return result
+		}
+		return localTimeProperty(value.LocalTime(), key)
+	case temporal.Duration:
+		switch key {
+		case "seconds":
+			return value.CanonicalSeconds()
+		case "millisecondsOfSecond":
+			return int64(value.NanosecondsPart() / 1_000_000)
+		case "microsecondsOfSecond":
+			return int64(value.NanosecondsPart() / 1_000)
+		case "nanosecondsOfSecond":
+			return int64(value.NanosecondsPart())
+		}
+		component, err := value.Component(key)
+		if err != nil {
+			return nil
+		}
+		return component
 	case domain.Node:
 		if key == "body" {
 			return value.Body
@@ -1021,6 +1231,63 @@ func property(value any, key string) any {
 		return value[key]
 	default:
 		return nil
+	}
+}
+
+func dateProperty(value temporal.Date, key string) any {
+	switch key {
+	case "year":
+		return value.Year()
+	case "quarter":
+		return int64(value.Quarter())
+	case "month":
+		return int64(value.Month())
+	case "week":
+		return int64(value.Week())
+	case "weekYear":
+		return value.WeekYear()
+	case "day":
+		return int64(value.Day())
+	case "ordinalDay":
+		return int64(value.OrdinalDay())
+	case "weekDay":
+		return int64(value.WeekDay())
+	case "dayOfQuarter":
+		return int64(value.DayOfQuarter())
+	default:
+		return nil
+	}
+}
+
+func localTimeProperty(value temporal.LocalTime, key string) any {
+	switch key {
+	case "hour":
+		return int64(value.Hour())
+	case "minute":
+		return int64(value.Minute())
+	case "second":
+		return int64(value.Second())
+	case "millisecond":
+		return int64(value.Millisecond())
+	case "microsecond":
+		return int64(value.Microsecond())
+	case "nanosecond":
+		return int64(value.Nanosecond())
+	default:
+		return nil
+	}
+}
+
+func offsetProperty(offset string, offsetMinutes, offsetSeconds int, key string) (any, bool) {
+	switch key {
+	case "timezone", "offset":
+		return offset, true
+	case "offsetMinutes":
+		return int64(offsetMinutes), true
+	case "offsetSeconds":
+		return int64(offsetSeconds), true
+	default:
+		return nil, false
 	}
 }
 
@@ -1101,8 +1368,17 @@ func equalValues(left, right any) bool {
 		return !unordered && comparison == 0
 	}
 	if leftTime, ok := left.(time.Time); ok {
-		rightTime, ok := right.(time.Time)
-		return ok && leftTime.Equal(rightTime)
+		switch rightTime := right.(type) {
+		case time.Time:
+			return leftTime.Equal(rightTime)
+		case temporal.DateTime:
+			return legacyTimeEqualsDateTime(leftTime, rightTime)
+		}
+	}
+	if leftTime, ok := left.(temporal.DateTime); ok {
+		if rightTime, legacy := right.(time.Time); legacy {
+			return legacyTimeEqualsDateTime(rightTime, leftTime)
+		}
 	}
 	return reflect.DeepEqual(left, right)
 }
@@ -1125,11 +1401,36 @@ func compareValues(left, right any) (int, bool) {
 		}
 		return compareBool(left, right), true
 	case time.Time:
-		right, ok := right.(time.Time)
-		if !ok {
-			return 0, false
+		switch right := right.(type) {
+		case time.Time:
+			return left.Compare(right), true
+		case temporal.DateTime:
+			return compareLegacyTimeDateTime(left, right), true
 		}
-		return left.Compare(right), true
+		return 0, false
+	case temporal.Date:
+		right, ok := right.(temporal.Date)
+		return left.Compare(right), ok
+	case temporal.LocalTime:
+		right, ok := right.(temporal.LocalTime)
+		return left.Compare(right), ok
+	case temporal.Time:
+		right, ok := right.(temporal.Time)
+		return left.Compare(right), ok
+	case temporal.LocalDateTime:
+		right, ok := right.(temporal.LocalDateTime)
+		return left.Compare(right), ok
+	case temporal.DateTime:
+		switch right := right.(type) {
+		case temporal.DateTime:
+			return left.Compare(right), true
+		case time.Time:
+			return -compareLegacyTimeDateTime(right, left), true
+		}
+		return 0, false
+	case temporal.Duration:
+		right, ok := right.(temporal.Duration)
+		return left.CompareForOrder(right), ok
 	default:
 		return 0, false
 	}
@@ -1185,11 +1486,41 @@ func cypherEqual(left, right any) any {
 		right, ok := right.(bool)
 		return ok && left == right
 	case time.Time:
-		right, ok := right.(time.Time)
-		return ok && left.Equal(right)
+		switch right := right.(type) {
+		case time.Time:
+			return left.Equal(right)
+		case temporal.DateTime:
+			return legacyTimeEqualsDateTime(left, right)
+		default:
+			return false
+		}
 	case time.Duration:
 		right, ok := right.(time.Duration)
 		return ok && left == right
+	case temporal.Date:
+		right, ok := right.(temporal.Date)
+		return ok && left.Equal(right)
+	case temporal.LocalTime:
+		right, ok := right.(temporal.LocalTime)
+		return ok && left.Equal(right)
+	case temporal.Time:
+		right, ok := right.(temporal.Time)
+		return ok && left.Equal(right)
+	case temporal.LocalDateTime:
+		right, ok := right.(temporal.LocalDateTime)
+		return ok && left.Equal(right)
+	case temporal.DateTime:
+		switch right := right.(type) {
+		case temporal.DateTime:
+			return left.Equal(right)
+		case time.Time:
+			return legacyTimeEqualsDateTime(right, left)
+		default:
+			return false
+		}
+	case temporal.Duration:
+		right, ok := right.(temporal.Duration)
+		return ok && left.Equal(right)
 	case *domain.Node:
 		switch right := right.(type) {
 		case *domain.Node:
@@ -1313,17 +1644,54 @@ func compareCypherValues(left, right any) (comparison int, comparable, unordered
 		}
 		return compareBool(left, right), true, false
 	case time.Time:
-		right, ok := right.(time.Time)
-		if !ok {
-			return 0, false, false
+		switch right := right.(type) {
+		case time.Time:
+			return left.Compare(right), true, false
+		case temporal.DateTime:
+			return compareLegacyTimeDateTime(left, right), true, false
 		}
-		return left.Compare(right), true, false
+		return 0, false, false
 	case time.Duration:
 		right, ok := right.(time.Duration)
 		if !ok {
 			return 0, false, false
 		}
 		return compare(int64(left), int64(right)), true, false
+	case temporal.Date:
+		right, ok := right.(temporal.Date)
+		if !ok {
+			return 0, false, false
+		}
+		return left.Compare(right), true, false
+	case temporal.LocalTime:
+		right, ok := right.(temporal.LocalTime)
+		if !ok {
+			return 0, false, false
+		}
+		return left.Compare(right), true, false
+	case temporal.Time:
+		right, ok := right.(temporal.Time)
+		if !ok {
+			return 0, false, false
+		}
+		return left.Compare(right), true, false
+	case temporal.LocalDateTime:
+		right, ok := right.(temporal.LocalDateTime)
+		if !ok {
+			return 0, false, false
+		}
+		return left.Compare(right), true, false
+	case temporal.DateTime:
+		switch right := right.(type) {
+		case temporal.DateTime:
+			return left.Compare(right), true, false
+		case time.Time:
+			return -compareLegacyTimeDateTime(right, left), true, false
+		}
+		return 0, false, false
+	case temporal.Duration:
+		// Duration equality is defined, but relational comparison is not.
+		return 0, false, false
 	}
 	leftList, leftOK := asList(left)
 	rightList, rightOK := asList(right)
@@ -1349,6 +1717,17 @@ func compareCypherValues(left, right any) (comparison int, comparable, unordered
 		return compare(len(leftList), len(rightList)), true, false
 	}
 	return 0, false, false
+}
+
+func legacyTimeEqualsDateTime(legacy time.Time, exact temporal.DateTime) bool {
+	return legacy.Unix() == exact.EpochSecond() && legacy.Nanosecond() == exact.Nanosecond()
+}
+
+func compareLegacyTimeDateTime(legacy time.Time, exact temporal.DateTime) int {
+	if comparison := compare(legacy.Unix(), exact.EpochSecond()); comparison != 0 {
+		return comparison
+	}
+	return compare(legacy.Nanosecond(), exact.Nanosecond())
 }
 
 func compareNumbers(left, right any) (comparison int, numeric, unordered bool) {
@@ -1433,16 +1812,48 @@ func compareOrderValues(left, right any) int {
 	case 4: // paths
 		return strings.Compare(valueKey(left), valueKey(right))
 	case 5: // temporal values
-		leftTime, leftOK := left.(time.Time)
-		rightTime, rightOK := right.(time.Time)
-		if leftOK && rightOK {
-			return leftTime.Compare(rightTime)
+		switch left := left.(type) {
+		case time.Time:
+			switch right := right.(type) {
+			case time.Time:
+				return left.Compare(right)
+			case temporal.DateTime:
+				return compareLegacyTimeDateTime(left, right)
+			}
+		case temporal.Date:
+			if right, ok := right.(temporal.Date); ok {
+				return left.Compare(right)
+			}
+		case temporal.LocalTime:
+			if right, ok := right.(temporal.LocalTime); ok {
+				return left.Compare(right)
+			}
+		case temporal.Time:
+			if right, ok := right.(temporal.Time); ok {
+				return left.Compare(right)
+			}
+		case temporal.LocalDateTime:
+			if right, ok := right.(temporal.LocalDateTime); ok {
+				return left.Compare(right)
+			}
+		case temporal.DateTime:
+			switch right := right.(type) {
+			case temporal.DateTime:
+				return left.Compare(right)
+			case time.Time:
+				return -compareLegacyTimeDateTime(right, left)
+			}
 		}
 	case 6: // durations
-		leftDuration, leftOK := left.(time.Duration)
-		rightDuration, rightOK := right.(time.Duration)
-		if leftOK && rightOK {
-			return compare(int64(leftDuration), int64(rightDuration))
+		switch left := left.(type) {
+		case time.Duration:
+			if right, ok := right.(time.Duration); ok {
+				return compare(int64(left), int64(right))
+			}
+		case temporal.Duration:
+			if right, ok := right.(temporal.Duration); ok {
+				return left.CompareForOrder(right)
+			}
 		}
 	case 7:
 		return strings.Compare(left.(string), right.(string))
@@ -1481,9 +1892,9 @@ func orderRank(value any) int {
 	switch value.(type) {
 	case Path, PathValue:
 		return 4
-	case time.Time:
+	case time.Time, temporal.Date, temporal.LocalTime, temporal.Time, temporal.LocalDateTime, temporal.DateTime:
 		return 5
-	case time.Duration:
+	case time.Duration, temporal.Duration:
 		return 6
 	case string:
 		return 7
@@ -1636,6 +2047,18 @@ func convertValue(expression cypher.Expression, name string, value any) (any, er
 			return strconv.FormatInt(value, 10), nil
 		case float64:
 			return strconv.FormatFloat(value, 'g', -1, 64), nil
+		case temporal.Date:
+			return value.String(), nil
+		case temporal.LocalTime:
+			return value.String(), nil
+		case temporal.Time:
+			return value.String(), nil
+		case temporal.LocalDateTime:
+			return value.String(), nil
+		case temporal.DateTime:
+			return value.String(), nil
+		case temporal.Duration:
+			return value.String(), nil
 		default:
 			if integer, ok := integer(value); ok {
 				return strconv.FormatInt(integer, 10), nil
