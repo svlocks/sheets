@@ -200,7 +200,7 @@ func (m *Model) renderContent() string {
 	case QueryWorkspace:
 		return m.renderPane("Query · Tab moves focus · Ctrl+R reads · Ctrl+X executes", m.query.view(), m.width, geometry.contentHeight, true, false)
 	case TimelineWorkspace:
-		return m.renderPrimaryAndInspector("Timeline · Enter opens revision", m.timeline.view(), geometry)
+		return m.renderPrimaryAndInspector("Timeline · Enter opens · o loads older", m.timeline.view(), geometry)
 	default:
 		return fitBlock("Unknown workspace", m.width, geometry.contentHeight)
 	}
@@ -358,7 +358,7 @@ func (m *Model) contextShortHelp() []key.Binding {
 	case QueryWorkspace:
 		return append(global, m.keys.TogglePane, m.keys.RunQuery, enabledBinding(m.keys.ExecQuery, !m.historical()), m.keys.PreviousTab, m.keys.NextTab)
 	case TimelineWorkspace:
-		return append(global, m.timeline.list.KeyMap.CursorUp, m.timeline.list.KeyMap.CursorDown, m.keys.Open, m.timeline.list.KeyMap.Filter)
+		return append(global, m.timeline.list.KeyMap.CursorUp, m.timeline.list.KeyMap.CursorDown, m.keys.Open, m.keys.LoadOlder, m.timeline.list.KeyMap.Filter)
 	default:
 		return global
 	}
@@ -404,7 +404,7 @@ func (m *Model) contextFullHelp() [][]key.Binding {
 	case QueryWorkspace:
 		local = []key.Binding{m.keys.TogglePane, m.keys.RunQuery, enabledBinding(m.keys.ExecQuery, !m.historical()), m.keys.PreviousSet, m.keys.NextSet}
 	case TimelineWorkspace:
-		local = []key.Binding{m.timeline.list.KeyMap.CursorUp, m.timeline.list.KeyMap.CursorDown, m.timeline.list.KeyMap.Filter, m.keys.Open, m.keys.TogglePane}
+		local = []key.Binding{m.timeline.list.KeyMap.CursorUp, m.timeline.list.KeyMap.CursorDown, m.timeline.list.KeyMap.Filter, m.keys.Open, m.keys.LoadOlder, m.keys.TogglePane}
 	}
 	return [][]key.Binding{local, workspaces, global}
 }
@@ -415,6 +415,7 @@ func (m *Model) refreshHelpContent() {
 		"• Relationships contains every edge, including CHILD, and / filters the real list.\n" +
 		"• Query read mode rejects writes. Write-capable execution always asks for confirmation.\n" +
 		"• Opening a Timeline revision makes every workspace read-only until Return to Live.\n" +
+		"• Timeline loads newest revisions first; o fetches the next bounded older page.\n" +
 		"• F1–F4 switch workspaces from any focus; Ctrl+K exposes every primary action when no modal is open."
 	m.helpViewport.SetContent(m.help.FullHelpView(m.contextFullHelp()) + workflow)
 }

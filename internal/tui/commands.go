@@ -19,7 +19,9 @@ type snapshotLoadedMsg struct {
 
 type historyLoadedMsg struct {
 	serial    uint64
+	older     bool
 	revisions []domain.RevisionInfo
+	page      domain.PageInfo
 	err       error
 }
 
@@ -58,7 +60,20 @@ func (m *Model) startSnapshotLoad(snapshot domain.Snapshot) tea.Cmd {
 	return tea.Batch(m.spinner.Tick, load)
 }
 
+const timelinePageSize = 100
+
 func (m *Model) startHistoryLoad() tea.Cmd {
+	return m.startHistoryPage(false)
+}
+
+func (m *Model) startOlderHistory() tea.Cmd {
+	if !m.historyReady || m.loadingHistory || m.historyEnd {
+		return nil
+	}
+	return m.startHistoryPage(true)
+}
+
+func (m *Model) startHistoryPage(older bool) tea.Cmd {
 	if m.historyCancel != nil {
 		m.historyCancel()
 	}
@@ -67,14 +82,20 @@ func (m *Model) startHistoryLoad() tea.Cmd {
 	m.historySeq++
 	serial := m.historySeq
 	m.loadingHistory = true
+	m.historyOlder = older
 	m.historyErr = nil
+	m.timeline.setPaging(true, older, m.historyEnd, nil)
+	page := domain.RevisionPage{Limit: timelinePageSize, Order: domain.RevisionOrderDescending}
+	if older {
+		page.Cursor = m.historyCursor
+	}
 	backend := m.backend
 	load := func() tea.Msg {
 		if backend == nil {
-			return historyLoadedMsg{serial: serial, err: errors.New("TUI backend is nil")}
+			return historyLoadedMsg{serial: serial, older: older, err: errors.New("TUI backend is nil")}
 		}
-		revisions, err := backend.Revisions(ctx)
-		return historyLoadedMsg{serial: serial, revisions: revisions, err: err}
+		revisions, info, err := backend.ListRevisionPage(ctx, page)
+		return historyLoadedMsg{serial: serial, older: older, revisions: revisions, page: info, err: err}
 	}
 	return tea.Batch(m.spinner.Tick, load)
 }

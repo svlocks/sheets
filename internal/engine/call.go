@@ -220,10 +220,10 @@ func (e *queryExecution) revisionRows(clause *cypher.CallClause, values row) ([]
 	if e.revisions == nil {
 		return nil, fmt.Errorf("procedure %s is unavailable", clause.Procedure.String())
 	}
-	if len(clause.Arguments) > 2 {
-		return nil, fmt.Errorf("procedure %s expects at most two arguments: limit and after cursor", clause.Procedure.String())
+	if len(clause.Arguments) > 3 {
+		return nil, fmt.Errorf("procedure %s expects at most three arguments: limit, cursor, and order", clause.Procedure.String())
 	}
-	page := domain.Page{}
+	page := domain.RevisionPage{Order: domain.RevisionOrderAscending}
 	if len(clause.Arguments) > 0 {
 		value, err := e.evaluator.expression(clause.Arguments[0], values)
 		if err != nil {
@@ -247,7 +247,27 @@ func (e *queryExecution) revisionRows(clause *cypher.CallClause, values row) ([]
 			if !ok {
 				return nil, evalError(clause.Arguments[1], "revision cursor must be a string or null")
 			}
-			page.After = after
+			page.Cursor = after
+		}
+	}
+	if len(clause.Arguments) > 2 {
+		value, err := e.evaluator.expression(clause.Arguments[2], values)
+		if err != nil {
+			return nil, err
+		}
+		if value != nil {
+			order, ok := value.(string)
+			if !ok {
+				return nil, evalError(clause.Arguments[2], "revision order must be ascending or descending")
+			}
+			switch strings.ToLower(strings.TrimSpace(order)) {
+			case "ascending", "asc":
+				page.Order = domain.RevisionOrderAscending
+			case "descending", "desc":
+				page.Order = domain.RevisionOrderDescending
+			default:
+				return nil, evalError(clause.Arguments[2], "revision order must be ascending or descending")
+			}
 		}
 	}
 	infos, pageInfo, err := e.revisions(e.ctx, page)

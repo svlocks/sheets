@@ -30,20 +30,8 @@ func (b engineBackend) CurrentRevision(ctx context.Context) (domain.Revision, er
 	return b.engine.CurrentRevision(ctx)
 }
 
-func (b engineBackend) Revisions(ctx context.Context) ([]domain.RevisionInfo, error) {
-	var revisions []domain.RevisionInfo
-	page := domain.Page{Limit: 100}
-	for {
-		values, info, err := b.engine.ListRevisions(ctx, page)
-		if err != nil {
-			return nil, err
-		}
-		revisions = append(revisions, values...)
-		if info.Next == "" {
-			return revisions, nil
-		}
-		page.After = info.Next
-	}
+func (b engineBackend) ListRevisionPage(ctx context.Context, page domain.RevisionPage) ([]domain.RevisionInfo, domain.PageInfo, error) {
+	return b.engine.ListRevisionPage(ctx, page)
 }
 
 func TestGeneratedMutationFlowsExecuteAgainstRealEngine(t *testing.T) {

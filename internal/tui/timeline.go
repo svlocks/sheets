@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -30,6 +31,11 @@ type timelineModel struct {
 	dark      bool
 	styles    styleSet
 	loaded    bool
+	loading   bool
+	older     bool
+	end       bool
+	err       error
+	restore   *domain.Revision
 }
 
 func newTimelineModel(styles styleSet, dark bool) timelineModel {
@@ -62,17 +68,26 @@ func (m *timelineModel) setStyle(styles styleSet, dark bool) {
 func (m *timelineModel) setSize(width, height int) {
 	m.width = clampSize(width, 1)
 	m.height = clampSize(height, 1)
-	m.list.SetSize(m.width, m.height)
+	m.list.SetSize(m.width, max(1, m.height-1))
 }
 
-func (m *timelineModel) setRevisions(revisions []domain.RevisionInfo, live domain.Revision) tea.Cmd {
+func (m *timelineModel) setRevisions(revisions []domain.RevisionInfo, live domain.Revision, includeInitial bool) tea.Cmd {
 	selected, hadSelection := m.selectedRevision()
 	m.revisions = append([]domain.RevisionInfo(nil), revisions...)
+	sort.Slice(m.revisions, func(i, j int) bool { return m.revisions[i].Revision > m.revisions[j].Revision })
 	m.live = live
 	m.loaded = true
-	items := make([]list.Item, 0, len(revisions)+1)
-	for index := len(revisions) - 1; index >= 0; index-- {
-		info := revisions[index]
+	items := make([]list.Item, 0, len(m.revisions)+1)
+	seen := make(map[domain.Revision]struct{}, len(m.revisions))
+	for _, info := range m.revisions {
+		if info.Revision == 0 {
+			includeInitial = true
+			continue
+		}
+		if _, exists := seen[info.Revision]; exists {
+			continue
+		}
+		seen[info.Revision] = struct{}{}
 		marker := ""
 		if info.Revision == live {
 			marker = " · LIVE"
@@ -93,23 +108,36 @@ func (m *timelineModel) setRevisions(revisions []domain.RevisionInfo, live domai
 			filter:      fmt.Sprintf("%d %s %s %s", info.Revision, when, actor, message),
 		})
 	}
-	zero := domain.RevisionInfo{Revision: 0, Time: time.Time{}, Message: "Initial empty graph"}
-	items = append(items, revisionItem{
-		info: zero, title: "Revision 0 · INITIAL", description: "Empty graph before the first commit",
-		filter: "0 initial empty graph",
-	})
+	if includeInitial {
+		zero := domain.RevisionInfo{Revision: 0, Time: time.Time{}, Message: "Initial empty graph"}
+		items = append(items, revisionItem{
+			info: zero, title: "Revision 0 · INITIAL", description: "Empty graph before the first commit",
+			filter: "0 initial empty graph",
+		})
+	}
 	cmd := m.list.SetItems(items)
 	if hadSelection {
-		m.selectRevision(selected)
+		if !m.selectRevision(selected) {
+			value := selected
+			m.restore = &value
+		}
 	}
 	return scopeListCmd(listTargetTimeline, 0, m.list.FilterValue(), cmd)
 }
 
+func (m *timelineModel) setPaging(loading, older, end bool, err error) {
+	m.loading = loading
+	m.older = older
+	m.end = end
+	m.err = err
+}
+
 func (m *timelineModel) selectRevision(revision domain.Revision) bool {
-	for index, item := range m.list.Items() {
+	for index, item := range m.list.VisibleItems() {
 		value, ok := item.(revisionItem)
 		if ok && value.info.Revision == revision {
 			m.list.Select(index)
+			m.restore = nil
 			return true
 		}
 	}
@@ -119,6 +147,9 @@ func (m *timelineModel) selectRevision(revision domain.Revision) bool {
 func (m *timelineModel) update(msg tea.Msg) tea.Cmd {
 	updated, cmd := m.list.Update(msg)
 	m.list = updated
+	if m.restore != nil {
+		m.selectRevision(*m.restore)
+	}
 	return scopeListCmd(listTargetTimeline, 0, m.list.FilterValue(), cmd)
 }
 
@@ -140,6 +171,11 @@ func (m *timelineModel) selectedInfo() (domain.RevisionInfo, bool) {
 
 func (m *timelineModel) filtering() bool { return m.list.SettingFilter() }
 
+func (m *timelineModel) nearEnd() bool {
+	items := m.list.Items()
+	return len(items) > 0 && !m.list.IsFiltered() && m.list.GlobalIndex() >= len(items)-3
+}
+
 func (m *timelineModel) wheel(delta int) {
 	if delta < 0 {
 		for range -delta {
@@ -154,7 +190,30 @@ func (m *timelineModel) wheel(delta int) {
 
 func (m timelineModel) view() string {
 	if !m.loaded {
+		if m.err != nil {
+			return "Revision timeline unavailable · F5 retries: " + terminalLine(m.err.Error())
+		}
 		return "Loading revision timeline…"
 	}
-	return m.list.View()
+	if m.height <= 1 {
+		return m.list.View()
+	}
+	status := "More older revisions · press o to load"
+	switch {
+	case m.loading && m.older:
+		status = "Loading older revisions…"
+	case m.loading:
+		status = "Refreshing revision timeline…"
+	case m.err != nil && m.older:
+		status = "Older revisions failed · press o to retry: " + terminalLine(m.err.Error())
+	case m.err != nil:
+		status = "Timeline refresh failed · press F5 to retry: " + terminalLine(m.err.Error())
+	case m.end:
+		status = "Beginning of revision history reached"
+	}
+	style := m.styles.subtle
+	if m.err != nil {
+		style = m.styles.error
+	}
+	return m.list.View() + "\n" + fitLine(style.Render(status), m.width)
 }

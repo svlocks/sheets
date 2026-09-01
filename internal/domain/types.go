@@ -66,6 +66,41 @@ type Page struct {
 	After string
 }
 
+// RevisionOrder selects the stable traversal order for revision history.
+// The zero value is ascending to preserve the ordering of the original
+// revision-listing API.
+type RevisionOrder uint8
+
+const (
+	RevisionOrderAscending RevisionOrder = iota
+	RevisionOrderDescending
+)
+
+// Valid reports whether order is a supported revision ordering.
+func (order RevisionOrder) Valid() bool {
+	return order == RevisionOrderAscending || order == RevisionOrderDescending
+}
+
+// String returns the public spelling of order.
+func (order RevisionOrder) String() string {
+	switch order {
+	case RevisionOrderAscending:
+		return "ascending"
+	case RevisionOrderDescending:
+		return "descending"
+	default:
+		return "unknown"
+	}
+}
+
+// RevisionPage describes a bounded revision-history window. Cursor is an
+// opaque token returned by a preceding page in the same order.
+type RevisionPage struct {
+	Limit  int           `json:"limit,omitempty"`
+	Cursor string        `json:"cursor,omitempty"`
+	Order  RevisionOrder `json:"order,omitempty"`
+}
+
 // PageInfo accompanies a paginated result.
 type PageInfo struct {
 	Next string `json:"next,omitempty"`

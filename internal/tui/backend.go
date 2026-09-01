@@ -12,13 +12,13 @@ import (
 
 // Backend is the application boundary used by the TUI. Graph reads and every
 // mutation cross app.Executor as Cypher. CurrentRevision is deliberately the
-// cheap invalidation token used by the poller; Revisions is the shared,
-// paginated application read service exposed by the process adapter.
+// cheap invalidation token used by the poller; RevisionPager is the shared,
+// bounded application read service exposed by the process adapter.
 type Backend interface {
 	app.Executor
+	app.RevisionPager
 	ProjectRoot() string
 	CurrentRevision(context.Context) (domain.Revision, error)
-	Revisions(context.Context) ([]domain.RevisionInfo, error)
 }
 
 const snapshotQuery = `CALL sheets.nodes() YIELD node RETURN node;

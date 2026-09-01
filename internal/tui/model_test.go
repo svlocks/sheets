@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -35,6 +37,7 @@ type fakeBackend struct {
 	currentReads int
 	currentErr   error
 	historyErr   error
+	historyPages []domain.RevisionPage
 	executeErr   error
 	nextResult   app.BatchResult
 }
@@ -53,10 +56,45 @@ func (b *fakeBackend) CurrentRevision(context.Context) (domain.Revision, error) 
 	return b.revision, b.currentErr
 }
 
-func (b *fakeBackend) Revisions(context.Context) ([]domain.RevisionInfo, error) {
+func (b *fakeBackend) ListRevisionPage(_ context.Context, page domain.RevisionPage) ([]domain.RevisionInfo, domain.PageInfo, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return append([]domain.RevisionInfo(nil), b.revisions...), b.historyErr
+	b.historyPages = append(b.historyPages, page)
+	if b.historyErr != nil {
+		return nil, domain.PageInfo{}, b.historyErr
+	}
+	values := append([]domain.RevisionInfo(nil), b.revisions...)
+	sort.Slice(values, func(i, j int) bool {
+		if page.Order == domain.RevisionOrderDescending {
+			return values[i].Revision > values[j].Revision
+		}
+		return values[i].Revision < values[j].Revision
+	})
+	var boundary uint64
+	if page.Cursor != "" {
+		parsed, err := strconv.ParseUint(page.Cursor, 10, 64)
+		if err != nil {
+			return nil, domain.PageInfo{}, err
+		}
+		boundary = parsed
+	}
+	filtered := values[:0]
+	for _, info := range values {
+		if page.Cursor == "" || page.Order == domain.RevisionOrderDescending && uint64(info.Revision) < boundary ||
+			page.Order == domain.RevisionOrderAscending && uint64(info.Revision) > boundary {
+			filtered = append(filtered, info)
+		}
+	}
+	limit := page.Limit
+	if limit == 0 {
+		limit = timelinePageSize
+	}
+	var info domain.PageInfo
+	if len(filtered) > limit {
+		filtered = filtered[:limit]
+		info.Next = strconv.FormatUint(uint64(filtered[len(filtered)-1].Revision), 10)
+	}
+	return append([]domain.RevisionInfo(nil), filtered...), info, nil
 }
 
 func (b *fakeBackend) Execute(_ context.Context, request app.ExecuteRequest) (app.BatchResult, error) {
@@ -814,6 +852,10 @@ func keyPress(value string) tea.KeyPressMsg {
 		return tea.KeyPressMsg{Code: tea.KeyEscape}
 	case "enter":
 		return tea.KeyPressMsg{Code: tea.KeyEnter}
+	case "up":
+		return tea.KeyPressMsg{Code: tea.KeyUp}
+	case "down":
+		return tea.KeyPressMsg{Code: tea.KeyDown}
 	case "ctrl+r":
 		return tea.KeyPressMsg{Code: 'r', Mod: tea.ModCtrl}
 	case "ctrl+pgup":
@@ -1088,7 +1130,7 @@ func TestRevisionTimelineIncludesInitialStateAndNewestFirst(t *testing.T) {
 	timeline.setRevisions([]domain.RevisionInfo{
 		{Revision: 1, Time: time.Unix(1, 0), Message: "one"},
 		{Revision: 2, Time: time.Unix(2, 0), Message: "two"},
-	}, 2)
+	}, 2, true)
 	items := timeline.list.Items()
 	if len(items) != 3 {
 		t.Fatalf("timeline item count = %d", len(items))
@@ -1096,6 +1138,195 @@ func TestRevisionTimelineIncludesInitialStateAndNewestFirst(t *testing.T) {
 	if items[0].(revisionItem).info.Revision != 2 || items[2].(revisionItem).info.Revision != 0 {
 		t.Fatalf("timeline order = %#v", items)
 	}
+}
+
+func TestTimelineLoadsBoundedNewestFirstPagesAndMergesRefresh(t *testing.T) {
+	backend := &fakeBackend{revisions: revisionFixture(250)}
+	model := NewModel(context.Background(), backend, WithPollInterval(0), WithNoColor(true))
+
+	first := lastCommandMessage(t, model.startHistoryLoad()).(historyLoadedMsg)
+	_ = model.applyHistoryLoaded(first)
+	if len(model.revisions) != timelinePageSize || model.revisions[0].Revision != 250 || model.revisions[99].Revision != 151 {
+		t.Fatalf("initial bounded history = %d rows, bounds %d..%d", len(model.revisions), model.revisions[0].Revision, model.revisions[len(model.revisions)-1].Revision)
+	}
+	if model.historyEnd || model.historyCursor == "" {
+		t.Fatalf("initial page state: end=%t cursor=%q", model.historyEnd, model.historyCursor)
+	}
+	if got := model.timeline.list.Items(); len(got) != timelinePageSize || got[len(got)-1].(revisionItem).info.Revision == 0 {
+		t.Fatalf("initial timeline loaded revision 0 prematurely: %d items", len(got))
+	}
+
+	model.timeline.list.SetFilterText("200")
+	if !model.timeline.selectRevision(200) {
+		t.Fatal("could not select filtered historical revision")
+	}
+	backend.mu.Lock()
+	backend.revisions = append(backend.revisions, domain.RevisionInfo{Revision: 251, Message: "revision 251"})
+	backend.mu.Unlock()
+	refresh := lastCommandMessage(t, model.startHistoryLoad()).(historyLoadedMsg)
+	filterCmd := model.applyHistoryLoaded(refresh)
+	_, _ = model.Update(lastCommandMessage(t, filterCmd))
+	if len(model.revisions) != timelinePageSize || model.revisions[0].Revision != 251 || model.revisions[99].Revision != 152 {
+		t.Fatalf("refresh merge was not deduplicated: %d rows, bounds %d..%d", len(model.revisions), model.revisions[0].Revision, model.revisions[len(model.revisions)-1].Revision)
+	}
+	if selected, _ := model.timeline.selectedRevision(); selected != 200 || model.timeline.list.FilterValue() != "200" {
+		t.Fatalf("refresh lost filtered selection: revision=%d filter=%q", selected, model.timeline.list.FilterValue())
+	}
+	model.timeline.list.ResetFilter()
+
+	model.workspace = TimelineWorkspace
+	for !model.historyEnd {
+		_, command := model.Update(keyPress("o"))
+		message, ok := lastCommandMessage(t, command).(historyLoadedMsg)
+		if !ok {
+			t.Fatalf("load-older command returned an unexpected message")
+		}
+		_ = model.applyHistoryLoaded(message)
+	}
+	if len(model.revisions) != 251 {
+		t.Fatalf("eventual revision count = %d, want 251", len(model.revisions))
+	}
+	items := model.timeline.list.Items()
+	if len(items) != 252 || items[0].(revisionItem).info.Revision != 251 || items[len(items)-1].(revisionItem).info.Revision != 0 {
+		t.Fatalf("complete timeline bounds/count = %d items", len(items))
+	}
+	backend.mu.Lock()
+	pages := append([]domain.RevisionPage(nil), backend.historyPages...)
+	backend.mu.Unlock()
+	if len(pages) != 4 {
+		t.Fatalf("backend page calls = %d, want 4", len(pages))
+	}
+	for index, page := range pages {
+		if page.Limit != timelinePageSize || page.Order != domain.RevisionOrderDescending {
+			t.Fatalf("page[%d] = %#v", index, page)
+		}
+	}
+}
+
+func TestTimelineNearBottomLoadsOlderAndRetriesFailure(t *testing.T) {
+	backend := &fakeBackend{revisions: revisionFixture(150)}
+	model := NewModel(context.Background(), backend, WithPollInterval(0), WithNoColor(true))
+	model.workspace = TimelineWorkspace
+	first := lastCommandMessage(t, model.startHistoryLoad()).(historyLoadedMsg)
+	_ = model.applyHistoryLoaded(first)
+	if !model.timeline.selectRevision(52) {
+		t.Fatal("could not select near-bottom revision")
+	}
+
+	backend.mu.Lock()
+	backend.historyErr = errors.New("temporary history failure")
+	backend.mu.Unlock()
+	_, command := model.Update(keyPress("down"))
+	failed := lastCommandMessage(t, command).(historyLoadedMsg)
+	_ = model.applyHistoryLoaded(failed)
+	if model.historyErr == nil || !strings.Contains(model.timeline.view(), "press o to retry") {
+		t.Fatalf("older-page failure is not actionable: err=%v\n%s", model.historyErr, model.timeline.view())
+	}
+	failedCursor := model.historyCursor
+
+	backend.mu.Lock()
+	backend.historyErr = nil
+	backend.mu.Unlock()
+	_, command = model.Update(keyPress("o"))
+	retried := lastCommandMessage(t, command).(historyLoadedMsg)
+	_ = model.applyHistoryLoaded(retried)
+	if model.historyErr != nil || !model.historyEnd || len(model.revisions) != 150 || failedCursor == "" {
+		t.Fatalf("older-page retry state: err=%v end=%t rows=%d cursor=%q", model.historyErr, model.historyEnd, len(model.revisions), failedCursor)
+	}
+}
+
+func TestTimelineRefreshKeepsRequestedMemoryBudgetAndProtectedSelection(t *testing.T) {
+	backend := &fakeBackend{revisions: revisionFixture(200)}
+	model := NewModel(context.Background(), backend, WithPollInterval(0), WithNoColor(true))
+	first := lastCommandMessage(t, model.startHistoryLoad()).(historyLoadedMsg)
+	_ = model.applyHistoryLoaded(first)
+	if !model.timeline.selectRevision(101) {
+		t.Fatal("could not select oldest loaded revision")
+	}
+	historical := domain.Revision(101)
+	model.snapshot.Revision = &historical
+
+	backend.mu.Lock()
+	backend.revisions = revisionFixture(300)
+	backend.mu.Unlock()
+	refresh := lastCommandMessage(t, model.startHistoryLoad()).(historyLoadedMsg)
+	_ = model.applyHistoryLoaded(refresh)
+	if len(model.revisions) != timelinePageSize+1 {
+		t.Fatalf("refresh memory = %d rows, want one page plus protected selection", len(model.revisions))
+	}
+	if model.revisions[0].Revision != 300 || model.revisions[99].Revision != 201 || model.revisions[100].Revision != historical {
+		t.Fatalf("bounded refresh revisions = %#v", model.revisions)
+	}
+	if selected, _ := model.timeline.selectedRevision(); selected != historical {
+		t.Fatalf("bounded refresh lost protected revision %d", selected)
+	}
+}
+
+func TestTimelineEventuallySelectsHistoricalRevisionAndEmptyIncludesZero(t *testing.T) {
+	backend := &fakeBackend{revisions: revisionFixture(205)}
+	model := NewModel(context.Background(), backend, WithPollInterval(0), WithNoColor(true))
+	historical := domain.Revision(3)
+	model.snapshot.Revision = &historical
+
+	message := lastCommandMessage(t, model.startHistoryLoad()).(historyLoadedMsg)
+	_ = model.applyHistoryLoaded(message)
+	if selected, _ := model.timeline.selectedRevision(); selected == historical {
+		t.Fatal("unloaded historical revision appeared in the first page")
+	}
+	for !model.historyEnd {
+		message = lastCommandMessage(t, model.startOlderHistory()).(historyLoadedMsg)
+		_ = model.applyHistoryLoaded(message)
+	}
+	if selected, _ := model.timeline.selectedRevision(); selected != historical || model.snapshot.Revision == nil || *model.snapshot.Revision != historical {
+		t.Fatalf("historical selection/state = %d / %#v", selected, model.snapshot)
+	}
+
+	empty := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	emptyPage := lastCommandMessage(t, empty.startHistoryLoad()).(historyLoadedMsg)
+	_ = empty.applyHistoryLoaded(emptyPage)
+	items := empty.timeline.list.Items()
+	if len(items) != 1 || items[0].(revisionItem).info.Revision != 0 || !empty.historyEnd {
+		t.Fatalf("empty history timeline = %#v, end=%t", items, empty.historyEnd)
+	}
+}
+
+func TestTimelineRefreshPreservesHistoricalRevisionZero(t *testing.T) {
+	backend := &fakeBackend{revisions: revisionFixture(105)}
+	model := NewModel(context.Background(), backend, WithPollInterval(0), WithNoColor(true))
+	message := lastCommandMessage(t, model.startHistoryLoad()).(historyLoadedMsg)
+	_ = model.applyHistoryLoaded(message)
+	message = lastCommandMessage(t, model.startOlderHistory()).(historyLoadedMsg)
+	_ = model.applyHistoryLoaded(message)
+	zero := domain.Revision(0)
+	model.snapshot.Revision = &zero
+	if !model.timeline.selectRevision(0) {
+		t.Fatal("could not select loaded revision zero")
+	}
+
+	backend.mu.Lock()
+	backend.revisions = revisionFixture(106)
+	backend.mu.Unlock()
+	message = lastCommandMessage(t, model.startHistoryLoad()).(historyLoadedMsg)
+	_ = model.applyHistoryLoaded(message)
+	if model.historyEnd {
+		t.Fatal("newer refresh incorrectly retained the old end cursor")
+	}
+	if selected, _ := model.timeline.selectedRevision(); selected != 0 {
+		t.Fatalf("newer refresh moved historical revision-zero selection to %d", selected)
+	}
+	items := model.timeline.list.Items()
+	if len(items) != 106 || items[len(items)-1].(revisionItem).info.Revision != 0 {
+		t.Fatalf("revision-zero refresh items = %d, last %#v", len(items), items[len(items)-1])
+	}
+}
+
+func revisionFixture(count int) []domain.RevisionInfo {
+	values := make([]domain.RevisionInfo, count)
+	for index := range values {
+		revision := domain.Revision(index + 1)
+		values[index] = domain.RevisionInfo{Revision: revision, Time: time.Unix(int64(revision), 0), Message: fmt.Sprintf("revision %d", revision)}
+	}
+	return values
 }
 
 func TestHistoricalPollTracksLiveWithoutReplacingSnapshot(t *testing.T) {

@@ -117,7 +117,11 @@ type Model struct {
 
 	loadingGraph    bool
 	loadingHistory  bool
+	historyOlder    bool
 	historyReady    bool
+	historyEnd      bool
+	historyCursor   string
+	historyCapacity int
 	executing       bool
 	pending         *pendingOperation
 	operationErr    error

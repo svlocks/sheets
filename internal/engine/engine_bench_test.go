@@ -271,7 +271,7 @@ func executeForcedFullSnapshot(ctx context.Context, executor *Engine, request ap
 	if err != nil {
 		return err
 	}
-	_, err = executeDocument(ctx, document, graph, request.Params, executor.store.ListRevisions)
+	_, err = executeDocument(ctx, document, graph, request.Params, executor.store.ListRevisionPage)
 	return err
 }
 

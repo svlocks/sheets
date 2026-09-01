@@ -72,7 +72,7 @@ func (e *Engine) Execute(ctx context.Context, request app.ExecuteRequest) (app.B
 			return app.BatchResult{}, err
 		}
 		e.storePlan(plan)
-		return executeDocument(ctx, document, graph, request.Params, e.store.ListRevisions)
+		return executeDocument(ctx, document, graph, request.Params, e.listProcedureRevisions)
 	}
 
 	var batch app.BatchResult
@@ -84,7 +84,7 @@ func (e *Engine) Execute(ctx context.Context, request app.ExecuteRequest) (app.B
 		if err != nil {
 			return err
 		}
-		batch, err = executeDocument(ctx, document, graph, request.Params, e.store.ListRevisions)
+		batch, err = executeDocument(ctx, document, graph, request.Params, e.listProcedureRevisions)
 		committedGraph = graph
 		return err
 	})
@@ -263,6 +263,18 @@ func (e *Engine) CurrentRevision(ctx context.Context) (domain.Revision, error) {
 // ListRevisions exposes the store's stable revision pagination.
 func (e *Engine) ListRevisions(ctx context.Context, page domain.Page) ([]domain.RevisionInfo, domain.PageInfo, error) {
 	return e.store.ListRevisions(ctx, page)
+}
+
+// ListRevisionPage exposes bounded revision traversal in either stable order.
+func (e *Engine) ListRevisionPage(ctx context.Context, page domain.RevisionPage) ([]domain.RevisionInfo, domain.PageInfo, error) {
+	return e.store.ListRevisionPage(ctx, page)
+}
+
+func (e *Engine) listProcedureRevisions(ctx context.Context, page domain.RevisionPage) ([]domain.RevisionInfo, domain.PageInfo, error) {
+	if page.Order == domain.RevisionOrderAscending {
+		return e.store.ListRevisions(ctx, domain.Page{Limit: page.Limit, After: page.Cursor})
+	}
+	return e.store.ListRevisionPage(ctx, page)
 }
 
 func statementMutates(statement cypher.Statement) bool {

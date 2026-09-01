@@ -249,7 +249,7 @@ func (f queryFlags) snapshot() (domain.Snapshot, error) {
 
 func (e *commandEnvironment) historyCommand() *cobra.Command {
 	var limit int
-	var after, format string
+	var after, format, orderText string
 	command := &cobra.Command{
 		Use:   "history",
 		Short: "List committed graph revisions",
@@ -259,12 +259,29 @@ func (e *commandEnvironment) historyCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			var order domain.RevisionOrder
+			switch strings.ToLower(strings.TrimSpace(orderText)) {
+			case "ascending", "asc":
+				order = domain.RevisionOrderAscending
+			case "descending", "desc":
+				order = domain.RevisionOrderDescending
+			default:
+				return fmt.Errorf("invalid revision order %q: expected ascending or descending", orderText)
+			}
 			_, database, _, err := e.open(command.Context())
 			if err != nil {
 				return err
 			}
 			defer func() { runErr = errors.Join(runErr, database.Close()) }()
-			revisions, page, err := database.ListRevisions(command.Context(), domain.Page{Limit: limit, After: after})
+			var revisions []domain.RevisionInfo
+			var page domain.PageInfo
+			if order == domain.RevisionOrderAscending {
+				revisions, page, err = database.ListRevisions(command.Context(), domain.Page{Limit: limit, After: after})
+			} else {
+				revisions, page, err = database.ListRevisionPage(command.Context(), domain.RevisionPage{
+					Limit: limit, Cursor: after, Order: order,
+				})
+			}
 			if err != nil {
 				return err
 			}
@@ -282,6 +299,7 @@ func (e *commandEnvironment) historyCommand() *cobra.Command {
 	}
 	command.Flags().IntVar(&limit, "limit", 100, "maximum revisions to return")
 	command.Flags().StringVar(&after, "after", "", "opaque pagination cursor")
+	command.Flags().StringVar(&orderText, "order", domain.RevisionOrderAscending.String(), "revision order: ascending or descending")
 	command.Flags().StringVarP(&format, "output", "o", string(FormatTable), "output format: table, json, or jsonl")
 	return command
 }

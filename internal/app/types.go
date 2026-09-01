@@ -37,6 +37,12 @@ type Executor interface {
 	Execute(context.Context, ExecuteRequest) (BatchResult, error)
 }
 
+// RevisionPager is the bounded revision-history read boundary shared by
+// frontends. Implementations must treat PageInfo.Next as opaque.
+type RevisionPager interface {
+	ListRevisionPage(context.Context, domain.RevisionPage) ([]domain.RevisionInfo, domain.PageInfo, error)
+}
+
 // BatchResult preserves one result per submitted statement.
 type BatchResult struct {
 	Results  []Result         `json:"results"`

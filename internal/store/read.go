@@ -3,12 +3,9 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"math"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/svlocks/sheets/internal/domain"
@@ -137,8 +134,29 @@ func (s *Store) Revision(ctx context.Context, revision domain.Revision) (domain.
 	return info, nil
 }
 
-// ListRevisions returns revision metadata in ascending order.
+// ListRevisions returns revision metadata in ascending order. It is the
+// compatibility form of ListRevisionPage; new callers that need descending
+// traversal should use that method directly.
 func (s *Store) ListRevisions(ctx context.Context, page domain.Page) ([]domain.RevisionInfo, domain.PageInfo, error) {
+	cursor := page.After
+	if cursor != "" {
+		// Cursors issued by releases before revision paging was versioned were
+		// base64-encoded decimal boundaries. Accept them only through this
+		// legacy ascending API, then immediately upgrade to the bound format.
+		if upgraded, ok := upgradeLegacyRevisionCursor(cursor); ok {
+			cursor = upgraded
+		}
+	}
+	return s.ListRevisionPage(ctx, domain.RevisionPage{
+		Limit: page.Limit, Cursor: cursor, Order: domain.RevisionOrderAscending,
+	})
+}
+
+// ListRevisionPage returns committed revision metadata in the requested
+// order. Its cursor is stable under concurrent commits: an ascending cursor
+// resumes strictly after its boundary, while a descending cursor resumes
+// strictly before it.
+func (s *Store) ListRevisionPage(ctx context.Context, page domain.RevisionPage) ([]domain.RevisionInfo, domain.PageInfo, error) {
 	if ctx == nil {
 		return nil, domain.PageInfo{}, fmt.Errorf("%w: nil context", ErrInvalidArgument)
 	}
@@ -149,20 +167,35 @@ func (s *Store) ListRevisions(ctx context.Context, page domain.Page) ([]domain.R
 	if err != nil {
 		return nil, domain.PageInfo{}, err
 	}
-	var after uint64
-	if page.After != "" {
-		text, err := decodeCursor(page.After)
+	if !page.Order.Valid() {
+		return nil, domain.PageInfo{}, fmt.Errorf("%w: invalid revision order %d", ErrInvalidArgument, page.Order)
+	}
+
+	var boundary domain.Revision
+	if page.Cursor != "" {
+		boundary, err = decodeRevisionCursor(page.Cursor, page.Order, revisionPredicateFingerprint)
 		if err != nil {
 			return nil, domain.PageInfo{}, err
 		}
-		after, err = strconv.ParseUint(text, 10, 63)
-		if err != nil {
-			return nil, domain.PageInfo{}, fmt.Errorf("%w: invalid revision cursor", ErrInvalidArgument)
+	}
+
+	var rows *sql.Rows
+	switch page.Order {
+	case domain.RevisionOrderAscending:
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT revision, committed_ns, actor, message FROM revisions
+			WHERE sealed = 1 AND revision > ? ORDER BY revision ASC LIMIT ?`, int64(boundary), limit+1)
+	case domain.RevisionOrderDescending:
+		if page.Cursor == "" {
+			rows, err = s.db.QueryContext(ctx, `
+				SELECT revision, committed_ns, actor, message FROM revisions
+				WHERE sealed = 1 ORDER BY revision DESC LIMIT ?`, limit+1)
+		} else {
+			rows, err = s.db.QueryContext(ctx, `
+				SELECT revision, committed_ns, actor, message FROM revisions
+				WHERE sealed = 1 AND revision < ? ORDER BY revision DESC LIMIT ?`, int64(boundary), limit+1)
 		}
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT revision, committed_ns, actor, message FROM revisions
-		WHERE sealed = 1 AND revision > ? ORDER BY revision LIMIT ?`, int64(after), limit+1)
 	if err != nil {
 		return nil, domain.PageInfo{}, fmt.Errorf("list revisions: %w", err)
 	}
@@ -187,7 +220,7 @@ func (s *Store) ListRevisions(ctx context.Context, page domain.Page) ([]domain.R
 	var pageInfo domain.PageInfo
 	if len(infos) > limit {
 		infos = infos[:limit]
-		pageInfo.Next = encodeCursor(strconv.FormatUint(uint64(infos[len(infos)-1].Revision), 10))
+		pageInfo.Next = encodeRevisionCursor(page.Order, infos[len(infos)-1].Revision)
 	}
 	return infos, pageInfo, nil
 }
@@ -387,18 +420,6 @@ func pageLimit(limit int) (int, error) {
 		return defaultPageSize, nil
 	}
 	return limit, nil
-}
-
-func encodeCursor(value string) string {
-	return base64.RawURLEncoding.EncodeToString([]byte(value))
-}
-
-func decodeCursor(cursor string) (string, error) {
-	data, err := base64.RawURLEncoding.DecodeString(cursor)
-	if err != nil || strings.IndexByte(string(data), 0) >= 0 {
-		return "", fmt.Errorf("%w: invalid page cursor", ErrInvalidArgument)
-	}
-	return string(data), nil
 }
 
 func timeFromUnixNano(ns int64) time.Time { return time.Unix(0, ns).UTC() }

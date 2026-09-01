@@ -100,7 +100,7 @@ ORDER BY leaf LIMIT 10`
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := executeDocument(context.Background(), document, full, params, executor.store.ListRevisions)
+	want, err := executeDocument(context.Background(), document, full, params, executor.store.ListRevisionPage)
 	if err != nil {
 		t.Fatal(err)
 	}

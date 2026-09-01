@@ -48,6 +48,7 @@ type keyMap struct {
 	ExecQuery     key.Binding
 	PreviousSet   key.Binding
 	NextSet       key.Binding
+	LoadOlder     key.Binding
 }
 
 func defaultKeyMap() keyMap {
@@ -76,6 +77,7 @@ func defaultKeyMap() keyMap {
 		ExecQuery:     binding("ctrl+x", "execute write-capable", "ctrl+x"),
 		PreviousSet:   binding("[", "previous result", "["),
 		NextSet:       binding("]", "next result", "]"),
+		LoadOlder:     binding("o", "load older", "o"),
 	}
 }
 

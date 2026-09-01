@@ -13,7 +13,7 @@ import (
 	"github.com/svlocks/sheets/internal/domain"
 )
 
-type revisionLister func(context.Context, domain.Page) ([]domain.RevisionInfo, domain.PageInfo, error)
+type revisionLister func(context.Context, domain.RevisionPage) ([]domain.RevisionInfo, domain.PageInfo, error)
 
 type queryClock struct {
 	transaction time.Time

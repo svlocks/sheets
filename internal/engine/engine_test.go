@@ -418,6 +418,37 @@ func TestSheetsRevisionsProcedurePaginatesMetadata(t *testing.T) {
 	if got := second.Results[0].Rows[0]; got[0] != int64(2) || got[1] != "bob" || got[2] != "second" || got[3] != "" {
 		t.Fatalf("second revision row = %#v", got)
 	}
+	legacy := execute(t, engine,
+		"CALL sheets.revisions(1, 'MQ') YIELD revision RETURN revision",
+		nil,
+	)
+	if got := legacy.Results[0].Rows[0][0]; got != int64(2) {
+		t.Fatalf("legacy procedure cursor returned revision %v", got)
+	}
+
+	newest := execute(t, engine,
+		"CALL sheets.revisions(1, null, 'descending') YIELD revision, actor, next RETURN revision, actor, next",
+		nil,
+	)
+	newestRow := newest.Results[0].Rows[0]
+	if newestRow[0] != int64(2) || newestRow[1] != "bob" || newestRow[2] == "" {
+		t.Fatalf("newest revision row = %#v", newestRow)
+	}
+	oldest := execute(t, engine,
+		"CALL sheets.revisions(1, $cursor, 'desc') YIELD revision, actor, next RETURN revision, actor, next",
+		map[string]any{"cursor": newestRow[2]},
+	)
+	if got := oldest.Results[0].Rows[0]; got[0] != int64(1) || got[1] != "alice" || got[2] != "" {
+		t.Fatalf("oldest revision row = %#v", got)
+	}
+
+	_, err = engine.Execute(ctx, app.ExecuteRequest{
+		Query:  "CALL sheets.revisions(1, $cursor, 'ascending') YIELD revision RETURN revision",
+		Params: map[string]any{"cursor": newestRow[2]},
+	})
+	if !errors.Is(err, store.ErrInvalidArgument) {
+		t.Fatalf("cross-order procedure cursor error = %v", err)
+	}
 }
 
 func TestGraphFreeAndFilteredNodeReadsAvoidCompleteSnapshotCache(t *testing.T) {

@@ -107,20 +107,8 @@ func (b tuiBackend) CurrentRevision(ctx context.Context) (domain.Revision, error
 	return b.engine.CurrentRevision(ctx)
 }
 
-func (b tuiBackend) Revisions(ctx context.Context) ([]domain.RevisionInfo, error) {
-	var revisions []domain.RevisionInfo
-	page := domain.Page{Limit: 1000}
-	for {
-		values, info, err := b.engine.ListRevisions(ctx, page)
-		if err != nil {
-			return nil, err
-		}
-		revisions = append(revisions, values...)
-		if info.Next == "" {
-			return revisions, nil
-		}
-		page.After = info.Next
-	}
+func (b tuiBackend) ListRevisionPage(ctx context.Context, page domain.RevisionPage) ([]domain.RevisionInfo, domain.PageInfo, error) {
+	return b.engine.ListRevisionPage(ctx, page)
 }
 
 func runTUI(ctx context.Context, found project.Project, executor *engine.Engine, options cli.TUIOptions) error {

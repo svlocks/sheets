@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -139,6 +140,38 @@ func TestExecFileIsOneAtomicRevision(t *testing.T) {
 	}
 	if !strings.Contains(history, "test-agent") || !strings.Contains(history, "seed") {
 		t.Fatalf("history = %s", history)
+	}
+}
+
+func TestHistoryDescendingPagination(t *testing.T) {
+	root := initializeProject(t)
+	for index := 1; index <= 3; index++ {
+		query := fmt.Sprintf("CREATE (:Task {number:%d})", index)
+		if _, _, err := runCommand(t, "", "-C", root, "exec", query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstJSON, _, err := runCommand(t, "", "-C", root, "history", "--order", "descending", "--limit", "2", "--output", "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first app.BatchResult
+	if err := json.Unmarshal([]byte(firstJSON), &first); err != nil {
+		t.Fatal(err)
+	}
+	if got := first.Results[0].Rows; len(got) != 2 || got[0][0] != float64(3) || got[1][0] != float64(2) || first.Results[0].Page == nil || first.Results[0].Page.Next == "" {
+		t.Fatalf("first descending history page = %#v", first)
+	}
+	secondJSON, _, err := runCommand(t, "", "-C", root, "history", "--order", "desc", "--limit", "2", "--after", first.Results[0].Page.Next, "--output", "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var second app.BatchResult
+	if err := json.Unmarshal([]byte(secondJSON), &second); err != nil {
+		t.Fatal(err)
+	}
+	if got := second.Results[0].Rows; len(got) != 1 || got[0][0] != float64(1) || second.Results[0].Page != nil {
+		t.Fatalf("second descending history page = %#v", second)
 	}
 }
 

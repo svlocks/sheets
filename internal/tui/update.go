@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/spinner"
@@ -399,13 +400,20 @@ func (m *Model) updateTimeline(msg tea.KeyPressMsg) tea.Cmd {
 		}
 		return nil
 	}
+	if key.Matches(msg, m.keys.LoadOlder) {
+		return m.startOlderHistory()
+	}
 	before, _ := m.timeline.selectedRevision()
 	cmd := m.timeline.update(msg)
 	after, _ := m.timeline.selectedRevision()
-	if before != after {
-		return tea.Batch(cmd, m.refreshInspector())
+	var older tea.Cmd
+	if m.timeline.nearEnd() {
+		older = m.startOlderHistory()
 	}
-	return cmd
+	if before != after {
+		return tea.Batch(cmd, m.refreshInspector(), older)
+	}
+	return tea.Batch(cmd, older)
 }
 
 func (m *Model) applySnapshotLoaded(msg snapshotLoadedMsg) tea.Cmd {
@@ -435,7 +443,7 @@ func (m *Model) applySnapshotLoaded(msg snapshotLoadedMsg) tea.Cmd {
 	relationshipCmd := m.relationships.setGraph(m.graph)
 	var timelineCmd tea.Cmd
 	if m.historyReady {
-		timelineCmd = m.timeline.setRevisions(m.revisions, m.liveRevision)
+		timelineCmd = m.timeline.setRevisions(m.revisions, m.liveRevision, m.includeInitialRevision())
 	}
 	if !msg.snapshot.IsCurrent() {
 		m.timeline.selectRevision(msg.loaded.revision)
@@ -456,19 +464,94 @@ func (m *Model) applyHistoryLoaded(msg historyLoadedMsg) tea.Cmd {
 	m.loadingHistory = false
 	if msg.err != nil {
 		if errors.Is(msg.err, context.Canceled) {
+			m.timeline.setPaging(false, msg.older, m.historyEnd, nil)
 			return nil
 		}
 		m.historyErr = msg.err
+		m.historyOlder = msg.older
+		m.timeline.setPaging(false, msg.older, m.historyEnd, msg.err)
 		return m.setNotice(noticeError, "load timeline: "+msg.err.Error())
+	}
+	if msg.older && msg.page.Next != "" && msg.page.Next == m.historyCursor {
+		m.historyErr = errors.New("revision backend returned a non-advancing cursor")
+		m.historyOlder = true
+		m.timeline.setPaging(false, true, m.historyEnd, m.historyErr)
+		return m.setNotice(noticeError, "load timeline: "+m.historyErr.Error())
+	}
+	if len(msg.revisions) > timelinePageSize || msg.page.Next != "" && len(msg.revisions) == 0 {
+		m.historyErr = errors.New("revision backend returned an invalid page")
+		m.historyOlder = msg.older
+		m.timeline.setPaging(false, msg.older, m.historyEnd, m.historyErr)
+		return m.setNotice(noticeError, "load timeline: "+m.historyErr.Error())
 	}
 	m.historyErr = nil
 	m.historyReady = true
-	m.revisions = append([]domain.RevisionInfo(nil), msg.revisions...)
-	cmd := m.timeline.setRevisions(m.revisions, m.liveRevision)
+	m.historyOlder = msg.older
+	m.historyCursor = msg.page.Next
+	m.historyEnd = msg.page.Next == ""
+	if m.historyCapacity == 0 {
+		m.historyCapacity = timelinePageSize
+	}
+	if msg.older {
+		m.historyCapacity += len(msg.revisions)
+	}
+	protected := make(map[domain.Revision]struct{}, 2)
+	if selected, ok := m.timeline.selectedRevision(); ok {
+		protected[selected] = struct{}{}
+	}
+	if selected := m.selectedSnapshot(); selected.Revision != nil {
+		protected[*selected.Revision] = struct{}{}
+	}
+	m.revisions = mergeRevisionHistory(m.revisions, msg.revisions, m.historyCapacity, protected)
+	m.timeline.setPaging(false, msg.older, m.historyEnd, nil)
+	cmd := m.timeline.setRevisions(m.revisions, m.liveRevision, m.includeInitialRevision())
+	if selected := m.selectedSnapshot(); selected.Revision != nil {
+		m.timeline.selectRevision(*selected.Revision)
+	}
 	if m.workspace == TimelineWorkspace {
 		return tea.Batch(cmd, m.refreshInspector())
 	}
 	return cmd
+}
+
+func (m *Model) includeInitialRevision() bool {
+	if m.historyEnd {
+		return true
+	}
+	if selected, ok := m.timeline.selectedRevision(); ok && selected == 0 {
+		return true
+	}
+	selected := m.selectedSnapshot()
+	return selected.Revision != nil && *selected.Revision == 0
+}
+
+func mergeRevisionHistory(current, incoming []domain.RevisionInfo, capacity int, protected map[domain.Revision]struct{}) []domain.RevisionInfo {
+	byRevision := make(map[domain.Revision]domain.RevisionInfo, len(current)+len(incoming))
+	for _, info := range current {
+		if info.Revision != 0 {
+			byRevision[info.Revision] = info
+		}
+	}
+	for _, info := range incoming {
+		if info.Revision != 0 {
+			byRevision[info.Revision] = info
+		}
+	}
+	merged := make([]domain.RevisionInfo, 0, len(byRevision))
+	for _, info := range byRevision {
+		merged = append(merged, info)
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].Revision > merged[j].Revision })
+	if capacity <= 0 || len(merged) <= capacity {
+		return merged
+	}
+	bounded := append([]domain.RevisionInfo(nil), merged[:capacity]...)
+	for _, info := range merged[capacity:] {
+		if _, keep := protected[info.Revision]; keep {
+			bounded = append(bounded, info)
+		}
+	}
+	return bounded
 }
 
 func (m *Model) applyRevisionChecked(msg revisionCheckedMsg) tea.Cmd {
@@ -664,9 +747,14 @@ func (m *Model) handleMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 		before, _ := m.timeline.selectedRevision()
 		m.timeline.wheel(delta)
 		after, _ := m.timeline.selectedRevision()
-		if before != after {
-			return m.refreshInspector()
+		var older tea.Cmd
+		if m.timeline.nearEnd() {
+			older = m.startOlderHistory()
 		}
+		if before != after {
+			return tea.Batch(m.refreshInspector(), older)
+		}
+		return older
 	case QueryWorkspace:
 		return m.query.update(msg)
 	}

@@ -34,7 +34,7 @@ func forcedFullSnapshotResult(ctx context.Context, executor *Engine, request app
 	if err != nil {
 		return app.BatchResult{}, err
 	}
-	return executeDocument(ctx, document, graph, request.Params, executor.store.ListRevisions)
+	return executeDocument(ctx, document, graph, request.Params, executor.store.ListRevisionPage)
 }
 
 func assertIteratorEqualsFullSnapshot(t *testing.T, executor *Engine, request app.ExecuteRequest) app.BatchResult {
