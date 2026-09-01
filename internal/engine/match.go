@@ -1,8 +1,12 @@
 package engine
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/svlocks/sheets/internal/cypher"
 	"github.com/svlocks/sheets/internal/domain"
@@ -18,6 +22,25 @@ type Path struct {
 type PathValue struct {
 	Nodes         []domain.Node `json:"nodes"`
 	Relationships []domain.Edge `json:"relationships"`
+}
+
+type pathExpansionBudget struct {
+	limit int64
+	used  int64
+}
+
+func (b *pathExpansionBudget) take(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if b == nil || b.limit <= 0 {
+		return nil
+	}
+	b.used++
+	if b.used > b.limit {
+		return fmt.Errorf("path expansion limit of %d exceeded; add a finite relationship bound or a more selective pattern", b.limit)
+	}
+	return nil
 }
 
 func (p Path) cloneValues() PathValue {
@@ -38,6 +61,9 @@ func matchClauseRows(graph *memoryGraph, evaluator evaluator, input []row, claus
 	introduced := patternVariables(clause.Patterns)
 	result := make([]row, 0)
 	for _, inputRow := range input {
+		if err := evaluator.ctx.Err(); err != nil {
+			return nil, err
+		}
 		matches := []row{cloneRow(inputRow)}
 		var err error
 		for _, pattern := range clause.Patterns {
@@ -56,6 +82,9 @@ func matchClauseRows(graph *memoryGraph, evaluator evaluator, input []row, claus
 			}
 		}
 		if len(matches) == 0 && clause.Optional {
+			if err := evaluator.rows.take(evaluator.ctx, 1); err != nil {
+				return nil, err
+			}
 			optional := cloneRow(inputRow)
 			for _, variable := range introduced {
 				if _, exists := optional[variable]; !exists {
@@ -65,6 +94,9 @@ func matchClauseRows(graph *memoryGraph, evaluator evaluator, input []row, claus
 			result = append(result, optional)
 			continue
 		}
+		if err := evaluator.rows.take(evaluator.ctx, len(matches)); err != nil {
+			return nil, err
+		}
 		result = append(result, matches...)
 	}
 	return result, nil
@@ -73,12 +105,18 @@ func matchClauseRows(graph *memoryGraph, evaluator evaluator, input []row, claus
 func matchPattern(graph *memoryGraph, evaluator evaluator, input []row, pattern cypher.PatternPart) ([]row, error) {
 	result := make([]row, 0)
 	for _, inputRow := range input {
+		if err := evaluator.ctx.Err(); err != nil {
+			return nil, err
+		}
 		first := pattern.Element.Nodes[0]
 		candidates, err := candidateNodes(graph, evaluator, inputRow, first)
 		if err != nil {
 			return nil, err
 		}
 		for _, candidate := range candidates {
+			if err := evaluator.ctx.Err(); err != nil {
+				return nil, err
+			}
 			next := cloneRow(inputRow)
 			if !bindValue(next, first.Variable.Name, candidate) {
 				continue
@@ -90,6 +128,9 @@ func matchPattern(graph *memoryGraph, evaluator evaluator, input []row, pattern 
 			}
 			for _, candidateRow := range matched {
 				if bindValue(candidateRow, pattern.Variable.Name, pathForRow(pattern.Element, candidateRow, path)) {
+					if err := evaluator.rows.take(evaluator.ctx, 1); err != nil {
+						return nil, err
+					}
 					result = append(result, candidateRow)
 				}
 			}
@@ -119,6 +160,295 @@ func (e *queryExecution) evaluatePattern(element cypher.PatternElement, values r
 		}
 	}
 	return paths, nil
+}
+
+// evaluateShortestPattern performs breadth-first expansion rather than asking
+// evaluatePattern to enumerate every trail and then discarding all but the
+// shortest. A shortest relationship trail is node-simple, so level-based
+// predecessor tracking is sufficient and preserves deterministic edge order.
+func (e *queryExecution) evaluateShortestPattern(element cypher.PatternElement, values row, all bool) (any, error) {
+	if len(element.Nodes) != 2 || len(element.Relationships) != 1 {
+		// The generic matcher remains the semantic fallback for compound pattern
+		// expressions. The common variable-length shortest-path form below never
+		// enumerates longer paths.
+		paths, err := e.evaluatePattern(element, values)
+		if err != nil || len(paths) == 0 {
+			return nil, err
+		}
+		return selectShortestPaths(paths, all), nil
+	}
+	if e.graph == nil {
+		return nil, errors.New("shortestPath requires a graph context")
+	}
+	startPattern, targetPattern := element.Nodes[0], element.Nodes[1]
+	relationship := element.Relationships[0]
+	// Use the same static boundary reported by EXPLAIN. In particular, a named
+	// variable-length relationship can be correlated to an outer trail and a
+	// dynamic/lower bound above one requires relationship-trail state. Keeping
+	// those shapes on the generic matcher avoids an execution-time algorithm
+	// switch that the physical plan did not disclose.
+	if !shortestPatternUsesBFS(element) {
+		paths, fallbackErr := e.evaluatePattern(element, values)
+		if fallbackErr != nil || len(paths) == 0 {
+			return nil, fallbackErr
+		}
+		return selectShortestPaths(paths, all), nil
+	}
+	minimum, maximum, err := relationshipBounds(e.evaluator, values, relationship, len(e.graph.edges))
+	if err != nil {
+		return nil, err
+	}
+	starts, err := candidateNodes(e.graph, e.evaluator, values, startPattern)
+	if err != nil {
+		return nil, err
+	}
+	if len(starts) == 0 {
+		return nil, nil
+	}
+	var result []Path
+	for _, start := range starts {
+		paths, err := shortestPathsFrom(e.evaluator, e.graph, values, start, targetPattern, relationship, minimum, maximum)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, paths...)
+	}
+	if len(result) == 0 {
+		return nil, nil
+	}
+	return selectShortestPaths(result, all), nil
+}
+
+func selectShortestPaths(paths []Path, all bool) any {
+	minimum := len(paths[0].Relationships)
+	for _, path := range paths[1:] {
+		if len(path.Relationships) < minimum {
+			minimum = len(path.Relationships)
+		}
+	}
+	result := make([]Path, 0, len(paths))
+	for _, path := range paths {
+		if len(path.Relationships) == minimum {
+			result = append(result, path)
+		}
+	}
+	sort.SliceStable(result, func(i, j int) bool { return pathOrderKey(result[i]) < pathOrderKey(result[j]) })
+	if !all {
+		return result[0]
+	}
+	values := make([]any, len(result))
+	for index := range result {
+		values[index] = result[index]
+	}
+	return values
+}
+
+type shortestPredecessor struct {
+	from domain.EntityID
+	edge *domain.Edge
+}
+
+func shortestPathsFrom(evaluator evaluator, graph *memoryGraph, values row, start *domain.Node, target cypher.NodePattern, relationship cypher.RelationshipPattern, minimum, maximum int64) ([]Path, error) {
+	if maximum < 0 {
+		return nil, nil
+	}
+	if minimum == 0 {
+		ok, err := shortestTargetMatches(evaluator, values, start, target)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return []Path{{Nodes: []*domain.Node{start}}}, nil
+		}
+	}
+	frontier := []domain.EntityID{start.ID}
+	levels := map[domain.EntityID]int64{start.ID: 0}
+	predecessors := make(map[domain.EntityID][]shortestPredecessor)
+	var targetIDs []domain.EntityID
+	var completed []Path
+	for depth := int64(1); depth <= maximum && len(frontier) > 0; depth++ {
+		if err := evaluator.ctx.Err(); err != nil {
+			return nil, err
+		}
+		nextSet := make(map[domain.EntityID]struct{})
+		for _, currentID := range frontier {
+			current := graph.nodes[currentID]
+			if current == nil {
+				continue
+			}
+			for _, adjacent := range adjacentEdges(graph, current.ID, relationship.Direction) {
+				if err := evaluator.paths.take(evaluator.ctx); err != nil {
+					return nil, err
+				}
+				matches, err := shortestRelationshipMatches(evaluator, values, adjacent.edge, relationship)
+				if err != nil || !matches {
+					if err != nil {
+						return nil, err
+					}
+					continue
+				}
+				next := graph.nodes[adjacent.next]
+				if next == nil {
+					continue
+				}
+				previousLevel, visited := levels[next.ID]
+				// A target seen below the declared lower bound must remain
+				// eligible at later levels; all other nodes only need their first
+				// (therefore shortest) level.
+				isTarget, targetErr := shortestTargetMatches(evaluator, values, next, target)
+				if targetErr != nil {
+					return nil, targetErr
+				}
+				if next.ID == start.ID && isTarget && depth >= minimum {
+					prefixes, reconstructErr := reconstructShortestPaths(evaluator, graph, start.ID, current.ID, predecessors)
+					if reconstructErr != nil {
+						return nil, reconstructErr
+					}
+					for _, prefix := range prefixes {
+						// Cypher paths are relationship trails. In an undirected
+						// traversal the edge used to leave the start is also adjacent
+						// when returning from its other endpoint; it must not be
+						// reused to manufacture a two-hop cycle.
+						if pathUsesRelationship(prefix, adjacent.edge.ID) {
+							continue
+						}
+						if err := evaluator.paths.take(evaluator.ctx); err != nil {
+							return nil, err
+						}
+						nodes := append(append([]*domain.Node(nil), prefix.Nodes...), start)
+						edges := append(append([]*domain.Edge(nil), prefix.Relationships...), adjacent.edge)
+						completed = append(completed, Path{Nodes: nodes, Relationships: edges})
+					}
+					continue
+				}
+				if visited && previousLevel < depth && (!isTarget || depth >= minimum) {
+					continue
+				}
+				if !visited || previousLevel == depth {
+					levels[next.ID] = depth
+					predecessors[next.ID] = append(predecessors[next.ID], shortestPredecessor{from: current.ID, edge: adjacent.edge})
+					nextSet[next.ID] = struct{}{}
+				}
+				if depth >= minimum && isTarget {
+					targetIDs = append(targetIDs, next.ID)
+				}
+			}
+		}
+		if len(targetIDs) > 0 || len(completed) > 0 {
+			break
+		}
+		frontier = sortedNodeIDs(nextSet)
+	}
+	if len(targetIDs) == 0 && len(completed) == 0 {
+		return nil, nil
+	}
+	targetSet := make(map[domain.EntityID]struct{}, len(targetIDs))
+	for _, id := range targetIDs {
+		targetSet[id] = struct{}{}
+	}
+	paths := completed
+	for _, targetID := range sortedNodeIDs(targetSet) {
+		reconstructed, err := reconstructShortestPaths(evaluator, graph, start.ID, targetID, predecessors)
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, reconstructed...)
+	}
+	return paths, nil
+}
+
+func pathUsesRelationship(path Path, id domain.EntityID) bool {
+	for _, edge := range path.Relationships {
+		if edge.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func shortestTargetMatches(evaluator evaluator, values row, node *domain.Node, pattern cypher.NodePattern) (bool, error) {
+	if pattern.Variable.Name != "" {
+		if bound, exists := values[pattern.Variable.Name]; exists {
+			wanted, ok := bound.(*domain.Node)
+			if !ok || wanted == nil || wanted.ID != node.ID {
+				return false, nil
+			}
+		}
+	}
+	return nodePatternMatches(evaluator, values, node, pattern)
+}
+
+func shortestRelationshipMatches(evaluator evaluator, values row, edge *domain.Edge, pattern cypher.RelationshipPattern) (bool, error) {
+	if pattern.Variable.Name != "" {
+		if bound, exists := values[pattern.Variable.Name]; exists {
+			wanted, ok := bound.(*domain.Edge)
+			if !ok || wanted == nil || wanted.ID != edge.ID {
+				return false, nil
+			}
+		}
+	}
+	return relationshipPatternMatches(evaluator, values, edge, pattern)
+}
+
+func reconstructShortestPaths(evaluator evaluator, graph *memoryGraph, start, target domain.EntityID, predecessors map[domain.EntityID][]shortestPredecessor) ([]Path, error) {
+	if start == target {
+		return []Path{{Nodes: []*domain.Node{graph.nodes[start]}}}, nil
+	}
+	var result []Path
+	var walk func(domain.EntityID, []*domain.Node, []*domain.Edge) error
+	walk = func(current domain.EntityID, reverseNodes []*domain.Node, reverseEdges []*domain.Edge) error {
+		if err := evaluator.ctx.Err(); err != nil {
+			return err
+		}
+		if current == start {
+			if err := evaluator.paths.take(evaluator.ctx); err != nil {
+				return err
+			}
+			nodes := append([]*domain.Node(nil), reverseNodes...)
+			edges := append([]*domain.Edge(nil), reverseEdges...)
+			reversePointers(nodes)
+			reversePointers(edges)
+			result = append(result, Path{Nodes: nodes, Relationships: edges})
+			return nil
+		}
+		for _, predecessor := range predecessors[current] {
+			from := graph.nodes[predecessor.from]
+			if from == nil {
+				continue
+			}
+			if err := walk(predecessor.from, append(reverseNodes, from), append(reverseEdges, predecessor.edge)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(target, []*domain.Node{graph.nodes[target]}, nil); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func reversePointers[T any](values []T) {
+	for left, right := 0, len(values)-1; left < right; left, right = left+1, right-1 {
+		values[left], values[right] = values[right], values[left]
+	}
+}
+
+func sortedNodeIDs(values map[domain.EntityID]struct{}) []domain.EntityID {
+	result := make([]domain.EntityID, 0, len(values))
+	for id := range values {
+		result = append(result, id)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result
+}
+
+func pathOrderKey(path Path) string {
+	parts := make([]string, len(path.Relationships))
+	for index, edge := range path.Relationships {
+		parts[index] = string(edge.ID)
+	}
+	return strings.Join(parts, "\x00")
 }
 
 func (e *queryExecution) evaluateExistsSubquery(query *cypher.QueryStatement, values row) (bool, error) {
@@ -161,6 +491,9 @@ func extendPattern(graph *memoryGraph, evaluator evaluator, values row, element 
 	var matches []row
 	var walk func(*domain.Node, int64, row, Path, map[domain.EntityID]struct{}) error
 	walk = func(node *domain.Node, depth int64, currentRow row, path Path, used map[domain.EntityID]struct{}) error {
+		if err := evaluator.ctx.Err(); err != nil {
+			return err
+		}
 		if depth >= minimum {
 			if ok, err := nodePatternMatches(evaluator, currentRow, node, targetPattern); err != nil {
 				return err
@@ -202,6 +535,9 @@ func extendPattern(graph *memoryGraph, evaluator evaluator, values row, element 
 			if !ok {
 				continue
 			}
+			if err := evaluator.paths.take(evaluator.ctx); err != nil {
+				return err
+			}
 			nextNode := graph.nodes[adjacent.next]
 			if nextNode == nil {
 				continue
@@ -221,7 +557,11 @@ func extendPattern(graph *memoryGraph, evaluator evaluator, values row, element 
 		}
 		return nil
 	}
-	if err := walk(currentNode, 0, values, current, map[domain.EntityID]struct{}{}); err != nil {
+	used := make(map[domain.EntityID]struct{}, len(current.Relationships))
+	for _, edge := range current.Relationships {
+		used[edge.ID] = struct{}{}
+	}
+	if err := walk(currentNode, 0, values, current, used); err != nil {
 		return nil, err
 	}
 	return matches, nil
@@ -258,7 +598,19 @@ func adjacentEdges(graph *memoryGraph, node domain.EntityID, direction cypher.Di
 		}
 		return result[i].edge.ID < result[j].edge.ID
 	})
-	return result
+	// A self-loop occurs in both adjacency lists. An undirected MATCH must see
+	// that relationship once, not manufacture two identical rows.
+	unique := result[:0]
+	for _, candidate := range result {
+		if len(unique) > 0 {
+			previous := unique[len(unique)-1]
+			if previous.edge.ID == candidate.edge.ID && previous.next == candidate.next {
+				continue
+			}
+		}
+		unique = append(unique, candidate)
+	}
+	return unique
 }
 
 func candidateNodes(graph *memoryGraph, evaluator evaluator, values row, pattern cypher.NodePattern) ([]*domain.Node, error) {
@@ -291,6 +643,14 @@ func candidateNodes(graph *memoryGraph, evaluator evaluator, values row, pattern
 		if value == nil {
 			return nil, nil
 		}
+		// Numeric equality is cross-type and time.Time equality is instant-based,
+		// while the in-memory key preserves their concrete representations. Leave
+		// both to the residual matcher so an equal integer/float or equivalent
+		// temporal location cannot produce a false-negative index lookup.
+		_, numeric, _ := compareNumbers(value, value)
+		if _, temporal := value.(time.Time); numeric || temporal {
+			continue
+		}
 		choose(graph.properties[key][valueKey(value)])
 	}
 	candidates := graph.nodePointers()
@@ -303,6 +663,9 @@ func candidateNodes(graph *memoryGraph, evaluator evaluator, values row, pattern
 	}
 	result := make([]*domain.Node, 0, len(candidates))
 	for _, node := range candidates {
+		if err := evaluator.ctx.Err(); err != nil {
+			return nil, err
+		}
 		if nodeMatchesExpected(node, pattern.Labels, expected) {
 			result = append(result, node)
 		}
@@ -493,6 +856,9 @@ func equalPath(left, right Path) bool {
 func filterRows(evaluator evaluator, input []row, predicate cypher.Expression) ([]row, error) {
 	result := make([]row, 0, len(input))
 	for _, values := range input {
+		if err := evaluator.ctx.Err(); err != nil {
+			return nil, err
+		}
 		value, err := evaluator.expression(predicate, values)
 		if err != nil {
 			return nil, err

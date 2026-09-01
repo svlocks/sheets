@@ -18,6 +18,8 @@ type Engine struct {
 	store   *store.Store
 	cacheMu sync.RWMutex
 	cache   *memoryGraph
+	planMu  sync.RWMutex
+	plan    physicalPlan
 }
 
 // New creates a graph execution engine. The caller retains ownership of the
@@ -42,6 +44,9 @@ func (e *Engine) Execute(ctx context.Context, request app.ExecuteRequest) (app.B
 	if len(document.Statements) == 0 {
 		return app.BatchResult{}, errors.New("query has no statements")
 	}
+	if err := validateDocumentSemantics(document); err != nil {
+		return app.BatchResult{}, err
+	}
 
 	mutates := false
 	for _, statement := range document.Statements {
@@ -55,11 +60,18 @@ func (e *Engine) Execute(ctx context.Context, request app.ExecuteRequest) (app.B
 	}
 
 	if !mutates {
-		graph, err := e.loadGraph(ctx, request.Snapshot)
+		if result, plan, ok, err := e.executeDirectCount(ctx, request.Snapshot, document, request.Params); err != nil {
+			return app.BatchResult{}, err
+		} else if ok {
+			e.storePlan(plan)
+			return result, nil
+		}
+		graph, plan, err := e.loadExecutionGraph(ctx, request.Snapshot, document, request.Params)
 		if err != nil {
 			return app.BatchResult{}, err
 		}
-		return executeDocument(ctx, document, graph, request.Params)
+		e.storePlan(plan)
+		return executeDocument(ctx, document, graph, request.Params, e.store.ListRevisions)
 	}
 
 	var batch app.BatchResult
@@ -71,7 +83,7 @@ func (e *Engine) Execute(ctx context.Context, request app.ExecuteRequest) (app.B
 		if err != nil {
 			return err
 		}
-		batch, err = executeDocument(ctx, document, graph, request.Params)
+		batch, err = executeDocument(ctx, document, graph, request.Params, e.store.ListRevisions)
 		committedGraph = graph
 		return err
 	})
@@ -89,7 +101,13 @@ func (e *Engine) Execute(ctx context.Context, request app.ExecuteRequest) (app.B
 	return batch, nil
 }
 
-func executeDocument(ctx context.Context, document *cypher.Document, graph *memoryGraph, params map[string]any) (app.BatchResult, error) {
+func executeDocument(
+	ctx context.Context,
+	document *cypher.Document,
+	graph *memoryGraph,
+	params map[string]any,
+	listRevisions revisionLister,
+) (app.BatchResult, error) {
 	batch := app.BatchResult{Results: make([]app.Result, 0, len(document.Statements))}
 	for _, statement := range document.Statements {
 		if err := ctx.Err(); err != nil {
@@ -103,7 +121,7 @@ func executeDocument(ctx context.Context, document *cypher.Document, graph *memo
 			batch.Results = append(batch.Results, explainQuery(query))
 			continue
 		}
-		result, err := executeQuery(ctx, document.Source, query, graph, params)
+		result, err := executeQuery(ctx, document.Source, query, graph, params, listRevisions)
 		if err != nil {
 			return app.BatchResult{}, err
 		}
@@ -111,6 +129,59 @@ func executeDocument(ctx context.Context, document *cypher.Document, graph *memo
 		batch.Results = append(batch.Results, result)
 	}
 	return batch, nil
+}
+
+func (e *Engine) loadExecutionGraph(
+	ctx context.Context,
+	snapshot domain.Snapshot,
+	document *cypher.Document,
+	params map[string]any,
+) (*memoryGraph, physicalPlan, error) {
+	if documentRequiresGraph(document) {
+		iteratorFallback := ""
+		if graph, plan, ok, err := e.loadReadWorkingSet(ctx, snapshot, document, params); err != nil {
+			return nil, plan, err
+		} else if ok {
+			return graph, plan, nil
+		} else {
+			iteratorFallback = plan.Fallback
+		}
+		if graph, ok, err := e.loadNodeWorkingSet(ctx, snapshot, document, params); err != nil {
+			legacyFallback := "legacy single-node working set"
+			if iteratorFallback != "" {
+				legacyFallback = iteratorFallback + "; " + legacyFallback
+			}
+			return nil, physicalPlan{Fallback: legacyFallback}, err
+		} else if ok {
+			return graph, physicalPlan{Operators: []planOperator{{Kind: "NodeIndexScan", Detail: "legacy single-node working set"}}, Fallback: iteratorFallback}, nil
+		}
+		graph, err := e.loadGraph(ctx, snapshot)
+		if iteratorFallback == "" {
+			iteratorFallback = "unsupported or correlated graph pipeline"
+		} else {
+			iteratorFallback += "; full snapshot materialization"
+		}
+		return graph, physicalPlan{Operators: []planOperator{{Kind: "FullSnapshot", Detail: "complete graph materialization"}}, Fallback: iteratorFallback}, err
+	}
+	revision, err := e.store.ResolveSnapshot(ctx, snapshot)
+	if err != nil {
+		return nil, physicalPlan{}, err
+	}
+	return newMemoryGraph(revision, nil, nil, nil), physicalPlan{Operators: []planOperator{{Kind: "ScalarPipeline", Detail: "graph-free"}}}, nil
+}
+
+func (e *Engine) storePlan(plan physicalPlan) {
+	e.planMu.Lock()
+	e.plan = plan.clone()
+	e.planMu.Unlock()
+}
+
+// lastPlan is retained for engine-package regression tests. Public callers use
+// EXPLAIN, whose rows expose the same selected operator/fallback information.
+func (e *Engine) lastPlan() physicalPlan {
+	e.planMu.RLock()
+	defer e.planMu.RUnlock()
+	return e.plan.clone()
 }
 
 // Snapshot returns a complete graph state for interactive clients.
@@ -197,18 +268,21 @@ func statementMutates(statement cypher.Statement) bool {
 }
 
 func explainQuery(query *cypher.QueryStatement) app.Result {
-	rows := make([][]any, 0, len(query.Clauses))
-	for index, clause := range query.Clauses {
-		name := strings.TrimPrefix(fmt.Sprintf("%T", clause), "*cypher.")
-		rows = append(rows, []any{int64(index), name, clause.Mutates()})
+	plan := logicalReadPlan(query)
+	rows := make([][]any, 0, len(plan.Operators)+1)
+	for _, operator := range plan.Operators {
+		rows = append(rows, []any{operator.Kind, operator.Detail, operator.Pushdown, ""})
 	}
-	for branchIndex, branch := range query.UnionBranches {
-		for clauseIndex, clause := range branch.Query.Clauses {
+	if plan.Fallback != "" {
+		rows = append(rows, []any{"Fallback", plan.Fallback, "", plan.Fallback})
+	}
+	if len(rows) == 0 {
+		for index, clause := range query.Clauses {
 			name := strings.TrimPrefix(fmt.Sprintf("%T", clause), "*cypher.")
-			rows = append(rows, []any{fmt.Sprintf("union_%d.%d", branchIndex+1, clauseIndex), name, clause.Mutates()})
+			rows = append(rows, []any{fmt.Sprintf("Clause%d", index), name, "", ""})
 		}
 	}
-	return app.Result{Columns: []string{"operator", "clause", "mutates"}, Rows: rows}
+	return app.Result{Columns: []string{"operator", "detail", "pushdown", "fallback"}, Rows: rows}
 }
 
 func clausesMutate(clauses []cypher.Clause) bool {
@@ -233,7 +307,7 @@ func clausesMutate(clauses []cypher.Clause) bool {
 
 func readOnlyProcedure(name string) bool {
 	switch strings.ToLower(name) {
-	case "db.labels", "db.relationshiptypes", "db.propertykeys", "sheets.nodes", "sheets.edges":
+	case "db.labels", "db.relationshiptypes", "db.propertykeys", "sheets.nodes", "sheets.edges", "sheets.revisions":
 		return true
 	default:
 		return false

@@ -27,6 +27,11 @@ func (e *queryExecution) create(input []row, patterns []cypher.PatternPart) ([]r
 
 func (e *queryExecution) createPattern(values row, pattern cypher.PatternPart) (row, error) {
 	next := cloneRow(values)
+	if pattern.Variable.Name != "" {
+		if _, exists := next[pattern.Variable.Name]; exists {
+			return nil, fmt.Errorf("CREATE path variable %s is already declared", pattern.Variable.Name)
+		}
+	}
 	path := Path{}
 	for index, nodePattern := range pattern.Element.Nodes {
 		var node *domain.Node
@@ -66,6 +71,8 @@ func (e *queryExecution) createPattern(values row, pattern cypher.PatternPart) (
 			if !bindValue(next, nodePattern.Variable.Name, node) {
 				return nil, fmt.Errorf("CREATE variable %s conflicts with an existing value", nodePattern.Variable.Name)
 			}
+		} else if len(nodePattern.Labels) > 0 || nodePattern.Properties != nil {
+			return nil, fmt.Errorf("CREATE cannot redeclare labels or properties on bound node %s; use SET", nodePattern.Variable.Name)
 		}
 		path.Nodes = append(path.Nodes, node)
 		if index == 0 {
@@ -78,6 +85,14 @@ func (e *queryExecution) createPattern(values row, pattern cypher.PatternPart) (
 		}
 		if len(relationship.Types) != 1 {
 			return nil, fmt.Errorf("CREATE relationships require exactly one type")
+		}
+		if relationship.Direction == cypher.Undirected {
+			return nil, fmt.Errorf("CREATE relationships must have a direction")
+		}
+		if relationship.Variable.Name != "" {
+			if _, exists := next[relationship.Variable.Name]; exists {
+				return nil, fmt.Errorf("CREATE relationship variable %s is already declared", relationship.Variable.Name)
+			}
 		}
 		properties, err := e.evaluateProperties(relationship.Properties, next)
 		if err != nil {
@@ -118,6 +133,9 @@ func (e *queryExecution) createPattern(values row, pattern cypher.PatternPart) (
 func (e *queryExecution) merge(input []row, clause *cypher.MergeClause) ([]row, error) {
 	result := make([]row, 0, len(input))
 	for _, values := range input {
+		if err := e.rejectMergeNullProperties(values, clause.Pattern); err != nil {
+			return nil, err
+		}
 		matches, err := matchPattern(e.graph, e.evaluator, []row{values}, clause.Pattern)
 		if err != nil {
 			return nil, err
@@ -145,6 +163,32 @@ func (e *queryExecution) merge(input []row, clause *cypher.MergeClause) ([]row, 
 	return result, nil
 }
 
+func (e *queryExecution) rejectMergeNullProperties(values row, pattern cypher.PatternPart) error {
+	for _, node := range pattern.Element.Nodes {
+		properties, err := e.evaluateProperties(node.Properties, values)
+		if err != nil {
+			return err
+		}
+		for key, value := range properties {
+			if value == nil {
+				return evalError(node.Properties, "MERGE cannot use null property %q", key)
+			}
+		}
+	}
+	for _, relationship := range pattern.Element.Relationships {
+		properties, err := e.evaluateProperties(relationship.Properties, values)
+		if err != nil {
+			return err
+		}
+		for key, value := range properties {
+			if value == nil {
+				return evalError(relationship.Properties, "MERGE cannot use null property %q", key)
+			}
+		}
+	}
+	return nil
+}
+
 func (e *queryExecution) set(rows []row, items []cypher.SetItem) error {
 	for _, values := range rows {
 		for _, item := range items {
@@ -152,6 +196,9 @@ func (e *queryExecution) set(rows []row, items []cypher.SetItem) error {
 				entity, err := e.evaluator.expression(item.Target, values)
 				if err != nil {
 					return err
+				}
+				if entity == nil {
+					continue
 				}
 				node, ok := entity.(*domain.Node)
 				if !ok || node == nil {
@@ -368,6 +415,9 @@ func (e *queryExecution) remove(rows []row, items []cypher.RemoveItem) error {
 				if err != nil {
 					return err
 				}
+				if entity == nil {
+					continue
+				}
 				node, ok := entity.(*domain.Node)
 				if !ok || node == nil {
 					return evalError(item.Target, "labels can only be removed from a node")
@@ -484,7 +534,9 @@ func (e *queryExecution) delete(rows []row, clause *cypher.DeleteClause) error {
 			if err != nil {
 				return err
 			}
-			collectDeletedEntities(value, nodes, edges)
+			if !collectDeletedEntities(value, nodes, edges) {
+				return evalError(expression, "DELETE expects a node, relationship, path, list of entities, or null; got %T", value)
+			}
 		}
 	}
 	edgeIDs := sortedEntityIDs(edges)
@@ -594,16 +646,20 @@ func dropNullProperties(properties domain.Properties) {
 	}
 }
 
-func collectDeletedEntities(value any, nodes map[domain.EntityID]*domain.Node, edges map[domain.EntityID]*domain.Edge) {
+func collectDeletedEntities(value any, nodes map[domain.EntityID]*domain.Node, edges map[domain.EntityID]*domain.Edge) bool {
 	switch value := value.(type) {
+	case nil:
+		return true
 	case *domain.Node:
 		if value != nil {
 			nodes[value.ID] = value
 		}
+		return true
 	case *domain.Edge:
 		if value != nil {
 			edges[value.ID] = value
 		}
+		return true
 	case Path:
 		for _, node := range value.Nodes {
 			nodes[node.ID] = node
@@ -611,11 +667,16 @@ func collectDeletedEntities(value any, nodes map[domain.EntityID]*domain.Node, e
 		for _, edge := range value.Relationships {
 			edges[edge.ID] = edge
 		}
+		return true
 	case []any:
 		for _, item := range value {
-			collectDeletedEntities(item, nodes, edges)
+			if !collectDeletedEntities(item, nodes, edges) {
+				return false
+			}
 		}
+		return true
 	}
+	return false
 }
 
 func sortedEntityIDs[T *domain.Node | *domain.Edge](entities map[domain.EntityID]T) []domain.EntityID {

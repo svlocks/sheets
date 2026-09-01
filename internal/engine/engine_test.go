@@ -257,6 +257,31 @@ RETURN n.created AS created, n.estimate AS estimate, n.obsolete AS obsolete`, ni
 	}
 }
 
+func TestEngineDatetimeFixedOffsetRoundTripsAndMatches(t *testing.T) {
+	executor, _ := testEngine(t)
+	result := execute(t, executor, `
+CREATE (n:Task {at: datetime('2026-08-31T12:34:56.123456789-05:00')})
+RETURN n.at AS at`, nil)
+	if len(result.Results) != 1 || len(result.Results[0].Rows) != 1 {
+		t.Fatalf("create fixed-offset datetime result = %#v", result)
+	}
+	want, err := time.Parse(time.RFC3339Nano, "2026-08-31T12:34:56.123456789-05:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := result.Results[0].Rows[0][0].(time.Time)
+	if !ok || !got.Equal(want) || got.Nanosecond() != want.Nanosecond() {
+		t.Fatalf("created fixed-offset datetime = %#v, want %s", result.Results[0].Rows[0][0], want)
+	}
+	matched := execute(t, executor, `
+MATCH (n:Task {at: datetime('2026-08-31T12:34:56.123456789-05:00')})
+RETURN count(n) AS count`, nil)
+	if got := matched.Results[0].Rows; len(got) != 1 || got[0][0] != int64(1) {
+		actual := execute(t, executor, "MATCH (n:Task) RETURN n.at AS at", nil)
+		t.Fatalf("fixed-offset datetime predicate = %#v; stored = %#v", got, actual.Results[0].Rows)
+	}
+}
+
 func TestEngineRejectsDurationOverflow(t *testing.T) {
 	engine, _ := testEngine(t)
 	for _, query := range []string{
@@ -282,6 +307,66 @@ func TestEngineStandaloneProcedureReturnsColumns(t *testing.T) {
 	result := execute(t, engine, "CALL db.labels()", nil)
 	if len(result.Results[0].Columns) != 1 || result.Results[0].Columns[0] != "label" || len(result.Results[0].Rows) != 2 {
 		t.Fatalf("procedure result = %#v", result.Results[0])
+	}
+}
+
+func TestSheetsRevisionsProcedurePaginatesMetadata(t *testing.T) {
+	engine, _ := testEngine(t)
+	ctx := context.Background()
+	for _, request := range []app.ExecuteRequest{
+		{Query: "CREATE (:Task {title: 'one'})", Actor: "alice", Message: "first"},
+		{Query: "CREATE (:Task {title: 'two'})", Actor: "bob", Message: "second"},
+	} {
+		if _, err := engine.Execute(ctx, request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := engine.Execute(ctx, app.ExecuteRequest{
+		Query: "CALL sheets.revisions(1) YIELD revision, time, actor, message, next RETURN revision, time, actor, message, next",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := first.Results[0].Rows[0]
+	if row[0] != int64(1) || row[2] != "alice" || row[3] != "first" || row[4] == "" {
+		t.Fatalf("first revision row = %#v", row)
+	}
+	if _, ok := row[1].(time.Time); !ok {
+		t.Fatalf("revision time type = %T", row[1])
+	}
+	second := execute(t, engine,
+		"CALL sheets.revisions(1, $after) YIELD revision, actor, message, next RETURN revision, actor, message, next",
+		map[string]any{"after": row[4]},
+	)
+	if got := second.Results[0].Rows[0]; got[0] != int64(2) || got[1] != "bob" || got[2] != "second" || got[3] != "" {
+		t.Fatalf("second revision row = %#v", got)
+	}
+}
+
+func TestGraphFreeAndFilteredNodeReadsAvoidCompleteSnapshotCache(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "sheets.db")
+	database, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	writer, _ := New(database)
+	execute(t, writer, "CREATE (:Task {status:'open'}), (:Task {status:'closed'})-[:LINK]->(:Task)", nil)
+
+	reader, _ := New(database)
+	if got := execute(t, reader, "RETURN 40 + 2 AS answer", nil).Results[0].Rows[0][0]; got != int64(42) {
+		t.Fatalf("scalar result = %v", got)
+	}
+	if reader.cache != nil {
+		t.Fatal("scalar query populated the complete graph cache")
+	}
+	result := execute(t, reader, "MATCH (task:Task {status:$status}) RETURN task.status", map[string]any{"status": "open"})
+	if got := result.Results[0].Rows; len(got) != 1 || got[0][0] != "open" {
+		t.Fatalf("filtered result = %#v", got)
+	}
+	if reader.cache != nil {
+		t.Fatal("filtered single-node query populated the complete graph cache")
 	}
 }
 

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -23,6 +24,9 @@ func (e evaluator) aggregate(expression *cypher.FunctionInvocation, representati
 	scalar := e
 	scalar.group = nil
 	for _, groupRow := range e.group {
+		if err := e.ctx.Err(); err != nil {
+			return nil, err
+		}
 		value, err := scalar.expression(expression.Arguments[0], groupRow)
 		if err != nil {
 			return nil, err
@@ -32,7 +36,11 @@ func (e evaluator) aggregate(expression *cypher.FunctionInvocation, representati
 		}
 	}
 	if expression.Distinct {
-		values = distinctValues(values)
+		distinct, err := distinctValues(e.ctx, values)
+		if err != nil {
+			return nil, err
+		}
+		values = distinct
 	}
 
 	switch name {
@@ -51,6 +59,9 @@ func (e evaluator) aggregate(expression *cypher.FunctionInvocation, representati
 		allIntegers := true
 		integerTotal := int64(0)
 		for _, value := range values {
+			if err := e.ctx.Err(); err != nil {
+				return nil, err
+			}
 			number, integerValue, ok := number(value)
 			if !ok {
 				return nil, evalError(expression, "%s expects numeric values, got %T", name, value)
@@ -81,6 +92,9 @@ func (e evaluator) aggregate(expression *cypher.FunctionInvocation, representati
 		}
 		variance := float64(0)
 		for _, value := range values {
+			if err := e.ctx.Err(); err != nil {
+				return nil, err
+			}
 			number, _, _ := number(value)
 			difference := number - mean
 			variance += difference * difference
@@ -96,6 +110,9 @@ func (e evaluator) aggregate(expression *cypher.FunctionInvocation, representati
 		}
 		best := values[0]
 		for _, value := range values[1:] {
+			if err := e.ctx.Err(); err != nil {
+				return nil, err
+			}
 			comparison, ok := compareValues(value, best)
 			if !ok {
 				return nil, evalError(expression, "%s cannot compare %T and %T", name, value, best)
@@ -122,6 +139,9 @@ func (e evaluator) aggregate(expression *cypher.FunctionInvocation, representati
 		}
 		numbers := make([]float64, len(values))
 		for index, value := range values {
+			if err := e.ctx.Err(); err != nil {
+				return nil, err
+			}
 			numbers[index], _, ok = number(value)
 			if !ok {
 				return nil, evalError(expression, "%s expects numeric values", name)
@@ -144,10 +164,13 @@ func (e evaluator) aggregate(expression *cypher.FunctionInvocation, representati
 	}
 }
 
-func distinctValues(values []any) []any {
+func distinctValues(ctx context.Context, values []any) ([]any, error) {
 	seen := make(map[string]struct{}, len(values))
 	result := make([]any, 0, len(values))
 	for _, value := range values {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		key := valueKey(value)
 		if _, exists := seen[key]; exists {
 			continue
@@ -155,7 +178,7 @@ func distinctValues(values []any) []any {
 		seen[key] = struct{}{}
 		result = append(result, value)
 	}
-	return result
+	return result, nil
 }
 
 func valueKey(value any) string {

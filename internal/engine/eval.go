@@ -2,9 +2,11 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"reflect"
 	"regexp"
 	"sort"
@@ -20,16 +22,20 @@ import (
 type row map[string]any
 
 type evaluator struct {
+	ctx      context.Context
 	params   map[string]any
 	now      func() time.Time
 	group    []row
 	graph    *memoryGraph
 	pattern  func(cypher.PatternElement, row) ([]Path, error)
 	subquery func(*cypher.QueryStatement, row) (bool, error)
+	shortest func(cypher.PatternElement, row, bool) (any, error)
+	paths    *pathExpansionBudget
+	rows     *rowBudget
 }
 
 func newEvaluator(params map[string]any) evaluator {
-	return evaluator{params: params, now: time.Now}
+	return evaluator{ctx: context.Background(), params: params, now: time.Now}
 }
 
 // evaluationError adds a Cypher source location to a runtime expression error.
@@ -92,12 +98,21 @@ func (e evaluator) expression(expression cypher.Expression, values row) (any, er
 		if err != nil {
 			return nil, err
 		}
+		if value == nil {
+			return nil, nil
+		}
 		return hasLabels(value, expression.Labels), nil
 	case *cypher.IndexExpression:
 		return e.index(expression, values)
 	case *cypher.SliceExpression:
 		return e.slice(expression, values)
 	case *cypher.FunctionInvocation:
+		name := strings.ToLower(expression.Name.String())
+		if (name == "shortestpath" || name == "allshortestpaths") && len(expression.Arguments) == 1 {
+			if pattern, ok := expression.Arguments[0].(*cypher.PatternExpression); ok && e.shortest != nil {
+				return e.shortest(pattern.Pattern, values, name == "allshortestpaths")
+			}
+		}
 		return e.function(expression, values)
 	case *cypher.ListLiteral:
 		items := make([]any, len(expression.Elements))
@@ -214,22 +229,23 @@ func (e evaluator) binary(expression *cypher.BinaryExpression, values row) (any,
 	case "AND", "OR", "XOR":
 		return booleanBinary(expression, operator, left, right)
 	case "=":
-		if left == nil || right == nil {
-			return nil, nil
-		}
-		return equalValues(left, right), nil
+		return cypherEqual(left, right), nil
 	case "<>", "!=":
-		if left == nil || right == nil {
+		equal := cypherEqual(left, right)
+		if equal == nil {
 			return nil, nil
 		}
-		return !equalValues(left, right), nil
+		return !equal.(bool), nil
 	case "<", "<=", ">", ">=":
 		if left == nil || right == nil {
 			return nil, nil
 		}
-		comparison, ok := compareValues(left, right)
-		if !ok {
-			return nil, evalError(expression, "cannot compare %T and %T", left, right)
+		comparison, comparable, unordered := compareCypherValues(left, right)
+		if unordered {
+			return false, nil
+		}
+		if !comparable {
+			return nil, nil
 		}
 		switch operator {
 		case "<":
@@ -243,6 +259,12 @@ func (e evaluator) binary(expression *cypher.BinaryExpression, values row) (any,
 		}
 	case "IN":
 		return containsValue(expression, right, left)
+	case "NOT IN":
+		contained, err := containsValue(expression, right, left)
+		if err != nil || contained == nil {
+			return contained, err
+		}
+		return !contained.(bool), nil
 	case "STARTS WITH", "ENDS WITH", "CONTAINS":
 		if left == nil || right == nil {
 			return nil, nil
@@ -353,7 +375,7 @@ func numericBinary(expression cypher.Expression, operator string, left, right an
 	if !leftOK || !rightOK {
 		return nil, evalError(expression, "%s expects numbers, got %T and %T", operator, left, right)
 	}
-	if operator == "/" && rightFloat == 0 || operator == "%" && rightFloat == 0 {
+	if operator == "%" && rightFloat == 0 || operator == "/" && rightFloat == 0 && leftInteger && rightInteger {
 		return nil, evalError(expression, "division by zero")
 	}
 	if leftInteger && rightInteger && operator != "/" && operator != "^" {
@@ -445,6 +467,9 @@ func (e evaluator) slice(expression *cypher.SliceExpression, values row) (any, e
 		if err != nil {
 			return nil, err
 		}
+		if value == nil {
+			return nil, nil
+		}
 		start, ok = integer(value)
 		if !ok {
 			return nil, evalError(expression, "slice start must be an integer")
@@ -454,6 +479,9 @@ func (e evaluator) slice(expression *cypher.SliceExpression, values row) (any, e
 		value, err := e.expression(expression.End, values)
 		if err != nil {
 			return nil, err
+		}
+		if value == nil {
+			return nil, nil
 		}
 		end, ok = integer(value)
 		if !ok {
@@ -486,7 +514,7 @@ func (e evaluator) caseExpression(expression *cypher.CaseExpression, values row)
 		}
 		matches := condition == true
 		if expression.Operand != nil {
-			matches = operand != nil && condition != nil && equalValues(operand, condition)
+			matches = cypherEqual(operand, condition) == true
 		}
 		if matches {
 			return e.expression(alternative.Then, values)
@@ -506,12 +534,20 @@ func (e evaluator) listComprehension(expression *cypher.ListComprehension, value
 	}
 	result := make([]any, 0, len(items))
 	for _, item := range items {
+		if err := e.ctx.Err(); err != nil {
+			return nil, err
+		}
 		next := cloneRow(values)
 		next[expression.Variable.Name] = item
 		if expression.Where != nil {
 			predicate, err := e.expression(expression.Where, next)
 			if err != nil {
 				return nil, err
+			}
+			if predicate != nil {
+				if _, ok := predicate.(bool); !ok {
+					return nil, evalError(expression.Where, "list comprehension predicate must be boolean")
+				}
 			}
 			if predicate != true {
 				continue
@@ -542,6 +578,9 @@ func (e evaluator) listPredicate(expression *cypher.ListPredicate, values row) (
 	falseCount := 0
 	hasNull := false
 	for _, item := range items {
+		if err := e.ctx.Err(); err != nil {
+			return nil, err
+		}
 		next := cloneRow(values)
 		next[expression.Variable.Name] = item
 		predicate, err := e.expression(expression.Where, next)
@@ -614,6 +653,9 @@ func (e evaluator) reduceExpression(expression *cypher.ReduceExpression, values 
 		return nil, evalError(expression, "reduce expects a list")
 	}
 	for _, item := range items {
+		if err := e.ctx.Err(); err != nil {
+			return nil, err
+		}
 		next := cloneRow(values)
 		next[expression.Accumulator.Name] = accumulator
 		next[expression.Variable.Name] = item
@@ -635,6 +677,9 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 	}
 	arguments := make([]any, len(expression.Arguments))
 	for index, argument := range expression.Arguments {
+		if err := e.ctx.Err(); err != nil {
+			return nil, err
+		}
 		value, err := e.expression(argument, values)
 		if err != nil {
 			return nil, err
@@ -650,6 +695,9 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 	switch name {
 	case "coalesce":
 		for _, argument := range arguments {
+			if err := e.ctx.Err(); err != nil {
+				return nil, err
+			}
 			if argument != nil {
 				return argument, nil
 			}
@@ -807,6 +855,9 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 		paths := make([]Path, 0, len(items))
 		minimum := math.MaxInt
 		for _, item := range items {
+			if err := e.ctx.Err(); err != nil {
+				return nil, err
+			}
 			path, ok := item.(Path)
 			if !ok {
 				return nil, evalError(expression, "%s expects a pattern", name)
@@ -970,6 +1021,8 @@ func property(value any, key string) any {
 		return property(*value, key)
 	case map[string]any:
 		return value[key]
+	case domain.Properties:
+		return value[key]
 	default:
 		return nil
 	}
@@ -991,6 +1044,8 @@ func properties(value any) map[string]any {
 			source = value.Properties
 		}
 	case map[string]any:
+		source = value
+	case domain.Properties:
 		source = value
 	}
 	if source == nil {
@@ -1046,29 +1101,19 @@ func asList(value any) ([]any, bool) {
 }
 
 func equalValues(left, right any) bool {
-	leftNumber, leftInteger, leftOK := number(left)
-	rightNumber, rightInteger, rightOK := number(right)
-	if leftOK && rightOK {
-		if leftInteger && rightInteger {
-			leftExact, _ := integer(left)
-			rightExact, _ := integer(right)
-			return leftExact == rightExact
-		}
-		return leftNumber == rightNumber
+	if comparison, numeric, unordered := compareNumbers(left, right); numeric {
+		return !unordered && comparison == 0
+	}
+	if leftTime, ok := left.(time.Time); ok {
+		rightTime, ok := right.(time.Time)
+		return ok && leftTime.Equal(rightTime)
 	}
 	return reflect.DeepEqual(left, right)
 }
 
 func compareValues(left, right any) (int, bool) {
-	leftNumber, leftInteger, leftOK := number(left)
-	rightNumber, rightInteger, rightOK := number(right)
-	if leftOK && rightOK {
-		if leftInteger && rightInteger {
-			leftExact, _ := integer(left)
-			rightExact, _ := integer(right)
-			return compare(leftExact, rightExact), true
-		}
-		return compare(leftNumber, rightNumber), true
+	if comparison, numeric, unordered := compareNumbers(left, right); numeric {
+		return comparison, !unordered
 	}
 	switch left := left.(type) {
 	case string:
@@ -1095,7 +1140,7 @@ func compareValues(left, right any) (int, bool) {
 }
 
 func containsValue(expression cypher.Expression, collection, needle any) (any, error) {
-	if collection == nil || needle == nil {
+	if collection == nil {
 		return nil, nil
 	}
 	items, ok := asList(collection)
@@ -1104,11 +1149,12 @@ func containsValue(expression cypher.Expression, collection, needle any) (any, e
 	}
 	foundNull := false
 	for _, item := range items {
-		if item == nil {
+		equal := cypherEqual(item, needle)
+		if equal == nil {
 			foundNull = true
 			continue
 		}
-		if equalValues(item, needle) {
+		if equal == true {
 			return true, nil
 		}
 	}
@@ -1116,6 +1162,391 @@ func containsValue(expression cypher.Expression, collection, needle any) (any, e
 		return nil, nil
 	}
 	return false, nil
+}
+
+// cypherEqual implements Cypher's three-valued structural equality. It is
+// deliberately separate from equalValues, which is used for internal change
+// detection and grouping where null values must form a stable equivalence
+// class.
+func cypherEqual(left, right any) any {
+	if left == nil || right == nil {
+		return nil
+	}
+	leftNumber, _, leftNumeric := number(left)
+	rightNumber, _, rightNumeric := number(right)
+	if leftNumeric || rightNumeric {
+		if !leftNumeric || !rightNumeric || math.IsNaN(leftNumber) || math.IsNaN(rightNumber) {
+			return false
+		}
+		comparison, _, _ := compareNumbers(left, right)
+		return comparison == 0
+	}
+	switch left := left.(type) {
+	case string:
+		right, ok := right.(string)
+		return ok && left == right
+	case bool:
+		right, ok := right.(bool)
+		return ok && left == right
+	case time.Time:
+		right, ok := right.(time.Time)
+		return ok && left.Equal(right)
+	case time.Duration:
+		right, ok := right.(time.Duration)
+		return ok && left == right
+	case *domain.Node:
+		switch right := right.(type) {
+		case *domain.Node:
+			return left != nil && right != nil && left.ID == right.ID
+		case domain.Node:
+			return left != nil && left.ID == right.ID
+		default:
+			return false
+		}
+	case domain.Node:
+		switch right := right.(type) {
+		case *domain.Node:
+			return right != nil && left.ID == right.ID
+		case domain.Node:
+			return left.ID == right.ID
+		default:
+			return false
+		}
+	case *domain.Edge:
+		switch right := right.(type) {
+		case *domain.Edge:
+			return left != nil && right != nil && left.ID == right.ID
+		case domain.Edge:
+			return left != nil && left.ID == right.ID
+		default:
+			return false
+		}
+	case domain.Edge:
+		switch right := right.(type) {
+		case *domain.Edge:
+			return right != nil && left.ID == right.ID
+		case domain.Edge:
+			return left.ID == right.ID
+		default:
+			return false
+		}
+	case Path:
+		right, ok := right.(Path)
+		return ok && equalPath(left, right)
+	}
+	leftList, leftIsList := asList(left)
+	rightList, rightIsList := asList(right)
+	if leftIsList || rightIsList {
+		if !leftIsList || !rightIsList || len(leftList) != len(rightList) {
+			return false
+		}
+		unknown := false
+		for index := range leftList {
+			equal := cypherEqual(leftList[index], rightList[index])
+			if equal == false {
+				return false
+			}
+			unknown = unknown || equal == nil
+		}
+		if unknown {
+			return nil
+		}
+		return true
+	}
+	leftMap, leftIsMap := asMap(left)
+	rightMap, rightIsMap := asMap(right)
+	if leftIsMap || rightIsMap {
+		if !leftIsMap || !rightIsMap || len(leftMap) != len(rightMap) {
+			return false
+		}
+		for key := range leftMap {
+			if _, exists := rightMap[key]; !exists {
+				return false
+			}
+		}
+		unknown := false
+		for key, leftValue := range leftMap {
+			equal := cypherEqual(leftValue, rightMap[key])
+			if equal == false {
+				return false
+			}
+			unknown = unknown || equal == nil
+		}
+		if unknown {
+			return nil
+		}
+		return true
+	}
+	return reflect.DeepEqual(left, right)
+}
+
+func asMap(value any) (map[string]any, bool) {
+	switch value := value.(type) {
+	case map[string]any:
+		return value, true
+	case domain.Properties:
+		return map[string]any(value), true
+	default:
+		return nil, false
+	}
+}
+
+// compareCypherValues is the partial ordering used by comparison operators.
+// comparable is false for different or non-orderable types. unordered is true
+// for NaN, for which every ordering predicate is false rather than null.
+func compareCypherValues(left, right any) (comparison int, comparable, unordered bool) {
+	_, _, leftNumeric := number(left)
+	_, _, rightNumeric := number(right)
+	if leftNumeric || rightNumeric {
+		if !leftNumeric || !rightNumeric {
+			return 0, false, false
+		}
+		return compareNumbers(left, right)
+	}
+	switch left := left.(type) {
+	case string:
+		right, ok := right.(string)
+		if !ok {
+			return 0, false, false
+		}
+		return strings.Compare(left, right), true, false
+	case bool:
+		right, ok := right.(bool)
+		if !ok {
+			return 0, false, false
+		}
+		return compareBool(left, right), true, false
+	case time.Time:
+		right, ok := right.(time.Time)
+		if !ok {
+			return 0, false, false
+		}
+		return left.Compare(right), true, false
+	case time.Duration:
+		right, ok := right.(time.Duration)
+		if !ok {
+			return 0, false, false
+		}
+		return compare(int64(left), int64(right)), true, false
+	}
+	leftList, leftOK := asList(left)
+	rightList, rightOK := asList(right)
+	if leftOK || rightOK {
+		if !leftOK || !rightOK {
+			return 0, false, false
+		}
+		for index := 0; index < min(len(leftList), len(rightList)); index++ {
+			if equal := cypherEqual(leftList[index], rightList[index]); equal == true {
+				continue
+			}
+			if leftList[index] == nil || rightList[index] == nil {
+				return 0, false, false
+			}
+			comparison, comparable, unordered := compareCypherValues(leftList[index], rightList[index])
+			if unordered || !comparable {
+				return comparison, comparable, unordered
+			}
+			if comparison != 0 {
+				return comparison, true, false
+			}
+		}
+		return compare(len(leftList), len(rightList)), true, false
+	}
+	return 0, false, false
+}
+
+func compareNumbers(left, right any) (comparison int, numeric, unordered bool) {
+	leftFloat, _, leftOK := number(left)
+	rightFloat, _, rightOK := number(right)
+	if !leftOK || !rightOK {
+		return 0, false, false
+	}
+	if math.IsNaN(leftFloat) || math.IsNaN(rightFloat) {
+		return 0, true, true
+	}
+	leftInteger, leftIsInteger := integer(left)
+	rightInteger, rightIsInteger := integer(right)
+	if leftIsInteger && rightIsInteger {
+		return compare(leftInteger, rightInteger), true, false
+	}
+	if !leftIsInteger && !rightIsInteger {
+		return compare(leftFloat, rightFloat), true, false
+	}
+	if math.IsInf(leftFloat, 0) || math.IsInf(rightFloat, 0) {
+		return compare(leftFloat, rightFloat), true, false
+	}
+	if leftIsInteger {
+		integerValue := new(big.Rat).SetInt64(leftInteger)
+		floatValue := new(big.Rat).SetFloat64(rightFloat)
+		return integerValue.Cmp(floatValue), true, false
+	}
+	integerValue := new(big.Rat).SetInt64(rightInteger)
+	floatValue := new(big.Rat).SetFloat64(leftFloat)
+	return floatValue.Cmp(integerValue), true, false
+}
+
+// compareOrderValues implements the total value hierarchy used by ORDER BY.
+// Unlike comparison operators, ORDER BY defines an order across types and
+// places null last (therefore first when the caller reverses for DESC).
+func compareOrderValues(left, right any) int {
+	if left == nil || isNilEntity(left) {
+		if right == nil || isNilEntity(right) {
+			return 0
+		}
+		return 1
+	}
+	if right == nil || isNilEntity(right) {
+		return -1
+	}
+	leftRank, rightRank := orderRank(left), orderRank(right)
+	if leftRank != rightRank {
+		return compare(leftRank, rightRank)
+	}
+	switch leftRank {
+	case 0: // maps
+		leftMap, _ := asMap(left)
+		rightMap, _ := asMap(right)
+		if len(leftMap) != len(rightMap) {
+			return compare(len(leftMap), len(rightMap))
+		}
+		leftKeys, rightKeys := sortedMapKeys(leftMap), sortedMapKeys(rightMap)
+		for index := range leftKeys {
+			if keyComparison := strings.Compare(leftKeys[index], rightKeys[index]); keyComparison != 0 {
+				return keyComparison
+			}
+		}
+		for _, key := range leftKeys {
+			if valueComparison := compareOrderValues(leftMap[key], rightMap[key]); valueComparison != 0 {
+				return valueComparison
+			}
+		}
+		return 0
+	case 1: // nodes
+		return strings.Compare(string(nodeIdentity(left)), string(nodeIdentity(right)))
+	case 2: // relationships
+		return strings.Compare(string(edgeIdentity(left)), string(edgeIdentity(right)))
+	case 3: // lists
+		leftList, _ := asList(left)
+		rightList, _ := asList(right)
+		for index := 0; index < min(len(leftList), len(rightList)); index++ {
+			if valueComparison := compareOrderValues(leftList[index], rightList[index]); valueComparison != 0 {
+				return valueComparison
+			}
+		}
+		return compare(len(leftList), len(rightList))
+	case 4: // paths
+		return strings.Compare(valueKey(left), valueKey(right))
+	case 5: // temporal values
+		leftTime, leftOK := left.(time.Time)
+		rightTime, rightOK := right.(time.Time)
+		if leftOK && rightOK {
+			return leftTime.Compare(rightTime)
+		}
+	case 6: // durations
+		leftDuration, leftOK := left.(time.Duration)
+		rightDuration, rightOK := right.(time.Duration)
+		if leftOK && rightOK {
+			return compare(int64(leftDuration), int64(rightDuration))
+		}
+	case 7:
+		return strings.Compare(left.(string), right.(string))
+	case 8:
+		return compareBool(left.(bool), right.(bool))
+	case 9:
+		comparison, _, unordered := compareNumbers(left, right)
+		if unordered {
+			leftNaN, rightNaN := isNaN(left), isNaN(right)
+			if leftNaN == rightNaN {
+				return 0
+			}
+			if leftNaN {
+				return 1
+			}
+			return -1
+		}
+		return comparison
+	}
+	return strings.Compare(valueKey(left), valueKey(right))
+}
+
+func orderRank(value any) int {
+	if _, ok := asMap(value); ok {
+		return 0
+	}
+	switch value.(type) {
+	case domain.Node, *domain.Node:
+		return 1
+	case domain.Edge, *domain.Edge:
+		return 2
+	}
+	if _, ok := asList(value); ok {
+		return 3
+	}
+	switch value.(type) {
+	case Path, PathValue:
+		return 4
+	case time.Time:
+		return 5
+	case time.Duration:
+		return 6
+	case string:
+		return 7
+	case bool:
+		return 8
+	}
+	if _, _, ok := number(value); ok {
+		return 9
+	}
+	return 11
+}
+
+func isNilEntity(value any) bool {
+	switch value := value.(type) {
+	case *domain.Node:
+		return value == nil
+	case *domain.Edge:
+		return value == nil
+	default:
+		return false
+	}
+}
+
+func nodeIdentity(value any) domain.EntityID {
+	switch value := value.(type) {
+	case domain.Node:
+		return value.ID
+	case *domain.Node:
+		if value != nil {
+			return value.ID
+		}
+	}
+	return ""
+}
+
+func edgeIdentity(value any) domain.EntityID {
+	switch value := value.(type) {
+	case domain.Edge:
+		return value.ID
+	case *domain.Edge:
+		if value != nil {
+			return value.ID
+		}
+	}
+	return ""
+}
+
+func sortedMapKeys(value map[string]any) []string {
+	keys := make([]string, 0, len(value))
+	for key := range value {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func isNaN(value any) bool {
+	number, _, ok := number(value)
+	return ok && math.IsNaN(number)
 }
 
 func number(value any) (float64, bool, bool) {
@@ -1313,17 +1744,26 @@ func integerRange(expression cypher.Expression, arguments []any) (any, error) {
 	if (step > 0 && start > end) || (step < 0 && start < end) {
 		return []any{}, nil
 	}
-	distance := end - start
-	count := distance/step + 1
-	if count < 0 || count > 1_000_000 {
+	// Compute cardinality outside int64 arithmetic. Both subtraction across
+	// opposite-signed endpoints and negating MinInt64 can overflow, and a
+	// boundary-controlled loop can wrap after appending MaxInt64/MinInt64.
+	// Iterating the proven count also avoids incrementing after the final item.
+	distance := new(big.Int).Sub(big.NewInt(end), big.NewInt(start))
+	distance.Abs(distance)
+	stepMagnitude := new(big.Int).Abs(big.NewInt(step))
+	countValue := new(big.Int).Quo(distance, stepMagnitude)
+	countValue.Add(countValue, big.NewInt(1))
+	if !countValue.IsInt64() || countValue.Int64() > 1_000_000 {
 		return nil, evalError(expression, "range result is too large")
 	}
+	count := countValue.Int64()
 	result := make([]any, 0, count)
-	for current := start; ; current += step {
-		if step > 0 && current > end || step < 0 && current < end {
-			break
-		}
+	current := start
+	for index := int64(0); index < count; index++ {
 		result = append(result, current)
+		if index+1 < count {
+			current += step
+		}
 	}
 	return result, nil
 }

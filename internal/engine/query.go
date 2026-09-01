@@ -3,12 +3,16 @@ package engine
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/cypher"
+	"github.com/svlocks/sheets/internal/domain"
 )
+
+type revisionLister func(context.Context, domain.Page) ([]domain.RevisionInfo, domain.PageInfo, error)
 
 type queryExecution struct {
 	ctx       context.Context
@@ -17,15 +21,53 @@ type queryExecution struct {
 	evaluator evaluator
 	summary   app.Summary
 	lastRows  []row
+	revisions revisionLister
 }
 
-func executeQuery(ctx context.Context, source string, query *cypher.QueryStatement, graph *memoryGraph, params map[string]any) (app.Result, error) {
-	execution := &queryExecution{
-		ctx: ctx, source: source, graph: graph, evaluator: newEvaluator(params),
+const defaultQueryRows int64 = 100_000
+
+type rowBudget struct {
+	limit int64
+	used  int64
+}
+
+func (b *rowBudget) take(ctx context.Context, count int) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	if b == nil || b.limit <= 0 || count <= 0 {
+		return nil
+	}
+	b.used += int64(count)
+	if b.used > b.limit {
+		return fmt.Errorf("query row budget of %d exceeded", b.limit)
+	}
+	return nil
+}
+
+// A variable-length pattern can enumerate exponentially many relationship
+// trails even though each individual trail is finite. Keep one budget across
+// the complete query so a small collection of patterns cannot evade the cap.
+const maxPathExpansions int64 = 1_000_000
+
+func executeQuery(
+	ctx context.Context,
+	source string,
+	query *cypher.QueryStatement,
+	graph *memoryGraph,
+	params map[string]any,
+	listRevisions revisionLister,
+) (app.Result, error) {
+	execution := &queryExecution{
+		ctx: ctx, source: source, graph: graph, evaluator: newEvaluator(params), revisions: listRevisions,
+	}
+	execution.evaluator.ctx = ctx
+	execution.evaluator.paths = &pathExpansionBudget{limit: maxPathExpansions}
+	execution.evaluator.rows = &rowBudget{limit: defaultQueryRows}
 	execution.evaluator.graph = graph
 	execution.evaluator.pattern = execution.evaluatePattern
 	execution.evaluator.subquery = execution.evaluateExistsSubquery
+	execution.evaluator.shortest = execution.evaluateShortestPattern
 	primary, err := execution.clauses(query.Clauses, []row{{}})
 	if err != nil {
 		return app.Result{}, err
@@ -41,8 +83,8 @@ func executeQuery(ctx context.Context, source string, query *cypher.QueryStateme
 		if err != nil {
 			return app.Result{}, err
 		}
-		if len(branchResult.Columns) != len(combined.Columns) {
-			return app.Result{}, fmt.Errorf("UNION branches return different column counts")
+		if !slices.Equal(branchResult.Columns, combined.Columns) {
+			return app.Result{}, fmt.Errorf("UNION branches return different columns: %v and %v", combined.Columns, branchResult.Columns)
 		}
 		combined.Rows = append(combined.Rows, branchResult.Rows...)
 		if !branch.All {
@@ -55,6 +97,7 @@ func executeQuery(ctx context.Context, source string, query *cypher.QueryStateme
 
 func (e *queryExecution) clauses(clauses []cypher.Clause, rows []row) (app.Result, error) {
 	result := app.Result{}
+	known := scopeFromRows(rows)
 	for clauseIndex, clause := range clauses {
 		if err := e.ctx.Err(); err != nil {
 			return app.Result{}, err
@@ -63,14 +106,24 @@ func (e *queryExecution) clauses(clauses []cypher.Clause, rows []row) (app.Resul
 		switch clause := clause.(type) {
 		case *cypher.MatchClause:
 			rows, err = matchClauseRows(e.graph, e.evaluator, rows, clause)
+			addPatternVariables(known, clause.Patterns)
 		case *cypher.UnwindClause:
 			rows, err = e.unwind(rows, clause)
+			known[clause.Alias.Name] = struct{}{}
 		case *cypher.ProjectionClause:
-			rows, result, err = e.project(rows, clause)
+			inputKnown := known
+			rows, result, err = e.project(rows, clause, known)
+			if clause.With {
+				known = projectionOutputScope(e.source, clause.Items, inputKnown, rows)
+			} else {
+				known = scopeFromColumns(result.Columns)
+			}
 		case *cypher.CreateClause:
 			rows, err = e.create(rows, clause.Patterns)
+			addPatternVariables(known, clause.Patterns)
 		case *cypher.MergeClause:
 			rows, err = e.merge(rows, clause)
+			addPatternVariables(known, []cypher.PatternPart{clause.Pattern})
 		case *cypher.SetClause:
 			err = e.set(rows, clause.Items)
 		case *cypher.RemoveClause:
@@ -78,9 +131,15 @@ func (e *queryExecution) clauses(clauses []cypher.Clause, rows []row) (app.Resul
 		case *cypher.DeleteClause:
 			err = e.delete(rows, clause)
 		case *cypher.CallClause:
+			var nextKnown variableScope
+			nextKnown, _, err = validateCall(e.source, clause, known)
+			if err != nil {
+				break
+			}
 			rows, err = e.call(rows, clause)
+			known = nextKnown
 			if err == nil && clauseIndex == len(clauses)-1 {
-				result = rowsResult(rows)
+				result = callRowsResult(rows, clause, sortedScope(known))
 			}
 		default:
 			err = fmt.Errorf("unsupported clause %T", clause)
@@ -91,6 +150,55 @@ func (e *queryExecution) clauses(clauses []cypher.Clause, rows []row) (app.Resul
 	}
 	e.lastRows = rows
 	return result, nil
+}
+
+func callRowsResult(rows []row, clause *cypher.CallClause, known []string) app.Result {
+	result := rowsResult(rows)
+	if len(result.Columns) != 0 {
+		return result
+	}
+	if len(known) > 0 {
+		result.Columns = append([]string(nil), known...)
+		return result
+	}
+	if clause.Subquery != nil {
+		return result
+	}
+	if len(clause.Yield) > 0 {
+		for _, item := range clause.Yield {
+			if item.Star {
+				result.Columns = procedureColumns(clause.Procedure.String())
+				return result
+			}
+			name := item.Name.Name
+			if item.Alias.Name != "" {
+				name = item.Alias.Name
+			}
+			result.Columns = append(result.Columns, name)
+		}
+		return result
+	}
+	result.Columns = procedureColumns(clause.Procedure.String())
+	return result
+}
+
+func procedureColumns(name string) []string {
+	switch strings.ToLower(name) {
+	case "db.labels":
+		return []string{"label"}
+	case "db.relationshiptypes":
+		return []string{"relationshipType"}
+	case "db.propertykeys":
+		return []string{"propertyKey"}
+	case "sheets.nodes":
+		return []string{"node"}
+	case "sheets.edges":
+		return []string{"relationship"}
+	case "sheets.revisions":
+		return []string{"revision", "time", "actor", "message", "next"}
+	default:
+		return nil
+	}
 }
 
 func rowsResult(rows []row) app.Result {
@@ -120,6 +228,9 @@ func rowsResult(rows []row) app.Result {
 func (e *queryExecution) unwind(input []row, clause *cypher.UnwindClause) ([]row, error) {
 	result := make([]row, 0)
 	for _, values := range input {
+		if err := e.ctx.Err(); err != nil {
+			return nil, err
+		}
 		value, err := e.evaluator.expression(clause.Expression, values)
 		if err != nil {
 			return nil, err
@@ -132,6 +243,9 @@ func (e *queryExecution) unwind(input []row, clause *cypher.UnwindClause) ([]row
 			return nil, evalError(clause.Expression, "UNWIND expects a list, got %T", value)
 		}
 		for _, item := range items {
+			if err := e.evaluator.rows.take(e.ctx, 1); err != nil {
+				return nil, err
+			}
 			next := cloneRow(values)
 			next[clause.Alias.Name] = item
 			result = append(result, next)
@@ -140,16 +254,21 @@ func (e *queryExecution) unwind(input []row, clause *cypher.UnwindClause) ([]row
 	return result, nil
 }
 
-func (e *queryExecution) project(input []row, clause *cypher.ProjectionClause) ([]row, app.Result, error) {
-	columns := projectionColumns(e.source, clause.Items, input)
+func (e *queryExecution) project(input []row, clause *cypher.ProjectionClause, known variableScope) ([]row, app.Result, error) {
+	columns := projectionColumns(e.source, clause.Items, input, known)
 	var projected []row
 	var tableRows [][]any
+	var sortScopes []row
+	var sortEvaluators []evaluator
 	if projectionAggregates(clause.Items) {
 		groups, err := e.groupRows(input, clause.Items)
 		if err != nil {
 			return nil, app.Result{}, err
 		}
 		for _, group := range groups {
+			if err := e.ctx.Err(); err != nil {
+				return nil, app.Result{}, err
+			}
 			representative := row{}
 			if len(group) > 0 {
 				representative = group[0]
@@ -162,15 +281,25 @@ func (e *queryExecution) project(input []row, clause *cypher.ProjectionClause) (
 			}
 			projected = append(projected, mapped)
 			tableRows = append(tableRows, values)
+			sortScopes = append(sortScopes, projectionSortScope(representative, mapped, clause))
+			sortEvaluators = append(sortEvaluators, groupEvaluator)
 		}
 	} else {
 		for _, values := range input {
+			if err := e.ctx.Err(); err != nil {
+				return nil, app.Result{}, err
+			}
+			if err := e.evaluator.rows.take(e.ctx, 1); err != nil {
+				return nil, app.Result{}, err
+			}
 			projectedValues, mapped, err := evaluateProjection(e.evaluator, values, clause.Items, columns)
 			if err != nil {
 				return nil, app.Result{}, err
 			}
 			projected = append(projected, mapped)
 			tableRows = append(tableRows, projectedValues)
+			sortScopes = append(sortScopes, projectionSortScope(values, mapped, clause))
+			sortEvaluators = append(sortEvaluators, e.evaluator)
 		}
 	}
 
@@ -178,7 +307,12 @@ func (e *queryExecution) project(input []row, clause *cypher.ProjectionClause) (
 	if clause.Where != nil {
 		filteredRows := make([]row, 0, len(projected))
 		filteredTable := make([][]any, 0, len(tableRows))
+		filteredScopes := make([]row, 0, len(sortScopes))
+		filteredEvaluators := make([]evaluator, 0, len(sortEvaluators))
 		for index, values := range projected {
+			if err := e.ctx.Err(); err != nil {
+				return nil, app.Result{}, err
+			}
 			keep, filterErr := e.evaluator.expression(clause.Where, values)
 			if filterErr != nil {
 				return nil, app.Result{}, filterErr
@@ -186,17 +320,33 @@ func (e *queryExecution) project(input []row, clause *cypher.ProjectionClause) (
 			if keep == true {
 				filteredRows = append(filteredRows, values)
 				filteredTable = append(filteredTable, tableRows[index])
+				filteredScopes = append(filteredScopes, sortScopes[index])
+				filteredEvaluators = append(filteredEvaluators, sortEvaluators[index])
 			} else if keep != nil && keep != false {
 				return nil, app.Result{}, evalError(clause.Where, "WHERE expects a boolean")
 			}
 		}
-		projected, tableRows = filteredRows, filteredTable
+		projected, tableRows, sortScopes, sortEvaluators = filteredRows, filteredTable, filteredScopes, filteredEvaluators
 	}
 	if clause.Distinct {
-		projected, tableRows = distinctProjected(projected, tableRows)
+		projected, tableRows, sortScopes, sortEvaluators, err = distinctProjected(e.ctx, projected, tableRows, sortScopes, sortEvaluators)
+		if err != nil {
+			return nil, app.Result{}, err
+		}
 	}
 	if len(clause.OrderBy) > 0 {
-		if err = e.sortProjection(projected, tableRows, clause.OrderBy); err != nil {
+		sortKeys := make([][]any, len(projected))
+		for index := range projected {
+			if err := e.ctx.Err(); err != nil {
+				return nil, app.Result{}, err
+			}
+			keys, sortErr := evaluateSortKeys(sortEvaluators[index], sortScopes[index], clause.OrderBy)
+			if sortErr != nil {
+				return nil, app.Result{}, sortErr
+			}
+			sortKeys[index] = keys
+		}
+		if err := sortProjection(e.ctx, projected, tableRows, sortKeys, clause.OrderBy); err != nil {
 			return nil, app.Result{}, err
 		}
 	}
@@ -213,11 +363,43 @@ func (e *queryExecution) project(input []row, clause *cypher.ProjectionClause) (
 	return projected, result, nil
 }
 
-func projectionColumns(source string, items []cypher.ProjectionItem, input []row) []string {
+func projectionSortScope(source, projected row, clause *cypher.ProjectionClause) row {
+	// DISTINCT removes variables which were not projected. Aggregating
+	// projections retain the representative input so projected grouping keys
+	// and aggregate ORDER BY expressions can be evaluated with the group.
+	scope := row{}
+	if !clause.Distinct || projectionAggregates(clause.Items) {
+		scope = cloneRow(source)
+	}
+	for name, value := range projected {
+		scope[name] = value
+	}
+	return scope
+}
+
+func evaluateSortKeys(evaluator evaluator, scope row, items []cypher.SortItem) ([]any, error) {
+	keys := make([]any, len(items))
+	for index, item := range items {
+		if err := evaluator.ctx.Err(); err != nil {
+			return nil, err
+		}
+		value, err := evaluator.expression(item.Expression, scope)
+		if err != nil {
+			return nil, err
+		}
+		keys[index] = value
+	}
+	return keys, nil
+}
+
+func projectionColumns(source string, items []cypher.ProjectionItem, input []row, known variableScope) []string {
 	columns := make([]string, 0, len(items))
 	for _, item := range items {
 		if item.Star {
-			set := make(map[string]struct{})
+			set := make(map[string]struct{}, len(known))
+			for key := range known {
+				set[key] = struct{}{}
+			}
 			for _, values := range input {
 				for key := range values {
 					if key != internalPathKey {
@@ -251,11 +433,44 @@ func projectionColumns(source string, items []cypher.ProjectionItem, input []row
 	return columns
 }
 
+func scopeFromRows(rows []row) variableScope {
+	result := variableScope{}
+	for _, values := range rows {
+		for name := range values {
+			if name != internalPathKey && name != expressionPathKey {
+				result[name] = struct{}{}
+			}
+		}
+	}
+	return result
+}
+
+func scopeFromColumns(columns []string) variableScope {
+	result := make(variableScope, len(columns))
+	for _, column := range columns {
+		result[column] = struct{}{}
+	}
+	return result
+}
+
+func projectionOutputScope(source string, items []cypher.ProjectionItem, input variableScope, rows []row) variableScope {
+	// result.Columns is intentionally empty for WITH, so reconstruct its
+	// static schema and include any concrete keys as a consistency fallback.
+	result := scopeFromColumns(projectionStaticColumns(source, items, input))
+	for name := range scopeFromRows(rows) {
+		result[name] = struct{}{}
+	}
+	return result
+}
+
 func evaluateProjection(evaluator evaluator, source row, items []cypher.ProjectionItem, columns []string) ([]any, row, error) {
 	values := make([]any, 0, len(columns))
 	mapped := make(row, len(columns))
 	columnIndex := 0
 	for _, item := range items {
+		if err := evaluator.ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		if item.Star {
 			starNames := make([]string, 0, len(source))
 			for name := range source {
@@ -285,12 +500,15 @@ func evaluateProjection(evaluator evaluator, source row, items []cypher.Projecti
 
 func (e *queryExecution) groupRows(input []row, items []cypher.ProjectionItem) ([][]row, error) {
 	groupExpressions := make([]cypher.Expression, 0)
+	groupCompleteRow := false
 	for _, item := range items {
-		if !item.Star && !containsAggregate(item.Expression) {
+		if item.Star {
+			groupCompleteRow = true
+		} else if !containsAggregate(item.Expression) {
 			groupExpressions = append(groupExpressions, item.Expression)
 		}
 	}
-	if len(groupExpressions) == 0 {
+	if len(groupExpressions) == 0 && !groupCompleteRow {
 		return [][]row{input}, nil
 	}
 	type group struct {
@@ -300,13 +518,19 @@ func (e *queryExecution) groupRows(input []row, items []cypher.ProjectionItem) (
 	groups := make([]group, 0)
 	index := make(map[string]int)
 	for _, values := range input {
-		keyValues := make([]any, len(groupExpressions))
-		for expressionIndex, expression := range groupExpressions {
+		if err := e.ctx.Err(); err != nil {
+			return nil, err
+		}
+		keyValues := make([]any, 0, len(groupExpressions)+1)
+		if groupCompleteRow {
+			keyValues = append(keyValues, values)
+		}
+		for _, expression := range groupExpressions {
 			value, err := e.evaluator.expression(expression, values)
 			if err != nil {
 				return nil, err
 			}
-			keyValues[expressionIndex] = value
+			keyValues = append(keyValues, value)
 		}
 		key := valueKey(keyValues)
 		position, exists := index[key]
@@ -383,11 +607,22 @@ func containsAggregate(expression cypher.Expression) bool {
 	return false
 }
 
-func distinctProjected(rows []row, table [][]any) ([]row, [][]any) {
+func distinctProjected(
+	ctx context.Context,
+	rows []row,
+	table [][]any,
+	scopes []row,
+	evaluators []evaluator,
+) ([]row, [][]any, []row, []evaluator, error) {
 	seen := make(map[string]struct{}, len(table))
 	resultRows := make([]row, 0, len(rows))
 	resultTable := make([][]any, 0, len(table))
+	resultScopes := make([]row, 0, len(scopes))
+	resultEvaluators := make([]evaluator, 0, len(evaluators))
 	for index, values := range table {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, nil, err
+		}
 		key := valueKey(values)
 		if _, exists := seen[key]; exists {
 			continue
@@ -395,8 +630,10 @@ func distinctProjected(rows []row, table [][]any) ([]row, [][]any) {
 		seen[key] = struct{}{}
 		resultRows = append(resultRows, rows[index])
 		resultTable = append(resultTable, values)
+		resultScopes = append(resultScopes, scopes[index])
+		resultEvaluators = append(resultEvaluators, evaluators[index])
 	}
-	return resultRows, resultTable
+	return resultRows, resultTable, resultScopes, resultEvaluators, nil
 }
 
 func distinctResultRows(rows [][]any) [][]any {
@@ -413,7 +650,10 @@ func distinctResultRows(rows [][]any) [][]any {
 	return result
 }
 
-func (e *queryExecution) sortProjection(rows []row, table [][]any, items []cypher.SortItem) error {
+func sortProjection(ctx context.Context, rows []row, table, keys [][]any, items []cypher.SortItem) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	type sortable struct {
 		row    row
 		values []any
@@ -421,30 +661,14 @@ func (e *queryExecution) sortProjection(rows []row, table [][]any, items []cyphe
 	}
 	sortableRows := make([]sortable, len(rows))
 	for index := range rows {
-		sortableRows[index] = sortable{row: rows[index], values: table[index], keys: make([]any, len(items))}
-		for itemIndex, item := range items {
-			value, err := e.evaluator.expression(item.Expression, rows[index])
-			if err != nil {
-				return err
-			}
-			sortableRows[index].keys[itemIndex] = value
-		}
+		sortableRows[index] = sortable{row: rows[index], values: table[index], keys: keys[index]}
 	}
 	sort.SliceStable(sortableRows, func(left, right int) bool {
 		for index, item := range items {
 			leftValue, rightValue := sortableRows[left].keys[index], sortableRows[right].keys[index]
-			if equalValues(leftValue, rightValue) {
+			comparison := compareOrderValues(leftValue, rightValue)
+			if comparison == 0 {
 				continue
-			}
-			if leftValue == nil {
-				return false
-			}
-			if rightValue == nil {
-				return true
-			}
-			comparison, ok := compareValues(leftValue, rightValue)
-			if !ok {
-				comparison = strings.Compare(valueKey(leftValue), valueKey(rightValue))
 			}
 			if item.Descending {
 				return comparison > 0
@@ -456,7 +680,7 @@ func (e *queryExecution) sortProjection(rows []row, table [][]any, items []cyphe
 	for index := range sortableRows {
 		rows[index], table[index] = sortableRows[index].row, sortableRows[index].values
 	}
-	return nil
+	return ctx.Err()
 }
 
 func (e *queryExecution) paginateProjection(rows []row, table [][]any, skipExpression, limitExpression cypher.Expression) ([]row, [][]any, error) {
@@ -483,7 +707,11 @@ func (e *queryExecution) paginateProjection(rows []row, table [][]any, skipExpre
 			return nil, nil, evalError(limitExpression, "LIMIT must be a non-negative integer")
 		}
 	}
-	start := min(skip, int64(len(rows)))
-	end := min(int64(len(rows)), start+limit)
+	length := int64(len(rows))
+	start := min(skip, length)
+	end := length
+	if limit < length-start {
+		end = start + limit
+	}
 	return rows[start:end], table[start:end], nil
 }

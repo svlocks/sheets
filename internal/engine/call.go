@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -13,12 +14,12 @@ func (e *queryExecution) call(input []row, clause *cypher.CallClause) ([]row, er
 	if clause.Subquery != nil {
 		return e.callSubquery(input, clause)
 	}
-	procedureRows, err := e.procedure(clause)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]row, 0, len(input)*max(1, len(procedureRows)))
+	result := make([]row, 0)
 	for _, outer := range input {
+		procedureRows, err := e.procedure(clause, outer)
+		if err != nil {
+			return nil, err
+		}
 		for _, procedureRow := range procedureRows {
 			next := cloneRow(outer)
 			if len(clause.Yield) == 0 {
@@ -57,14 +58,21 @@ func (e *queryExecution) call(input []row, clause *cypher.CallClause) ([]row, er
 func (e *queryExecution) callSubquery(input []row, clause *cypher.CallClause) ([]row, error) {
 	result := make([]row, 0)
 	for _, outer := range input {
-		_, err := e.clauses(clause.Subquery.Clauses, []row{cloneRow(outer)})
+		rows, columns, unit, err := e.executeSubquery(clause.Subquery, outer)
 		if err != nil {
 			return nil, err
 		}
-		for _, subqueryRow := range e.lastRows {
+		if unit {
+			result = append(result, cloneRow(outer))
+			continue
+		}
+		for _, subqueryRow := range rows {
 			merged := cloneRow(outer)
-			for key, value := range subqueryRow {
-				merged[key] = value
+			for _, key := range columns {
+				if _, exists := outer[key]; exists {
+					return nil, fmt.Errorf("subquery returns variable %q which is already declared in the outer scope", key)
+				}
+				merged[key] = subqueryRow[key]
 			}
 			result = append(result, merged)
 		}
@@ -72,11 +80,86 @@ func (e *queryExecution) callSubquery(input []row, clause *cypher.CallClause) ([
 	return result, nil
 }
 
-func (e *queryExecution) procedure(clause *cypher.CallClause) ([]row, error) {
+func (e *queryExecution) executeSubquery(query *cypher.QueryStatement, outer row) ([]row, []string, bool, error) {
+	initial := subqueryInitialRows(query.Clauses, outer)
+	primary, err := e.clauses(query.Clauses, initial)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	unit := !clausesReturnRows(query.Clauses)
+	if unit && len(query.UnionBranches) == 0 {
+		return nil, nil, true, nil
+	}
+	columns := primary.Columns
+	rows := append([]row(nil), e.lastRows...)
+	for _, branch := range query.UnionBranches {
+		branchResult, err := e.clauses(branch.Query.Clauses, subqueryInitialRows(branch.Query.Clauses, outer))
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if !slices.Equal(columns, branchResult.Columns) {
+			return nil, nil, false, fmt.Errorf("UNION branches return different columns: %v and %v", columns, branchResult.Columns)
+		}
+		rows = append(rows, e.lastRows...)
+		if !branch.All {
+			rows = distinctMappedRows(rows, columns)
+		}
+	}
+	return rows, columns, false, nil
+}
+
+func subqueryInitialRows(clauses []cypher.Clause, outer row) []row {
+	// In the supported CALL { ... } form an initial WITH is the explicit
+	// importing clause. Without it the subquery begins with an empty scope.
+	if len(clauses) > 0 {
+		if projection, ok := clauses[0].(*cypher.ProjectionClause); ok && projection.With {
+			return []row{cloneRow(outer)}
+		}
+	}
+	return []row{{}}
+}
+
+func clausesReturnRows(clauses []cypher.Clause) bool {
+	if len(clauses) == 0 {
+		return false
+	}
+	switch clause := clauses[len(clauses)-1].(type) {
+	case *cypher.ProjectionClause:
+		return !clause.With
+	case *cypher.CallClause:
+		return clause.Subquery == nil
+	default:
+		return false
+	}
+}
+
+func distinctMappedRows(rows []row, columns []string) []row {
+	seen := make(map[string]struct{}, len(rows))
+	result := make([]row, 0, len(rows))
+	for _, values := range rows {
+		keyValues := make([]any, len(columns))
+		for index, column := range columns {
+			keyValues[index] = values[column]
+		}
+		key := valueKey(keyValues)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, values)
+	}
+	return result
+}
+
+func (e *queryExecution) procedure(clause *cypher.CallClause, values row) ([]row, error) {
+	name := strings.ToLower(clause.Procedure.String())
+	if name == "sheets.revisions" {
+		return e.revisionRows(clause, values)
+	}
 	if len(clause.Arguments) != 0 {
 		return nil, fmt.Errorf("procedure %s expects no arguments", clause.Procedure.String())
 	}
-	switch strings.ToLower(clause.Procedure.String()) {
+	switch name {
 	case "db.labels":
 		set := make(map[string]struct{})
 		for _, node := range e.graph.nodes {
@@ -131,6 +214,57 @@ func (e *queryExecution) procedure(clause *cypher.CallClause) ([]row, error) {
 	default:
 		return nil, fmt.Errorf("unknown procedure %s", clause.Procedure.String())
 	}
+}
+
+func (e *queryExecution) revisionRows(clause *cypher.CallClause, values row) ([]row, error) {
+	if e.revisions == nil {
+		return nil, fmt.Errorf("procedure %s is unavailable", clause.Procedure.String())
+	}
+	if len(clause.Arguments) > 2 {
+		return nil, fmt.Errorf("procedure %s expects at most two arguments: limit and after cursor", clause.Procedure.String())
+	}
+	page := domain.Page{}
+	if len(clause.Arguments) > 0 {
+		value, err := e.evaluator.expression(clause.Arguments[0], values)
+		if err != nil {
+			return nil, err
+		}
+		if value != nil {
+			limit, ok := integer(value)
+			if !ok || limit < 0 || limit > 1000 {
+				return nil, evalError(clause.Arguments[0], "revision limit must be an integer between 0 and 1000")
+			}
+			page.Limit = int(limit)
+		}
+	}
+	if len(clause.Arguments) > 1 {
+		value, err := e.evaluator.expression(clause.Arguments[1], values)
+		if err != nil {
+			return nil, err
+		}
+		if value != nil {
+			after, ok := value.(string)
+			if !ok {
+				return nil, evalError(clause.Arguments[1], "revision cursor must be a string or null")
+			}
+			page.After = after
+		}
+	}
+	infos, pageInfo, err := e.revisions(e.ctx, page)
+	if err != nil {
+		return nil, fmt.Errorf("procedure %s: %w", clause.Procedure.String(), err)
+	}
+	result := make([]row, len(infos))
+	for index, info := range infos {
+		result[index] = row{
+			"revision": int64(info.Revision),
+			"time":     info.Time,
+			"actor":    info.Actor,
+			"message":  info.Message,
+			"next":     pageInfo.Next,
+		}
+	}
+	return result, nil
 }
 
 func stringRows(column string, values map[string]struct{}) []row {
