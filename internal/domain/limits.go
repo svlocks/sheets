@@ -25,6 +25,15 @@ const (
 
 	MaxPropertyDepth  = 128
 	MaxPropertyValues = 1_000_000
+
+	// Derived lookup structures have independent amplification budgets. A
+	// canonical property value may contain many nested values without indexing
+	// them, while only top-level scalars and normalized labels consume these
+	// durable B-tree budgets.
+	MaxLabelsPerNode                  = 4_096
+	MaxIndexedPropertiesPerVersion    = 4_096
+	MaxDerivedLabelBytesPerVersion    = 16 << 20
+	MaxDerivedPropertyBytesPerVersion = 32 << 20
 )
 
 // ValidateText validates one durable UTF-8 string and its byte ceiling. Empty

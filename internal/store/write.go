@@ -401,9 +401,6 @@ func (tx *WriteTx) CreateNode(input NodeInput) (result domain.Node, retErr error
 		VALUES (?, ?, ?, ?, ?)`, string(id), int64(revision), labelsData, properties, input.Body); err != nil {
 		return domain.Node{}, mapConflict("create node version", err)
 	}
-	if err := replacePropertyIndex(tx.ctx, tx.conn, "node_property_index", id, revision, nil, clonedProperties); err != nil {
-		return domain.Node{}, fmt.Errorf("index node properties: %w", err)
-	}
 	return domain.Node{ID: id, Labels: labels, Properties: clonedProperties, Body: input.Body, ValidFrom: revision}, nil
 }
 
@@ -416,7 +413,10 @@ func (tx *WriteTx) UpdateNode(id domain.EntityID, update NodeUpdate) (result dom
 	}
 	next := current
 	if update.Labels != nil {
-		next.Labels = normalizeLabels(*update.Labels)
+		// encodeLabels owns admission and normalization. Passing the raw slice
+		// through preserves its pre-allocation cardinality guard even when it
+		// contains many duplicates.
+		next.Labels = *update.Labels
 	}
 	if update.Properties != nil {
 		next.Properties = *update.Properties
@@ -454,9 +454,6 @@ func (tx *WriteTx) UpdateNode(id domain.EntityID, update NodeUpdate) (result dom
 	}
 	if err := tx.replaceNodeVersion(current, next, labelsData, properties, revision); err != nil {
 		return domain.Node{}, err
-	}
-	if err := replacePropertyIndex(tx.ctx, tx.conn, "node_property_index", id, revision, nil, next.Properties); err != nil {
-		return domain.Node{}, fmt.Errorf("index node properties: %w", err)
 	}
 	next.ValidFrom, next.ValidTo = revision, nil
 	return next, nil
@@ -599,9 +596,6 @@ func (tx *WriteTx) CreateEdge(input EdgeInput) (result domain.Edge, retErr error
 		VALUES (?, ?, ?, ?, ?, ?, ?)`, string(id), int64(revision), string(input.From), input.Type, string(input.To), input.Position, properties); err != nil {
 		return domain.Edge{}, mapConstraintError("create edge version", err)
 	}
-	if err := replacePropertyIndex(tx.ctx, tx.conn, "edge_property_index", id, revision, nil, clonedProperties); err != nil {
-		return domain.Edge{}, fmt.Errorf("index edge properties: %w", err)
-	}
 	edge.ValidFrom = revision
 	return edge, nil
 }
@@ -666,9 +660,6 @@ func (tx *WriteTx) UpdateEdge(id domain.EntityID, update EdgeUpdate) (result dom
 	}
 	if err != nil {
 		return domain.Edge{}, mapConstraintError("update edge", err)
-	}
-	if err := replacePropertyIndex(tx.ctx, tx.conn, "edge_property_index", id, revision, nil, next.Properties); err != nil {
-		return domain.Edge{}, fmt.Errorf("index edge properties: %w", err)
 	}
 	next.ValidFrom, next.ValidTo = revision, nil
 	return next, nil

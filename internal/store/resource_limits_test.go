@@ -437,8 +437,18 @@ func TestHistoricalSchemaFingerprints(t *testing.T) {
 		t.Fatal(err)
 	}
 	v3 := rawSchemaFingerprint(t, raw)
-	if v1 != expectedV1SchemaFingerprint || v2 != expectedV2SchemaFingerprint || v3 != expectedV3SchemaFingerprint {
-		t.Fatalf("historical fingerprints: v1=%s v2=%s v3=%s", v1, v2, v3)
+	if _, err := raw.Exec(resourceLimitMigration); err != nil {
+		t.Fatal(err)
+	}
+	v4 := rawSchemaFingerprint(t, raw)
+	if _, err := raw.Exec(derivedResourceLimitMigration); err != nil {
+		t.Fatal(err)
+	}
+	v5 := rawSchemaFingerprint(t, raw)
+	if v1 != expectedV1SchemaFingerprint || v2 != expectedV2SchemaFingerprint ||
+		v3 != expectedV3SchemaFingerprint || v4 != expectedV4SchemaFingerprint ||
+		v5 != expectedSchemaFingerprint {
+		t.Fatalf("historical fingerprints: v1=%s v2=%s v3=%s v4=%s v5=%s", v1, v2, v3, v4, v5)
 	}
 }
 

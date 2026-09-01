@@ -24,12 +24,12 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 // This is the SHA-256 digest of the ordered, non-internal sqlite_schema rows
 // produced by the embedded migrations. It makes routine Open detect altered
 // trigger/index definitions without scanning graph data.
-const expectedSchemaFingerprint = "77988fee52f43cdbcb9050836717c5f3287d6524d68f573d462f893b663ea8f0"
+const expectedSchemaFingerprint = "3be39b39c67594a6142d3167c7952c2c799d93c3b4d449de833695fb7e52c110"
 
 // Migrations verify the complete preceding schema before applying DDL. Later
 // migrations replace tables and triggers, so checking only the final schema
@@ -38,6 +38,7 @@ const (
 	expectedV1SchemaFingerprint = "9dea9ce84b3782df2bb8bc4a3ca1e8257bb6532a84b5aae104e65e865056c116"
 	expectedV2SchemaFingerprint = "868d00a7ad6e6bd2564e6c20687e1fe24af149ad4bcc6b56be00f302f75ec69c"
 	expectedV3SchemaFingerprint = "ce220b74c7edd80aff1942223383af9bc3c43f580fbe1537a46fcbbaf3709b3a"
+	expectedV4SchemaFingerprint = "77988fee52f43cdbcb9050836717c5f3287d6524d68f573d462f893b663ea8f0"
 )
 
 //go:embed migrations/001_initial.sql
@@ -51,6 +52,9 @@ var temporalMigration string
 
 //go:embed migrations/004_resource_limits.sql
 var resourceLimitMigration string
+
+//go:embed migrations/005_derived_resource_limits.sql
+var derivedResourceLimitMigration string
 
 // ErrClosed is returned when an operation is attempted on a closed Store.
 var ErrClosed = errors.New("store is closed")
@@ -292,21 +296,23 @@ func (s *Store) initialize(ctx context.Context) (err error) {
 	if version > schemaVersion {
 		return fmt.Errorf("database schema version %d is newer than supported version %d", version, schemaVersion)
 	}
-	migrations := []string{initialMigration, invariantMigration, temporalMigration, resourceLimitMigration}
+	migrations := []string{
+		initialMigration,
+		invariantMigration,
+		temporalMigration,
+		resourceLimitMigration,
+		derivedResourceLimitMigration,
+	}
 	migrated := version < schemaVersion
-	dataPreflighted := version == 0
 	for version < schemaVersion {
 		next := version + 1
 		if version != 0 {
 			if err := validateMigrationSourceSchema(ctx, conn, version); err != nil {
 				return fmt.Errorf("%w: before migration %d: %v", ErrCorrupt, next, err)
 			}
-		}
-		if !dataPreflighted {
 			if err := validateMigrationSourceValues(ctx, conn, version); err != nil {
 				return fmt.Errorf("%w: preflight migration %d: %v", ErrCorrupt, next, err)
 			}
-			dataPreflighted = true
 		}
 		if _, err := conn.ExecContext(ctx, migrations[next-1]); err != nil {
 			return fmt.Errorf("apply migration %d: %w", next, err)
@@ -336,6 +342,7 @@ func validateMigrationSourceSchema(ctx context.Context, conn *sql.Conn, version 
 		1: expectedV1SchemaFingerprint,
 		2: expectedV2SchemaFingerprint,
 		3: expectedV3SchemaFingerprint,
+		4: expectedV4SchemaFingerprint,
 	}[version]
 	if expected == "" {
 		return fmt.Errorf("no expected fingerprint for schema version %d", version)
@@ -360,7 +367,16 @@ func validateMigrationSourceValues(ctx context.Context, conn *sql.Conn, version 
 	if err != nil {
 		return err
 	}
-	return validateCanonicalGraphValues(ctx, conn)
+	if err := validateDerivedResourceBudgets(ctx, conn, version >= 2); err != nil {
+		return err
+	}
+	if err := validateCanonicalGraphValues(ctx, conn); err != nil {
+		return err
+	}
+	if version >= 2 {
+		return validateDerivedIndexes(ctx, conn)
+	}
+	return nil
 }
 
 func validateBaseResourceEnvelopes(ctx context.Context, conn *sql.Conn) error {
@@ -409,8 +425,8 @@ func validateResourceEnvelopes(ctx context.Context, conn *sql.Conn) error {
 		domain.MaxEncodedLabelsBytes, domain.MaxCanonicalPropertyBytes, domain.MaxNodeBodyBytes,
 		domain.MaxRelationshipTypeBytes, domain.MaxCanonicalPropertyBytes,
 		domain.MaxLabelBytes,
-		domain.MaxPropertyKeyBytes, domain.MaxCanonicalPropertyBytes,
-		domain.MaxPropertyKeyBytes, domain.MaxCanonicalPropertyBytes,
+		domain.MaxPropertyKeyBytes, domain.MaxDerivedPropertyBytesPerVersion,
+		domain.MaxPropertyKeyBytes, domain.MaxDerivedPropertyBytesPerVersion,
 	).Scan(&invalid)
 	if err != nil {
 		return fmt.Errorf("inspect durable value envelopes: %w", err)
@@ -430,17 +446,123 @@ func validateStoredLabelResources(ctx context.Context, conn *sql.Conn) error {
 			WHEN json_valid(CAST(versions.labels AS TEXT)) <> 1 THEN 0
 			WHEN json_type(CAST(versions.labels AS TEXT)) <> 'array' THEN 0
 			WHEN json_array_length(CAST(versions.labels AS TEXT)) > ? THEN 1
+			WHEN COALESCE((
+				SELECT SUM(octet_length(label.value))
+				FROM json_each(CAST(versions.labels AS TEXT)) AS label
+			), 0) > ? THEN 1
 			ELSE EXISTS (
 				SELECT 1 FROM json_each(CAST(versions.labels AS TEXT)) AS label
 				WHERE octet_length(label.value) > ? OR instr(label.value, char(0)) <> 0
 			)
 		END
-	)`, domain.MaxPropertyValues, domain.MaxLabelBytes).Scan(&invalid)
+	)`, domain.MaxLabelsPerNode, domain.MaxDerivedLabelBytesPerVersion, domain.MaxLabelBytes).Scan(&invalid)
 	if err != nil {
 		return fmt.Errorf("inspect stored label resources: %w", err)
 	}
 	if invalid != 0 {
 		return errors.New("existing labels exceed sheets resource limits")
+	}
+	return nil
+}
+
+// validateDerivedResourceBudgets bounds the work and B-tree amplification of
+// the migration that follows. Source envelopes are authoritative; historical
+// derived tables are checked too before a table-rebuild migration copies them.
+// All byte/count work stays inside SQLite, after the cheap envelope preflight,
+// so oversized legacy values are never materialized by the Go driver first.
+func validateDerivedResourceBudgets(ctx context.Context, conn *sql.Conn, hasDerivedTables bool) error {
+	var invalid int
+	err := conn.QueryRowContext(ctx, `SELECT
+		EXISTS (
+			SELECT 1 FROM node_versions AS version
+			WHERE CASE
+				WHEN json_valid(CAST(version.labels AS TEXT)) <> 1 THEN 0
+				WHEN json_type(CAST(version.labels AS TEXT)) <> 'array' THEN 0
+				ELSE json_array_length(CAST(version.labels AS TEXT)) > ?
+				  OR COALESCE((
+					SELECT SUM(octet_length(label.value))
+					FROM json_each(CAST(version.labels AS TEXT)) AS label
+				  ), 0) > ?
+			END
+		)
+		OR EXISTS (
+			SELECT 1 FROM node_versions AS version
+			WHERE CASE
+				WHEN json_valid(CAST(version.properties AS TEXT)) <> 1 THEN 0
+				ELSE EXISTS (
+					SELECT 1 FROM (
+						SELECT COUNT(*) AS row_count,
+						       COALESCE(SUM(
+							   octet_length(property.key)
+							   + octet_length(CAST(property.value AS BLOB))
+						       ), 0) AS payload_bytes
+						FROM json_each(CAST(version.properties AS TEXT), '$.o') AS property
+						WHERE json_extract(property.value, '$.k') NOT IN ('map', 'list')
+					)
+					WHERE row_count > ? OR payload_bytes > ?
+				)
+			END
+		)
+		OR EXISTS (
+			SELECT 1 FROM edge_versions AS version
+			WHERE CASE
+				WHEN json_valid(CAST(version.properties AS TEXT)) <> 1 THEN 0
+				ELSE EXISTS (
+					SELECT 1 FROM (
+						SELECT COUNT(*) AS row_count,
+						       COALESCE(SUM(
+							   octet_length(property.key)
+							   + octet_length(CAST(property.value AS BLOB))
+						       ), 0) AS payload_bytes
+						FROM json_each(CAST(version.properties AS TEXT), '$.o') AS property
+						WHERE json_extract(property.value, '$.k') NOT IN ('map', 'list')
+					)
+					WHERE row_count > ? OR payload_bytes > ?
+				)
+			END
+		)`,
+		domain.MaxLabelsPerNode, domain.MaxDerivedLabelBytesPerVersion,
+		domain.MaxIndexedPropertiesPerVersion, domain.MaxDerivedPropertyBytesPerVersion,
+		domain.MaxIndexedPropertiesPerVersion, domain.MaxDerivedPropertyBytesPerVersion,
+	).Scan(&invalid)
+	if err != nil {
+		return fmt.Errorf("inspect canonical derived-value budgets: %w", err)
+	}
+	if invalid != 0 {
+		return errors.New("existing canonical value exceeds sheets derived-index budgets")
+	}
+	if !hasDerivedTables {
+		return nil
+	}
+	err = conn.QueryRowContext(ctx, `SELECT
+		EXISTS (
+			SELECT 1 FROM node_version_labels
+			GROUP BY id, valid_from
+			HAVING COUNT(*) > ? OR COALESCE(SUM(octet_length(label)), 0) > ?
+		)
+		OR EXISTS (
+			SELECT 1 FROM node_property_index
+			GROUP BY id, valid_from
+			HAVING COUNT(*) > ? OR COALESCE(SUM(
+				octet_length(key) + octet_length(CAST(value AS BLOB))
+			), 0) > ?
+		)
+		OR EXISTS (
+			SELECT 1 FROM edge_property_index
+			GROUP BY id, valid_from
+			HAVING COUNT(*) > ? OR COALESCE(SUM(
+				octet_length(key) + octet_length(CAST(value AS BLOB))
+			), 0) > ?
+		)`,
+		domain.MaxLabelsPerNode, domain.MaxDerivedLabelBytesPerVersion,
+		domain.MaxIndexedPropertiesPerVersion, domain.MaxDerivedPropertyBytesPerVersion,
+		domain.MaxIndexedPropertiesPerVersion, domain.MaxDerivedPropertyBytesPerVersion,
+	).Scan(&invalid)
+	if err != nil {
+		return fmt.Errorf("inspect historical derived-table budgets: %w", err)
+	}
+	if invalid != 0 {
+		return errors.New("existing derived table exceeds sheets resource budgets")
 	}
 	return nil
 }
@@ -515,6 +637,16 @@ func validateSchema(ctx context.Context, conn *sql.Conn, deep bool) error {
 		"node_property_index_resource_limits_update": "trigger",
 		"edge_property_index_resource_limits_insert": "trigger",
 		"edge_property_index_resource_limits_update": "trigger",
+		"node_versions_derived_limits_insert":        "trigger",
+		"node_versions_derived_limits_update":        "trigger",
+		"edge_versions_derived_limits_insert":        "trigger",
+		"edge_versions_derived_limits_update":        "trigger",
+		"node_version_labels_derived_limits_insert":  "trigger",
+		"node_version_labels_derived_limits_update":  "trigger",
+		"node_property_index_derived_limits_insert":  "trigger",
+		"node_property_index_derived_limits_update":  "trigger",
+		"edge_property_index_derived_limits_insert":  "trigger",
+		"edge_property_index_derived_limits_update":  "trigger",
 	}
 	objectArgs := make([]any, 0, len(expectedObjects))
 	for name := range expectedObjects {
@@ -766,6 +898,10 @@ func validateDataIntegrity(ctx context.Context, conn *sql.Conn) error {
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf("validate database foreign keys: %w", err)
 	}
+	return validateDerivedIndexes(ctx, conn)
+}
+
+func validateDerivedIndexes(ctx context.Context, conn *sql.Conn) error {
 	var derivedInvalid int
 	if err := conn.QueryRowContext(ctx, `
 		WITH

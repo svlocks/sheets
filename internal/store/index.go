@@ -24,20 +24,32 @@ func scalarProperties(properties domain.Properties) ([]indexedProperty, error) {
 	if len(properties) == 0 {
 		return nil, nil
 	}
-	keys := make([]string, 0, len(properties))
-	for key := range properties {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	result := make([]indexedProperty, 0, len(keys))
-	for _, key := range keys {
+	result := make([]indexedProperty, 0, min(len(properties), domain.MaxIndexedPropertiesPerVersion))
+	payloadBytes := int64(0)
+	for key, property := range properties {
+		if err := domain.ValidateText("property map key", key, domain.MaxPropertyKeyBytes); err != nil {
+			return nil, fmt.Errorf("index property %q: %w", key, err)
+		}
 		state := encodeState{visiting: make(map[encodeReference]struct{})}
-		encoded, err := state.encodeValue(properties[key], 0)
+		encoded, err := state.encodeValue(property, 0)
 		if err != nil {
 			return nil, fmt.Errorf("index property %q: %w", key, err)
 		}
 		if encoded.Kind == "map" || encoded.Kind == "list" {
 			continue
+		}
+		if len(result) == domain.MaxIndexedPropertiesPerVersion {
+			return nil, &domain.ResourceLimitError{
+				Field: "indexed properties", Unit: "values",
+				Limit: domain.MaxIndexedPropertiesPerVersion, Actual: len(result) + 1,
+			}
+		}
+		payloadBytes += int64(len(key)) + canonicalEncodedValueSize(encoded)
+		if payloadBytes > int64(domain.MaxDerivedPropertyBytesPerVersion) {
+			return nil, &domain.ResourceLimitError{
+				Field: "derived property index", Unit: "bytes",
+				Limit: domain.MaxDerivedPropertyBytesPerVersion, Actual: int(payloadBytes),
+			}
 		}
 		value, err := json.Marshal(encoded)
 		if err != nil {
@@ -45,6 +57,7 @@ func scalarProperties(properties domain.Properties) ([]indexedProperty, error) {
 		}
 		result = append(result, indexedProperty{key: key, kind: encoded.Kind, value: value})
 	}
+	sort.Slice(result, func(i, j int) bool { return result[i].key < result[j].key })
 	return result, nil
 }
 
