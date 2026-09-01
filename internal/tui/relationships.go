@@ -82,9 +82,10 @@ func (m *relationshipsModel) setGraph(graph graphState) tea.Cmd {
 		if len(edge.Properties) > 0 {
 			properties = fmt.Sprintf(" · %d properties", len(edge.Properties))
 		}
+		typeName := terminalLine(truncateRunes(edge.Type, maxFormShortRunes))
 		items = append(items, relationshipItem{
 			edge:        edge,
-			title:       fmt.Sprintf("%s  —%s→  %s", nodeTitle(from), edge.Type, nodeTitle(to)),
+			title:       fmt.Sprintf("%s  —%s→  %s", nodeTitle(from), typeName, nodeTitle(to)),
 			description: fmt.Sprintf("%s · %s → %s%s%s", kind, shortID(edge.From), shortID(edge.To), position, properties),
 			filter:      edgeSearchValue(edge, graph),
 		})

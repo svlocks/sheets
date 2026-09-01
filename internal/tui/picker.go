@@ -25,12 +25,15 @@ const (
 )
 
 type nodePickerItem struct {
-	node domain.Node
+	id          domain.EntityID
+	title       string
+	description string
+	filter      string
 }
 
-func (i nodePickerItem) Title() string       { return nodeTitle(i.node) }
-func (i nodePickerItem) Description() string { return nodeSubtitle(i.node) }
-func (i nodePickerItem) FilterValue() string { return nodeSearchValue(i.node) }
+func (i nodePickerItem) Title() string       { return i.title }
+func (i nodePickerItem) Description() string { return i.description }
+func (i nodePickerItem) FilterValue() string { return i.filter }
 
 type commandID uint8
 
@@ -75,7 +78,9 @@ type pickerModel struct {
 func newNodePicker(serial uint64, graph graphState, styles styleSet, dark bool, width, height int) pickerModel {
 	items := make([]list.Item, 0, len(graph.nodes))
 	for _, node := range graph.nodes {
-		items = append(items, nodePickerItem{node: node})
+		items = append(items, nodePickerItem{
+			id: node.ID, title: nodeTitle(node), description: nodeSubtitle(node), filter: nodeSearchValue(node),
+		})
 	}
 	return newPicker(serial, pickerNodes, "Find work · type to filter", items, styles, dark, width, height)
 }
@@ -138,7 +143,7 @@ func (m pickerModel) selectedNode() (domain.EntityID, bool) {
 	if !ok {
 		return "", false
 	}
-	return item.node.ID, true
+	return item.id, true
 }
 
 func (m pickerModel) selectedCommand() (commandID, bool) {

@@ -122,7 +122,7 @@ func (m *Model) checkRevisionCmd() tea.Cmd {
 func (m *Model) setNotice(level noticeLevel, text string) tea.Cmd {
 	m.notice.serial++
 	m.notice.level = level
-	m.notice.text = text
+	m.notice.text = terminalLine(text)
 	serial := m.notice.serial
 	return tea.Tick(5*time.Second, func(time.Time) tea.Msg { return clearNoticeMsg{serial: serial} })
 }

@@ -68,6 +68,7 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	if !isKey {
 		return m, m.updateFocusedComponent(message)
 	}
+	keyMessage = terminalSafeKeyPress(keyMessage)
 
 	if key.Matches(keyMessage, m.keys.Quit) {
 		return m, tea.Quit
@@ -648,15 +649,8 @@ func (m *Model) handleMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
 	}
 	switch m.workspace {
 	case WorkWorkspace:
-		for range 3 {
-			if delta < 0 {
-				m.work.tree.Up()
-			} else {
-				m.work.tree.Down()
-			}
-		}
 		before := m.work.selected
-		m.work.syncSelection()
+		m.work.move(delta)
 		if before != m.work.selected {
 			return m.refreshInspector()
 		}

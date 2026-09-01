@@ -9,7 +9,6 @@ import (
 	"charm.land/bubbles/v2/table"
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/textinput"
-	"charm.land/bubbles/v2/tree"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 )
@@ -84,20 +83,6 @@ func makeStyles(dark, noColor bool) styleSet {
 		warning:       warning,
 		danger:        danger,
 	}
-}
-
-func (s styleSet) treeStyles(dark bool) tree.Styles {
-	if s.noColor {
-		return tree.Styles{}
-	}
-	styles := tree.DefaultStyles(dark)
-	styles.SelectedNodeStyle = lipgloss.NewStyle().Bold(true).Foreground(s.accent)
-	styles.CursorStyle = lipgloss.NewStyle().Foreground(s.accent)
-	styles.EnumeratorStyle = lipgloss.NewStyle().Foreground(s.dim)
-	styles.IndenterStyle = lipgloss.NewStyle().Foreground(s.dim)
-	styles.OpenIndicatorStyle = lipgloss.NewStyle().Foreground(s.dim)
-	styles.RootNodeStyle = lipgloss.NewStyle().Bold(true)
-	return styles
 }
 
 func (s styleSet) listStyles(dark bool) (list.Styles, list.DefaultItemStyles) {

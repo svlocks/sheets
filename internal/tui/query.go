@@ -26,6 +26,15 @@ const (
 	queryFocusRow
 )
 
+const (
+	maxQueryEditorRunes  = 1 << 20
+	maxParamsEditorRunes = 4 << 20
+	maxQueryTableRows    = 10_000
+	maxQueryTableColumns = 256
+	maxQueryTableCells   = 100_000
+	maxQueryCellWidth    = 80
+)
+
 type queryModel struct {
 	cypher        textarea.Model
 	params        textarea.Model
@@ -47,6 +56,7 @@ func newQueryModel(styles styleSet, dark bool) queryModel {
 	cypher := textarea.New()
 	cypher.Placeholder = "MATCH (n) RETURN n LIMIT 50"
 	cypher.ShowLineNumbers = true
+	cypher.CharLimit = maxQueryEditorRunes
 	cypher.SetValue("MATCH (n)\nRETURN n\nLIMIT 50")
 	cypher.SetWidth(72)
 	cypher.SetHeight(7)
@@ -55,6 +65,7 @@ func newQueryModel(styles styleSet, dark bool) queryModel {
 	params := textarea.New()
 	params.Placeholder = "{}"
 	params.ShowLineNumbers = false
+	params.CharLimit = maxParamsEditorRunes
 	params.SetValue("{}")
 	params.SetWidth(72)
 	params.SetHeight(4)
@@ -236,27 +247,30 @@ func (m *queryModel) rebuildTable() {
 		return
 	}
 	result := m.result.Results[m.resultIndex]
-	rows := make([]table.Row, len(result.Rows))
-	widths := make([]int, len(result.Columns))
-	for index, column := range result.Columns {
-		widths[index] = max(6, ansi.StringWidth(column))
+	displayRowCount, displayColumnCount := queryDisplayShape(result)
+	rows := make([]table.Row, displayRowCount)
+	widths := make([]int, displayColumnCount)
+	for index, column := range result.Columns[:displayColumnCount] {
+		title := ansi.Truncate(terminalLine(truncateRunes(column, maxQueryCellWidth*2)), maxQueryCellWidth, "…")
+		widths[index] = max(6, ansi.StringWidth(title))
 	}
-	for rowIndex, values := range result.Rows {
-		row := make(table.Row, len(result.Columns))
-		for columnIndex := range result.Columns {
+	for rowIndex, values := range result.Rows[:displayRowCount] {
+		row := make(table.Row, displayColumnCount)
+		for columnIndex := range displayColumnCount {
 			value := any(nil)
 			if columnIndex < len(values) {
 				value = values[columnIndex]
 			}
 			cell := queryCell(value)
 			row[columnIndex] = cell
-			widths[columnIndex] = min(80, max(widths[columnIndex], ansi.StringWidth(cell)))
+			widths[columnIndex] = min(maxQueryCellWidth, max(widths[columnIndex], ansi.StringWidth(cell)))
 		}
 		rows[rowIndex] = row
 	}
-	columns := make([]table.Column, len(result.Columns))
+	columns := make([]table.Column, displayColumnCount)
 	totalWidth := 0
-	for index, title := range result.Columns {
+	for index, title := range result.Columns[:displayColumnCount] {
+		title = ansi.Truncate(terminalLine(truncateRunes(title, maxQueryCellWidth*2)), maxQueryCellWidth, "…")
 		columns[index] = table.Column{Title: title, Width: widths[index]}
 		totalWidth += widths[index] + 2
 	}
@@ -291,12 +305,22 @@ func (m *queryModel) refreshSelectedRow() {
 	}
 	row := result.Rows[index]
 	var detail strings.Builder
-	for columnIndex, column := range result.Columns {
+	_, displayColumnCount := queryDisplayShape(result)
+	for columnIndex, column := range result.Columns[:displayColumnCount] {
 		value := any(nil)
 		if columnIndex < len(row) {
 			value = row[columnIndex]
 		}
-		fmt.Fprintf(&detail, "%d. %s\n%s\n\n", columnIndex+1, column, prettyJSON(value))
+		block := fmt.Sprintf("%d. %s\n%s\n\n", columnIndex+1,
+			terminalLine(truncateRunes(column, maxQueryCellWidth*2)), terminalBlock(prettyJSONPreview(value)))
+		if detail.Len()+len(block) > maxSelectedRowDetailSize {
+			detail.WriteString("… additional selected-row detail omitted from this TUI preview")
+			break
+		}
+		detail.WriteString(block)
+	}
+	if displayColumnCount < len(result.Columns) && detail.Len() < maxSelectedRowDetailSize {
+		fmt.Fprintf(&detail, "… %d additional columns omitted from this TUI preview", len(result.Columns)-displayColumnCount)
 	}
 	m.rowViewport.SetContent(strings.TrimSpace(detail.String()))
 }
@@ -336,11 +360,19 @@ func (m queryModel) resultViews() (string, string) {
 	if m.result != nil && len(m.result.Results) > 0 {
 		resultTitle += fmt.Sprintf(" · statement %d/%d", m.resultIndex+1, len(m.result.Results))
 		resultTitle += " · " + summaryText(m.result.Results[m.resultIndex].Summary)
+		result := m.result.Results[m.resultIndex]
+		displayRows, displayColumns := queryDisplayShape(result)
+		if displayRows < len(result.Rows) {
+			resultTitle += fmt.Sprintf(" · showing first %d/%d rows", displayRows, len(result.Rows))
+		}
+		if displayColumns < len(result.Columns) {
+			resultTitle += fmt.Sprintf(" · first %d/%d columns", displayColumns, len(result.Columns))
+		}
 	}
 	resultTitle = ansi.Truncate(resultTitle, m.tableViewport.Width(), "…")
 	resultView := resultTitle + "\n"
 	if m.err != nil {
-		resultView += wrapText("Query failed: "+m.err.Error(), m.tableViewport.Width())
+		resultView += wrapText("Query failed: "+errorText(m.err), m.tableViewport.Width())
 	} else if m.result == nil {
 		guidance := "Run a read-only query with Ctrl+R. Write-capable execution uses Ctrl+X and asks for confirmation."
 		resultView += wrapText(guidance, m.tableViewport.Width())
@@ -369,7 +401,7 @@ func queryCell(value any) string {
 	var text string
 	switch value := value.(type) {
 	case string:
-		text = value
+		text = truncateRunes(value, maxQueryCellWidth*2)
 	case json.Number:
 		text = value.String()
 	case temporal.Date:
@@ -389,13 +421,26 @@ func queryCell(value any) string {
 	case time.Duration:
 		text = "legacy_duration(" + value.String() + ")"
 	case []byte:
-		text = "bytes(" + base64.StdEncoding.EncodeToString(value) + ")"
+		maximum := min(len(value), 96)
+		text = "bytes(" + base64.StdEncoding.EncodeToString(value[:maximum])
+		if maximum < len(value) {
+			text += fmt.Sprintf("… %d bytes", len(value))
+		}
+		text += ")"
 	default:
-		text = stableJSON(value)
+		text = jsonPreview(value, false, maxSearchTextBytes)
 	}
-	text = strings.ReplaceAll(text, "\r", "")
-	text = strings.ReplaceAll(text, "\n", "↵")
-	return text
+	text = terminalLine(truncateRunes(text, maxQueryCellWidth*2))
+	return ansi.Truncate(text, maxQueryCellWidth, "…")
+}
+
+func queryDisplayShape(result app.Result) (rows, columns int) {
+	columns = min(len(result.Columns), maxQueryTableColumns)
+	rows = min(len(result.Rows), maxQueryTableRows)
+	if columns > 0 {
+		rows = min(rows, max(1, maxQueryTableCells/columns))
+	}
+	return rows, columns
 }
 
 func summaryText(summary app.Summary) string {

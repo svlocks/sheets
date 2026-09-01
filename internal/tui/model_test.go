@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
@@ -141,6 +143,180 @@ func TestHierarchyUsesOrderedThenUnorderedChildrenAtArbitraryDepth(t *testing.T)
 	}
 	if !work.selectID("deep") || work.selected != "deep" {
 		t.Fatalf("selectID(deep) selected %q", work.selected)
+	}
+}
+
+func TestDeepWorkOutlineIsIterativeAndViewportBounded(t *testing.T) {
+	const depth = 25_000
+	nodes := make([]domain.Node, depth)
+	edges := make([]domain.Edge, 0, depth-1)
+	for index := range nodes {
+		id := domain.EntityID(fmt.Sprintf("n-%05d", index))
+		nodes[index] = task(string(id), fmt.Sprintf("Node %d", index))
+		if index > 0 {
+			edges = append(edges, child(
+				fmt.Sprintf("e-%05d", index), string(nodes[index-1].ID), string(id), nil,
+			))
+		}
+	}
+	graph := newGraphState(nodes, edges)
+	work := newWorkModel(makeStyles(true, true), true)
+	work.setSize(60, 12)
+	work.setGraph(graph)
+	deepest := nodes[len(nodes)-1].ID
+	if !work.selectID(deepest) || work.selected != deepest {
+		t.Fatalf("deepest selection = %q, want %q", work.selected, deepest)
+	}
+	if got := strings.Count(work.view(), "\n") + 1; got > work.height {
+		t.Fatalf("deep outline rendered %d lines into a %d-line viewport", got, work.height)
+	}
+	if descendants := graph.descendants(nodes[0].ID); len(descendants) != depth-1 {
+		t.Fatalf("root descendant count = %d, want %d", len(descendants), depth-1)
+	}
+}
+
+func TestUntrustedTerminalTextCannotInjectControls(t *testing.T) {
+	malicious := "safe\x1b]52;c;payload\a\u202etxt\xff\nnext"
+	line := terminalLine(malicious)
+	if !utf8.ValidString(line) {
+		t.Fatalf("sanitized line is invalid UTF-8: %q", line)
+	}
+	for _, control := range []string{"\x1b", "\a", "\u202e"} {
+		if strings.Contains(line, control) {
+			t.Fatalf("sanitized line retains terminal control %q: %q", control, line)
+		}
+	}
+	for _, visible := range []string{`\x1b`, `\x07`, `\u202e`, `\uFFFD`, "↵"} {
+		if !strings.Contains(line, visible) {
+			t.Errorf("sanitized line %q lacks visible marker %q", line, visible)
+		}
+	}
+	if got := queryCell(malicious); strings.ContainsRune(got, '\x1b') || !utf8.ValidString(got) {
+		t.Fatalf("query cell is unsafe: %q", got)
+	}
+	block := terminalBlock("one\n\x1b[31mtwo")
+	if !strings.Contains(block, "one\n") || strings.ContainsRune(block, '\x1b') {
+		t.Fatalf("terminal block did not preserve only safe structure: %q", block)
+	}
+}
+
+func TestWriteQueryPreviewTruncatesOnRuneBoundary(t *testing.T) {
+	preview := truncateRunes(strings.Repeat("界", 601), 600)
+	if !utf8.ValidString(preview) || utf8.RuneCountInString(preview) != 601 || !strings.HasSuffix(preview, "…") {
+		t.Fatalf("truncated preview = %q, runes=%d", preview, utf8.RuneCountInString(preview))
+	}
+}
+
+func TestExactEditFieldsEscapeTerminalControlsWithoutChangingStoredValues(t *testing.T) {
+	node := task("unsafe", "placeholder")
+	originalTitle := "title\u202e"
+	originalLabel := "label\u0085"
+	originalBody := "line\n\x1b[31m\u202ebody"
+	originalProperty := "property\u2066value"
+	node.Properties["title"] = originalTitle
+	node.Properties["note"] = originalProperty
+	node.Labels = []string{originalLabel}
+	node.Body = originalBody
+
+	form := newEditNodeForm(1, node, 80, 24, true, true)
+	data := form.data.(*nodeFormData)
+	for name, value := range map[string]string{
+		"title": data.title, "labels": data.labels, "properties": data.properties, "body": data.body,
+	} {
+		for _, character := range value {
+			if character != '\n' && character != '\t' && isTerminalControl(character) {
+				t.Fatalf("%s editor contains unsafe rune U+%04X: %q", name, character, value)
+			}
+		}
+	}
+	request, err := form.request()
+	if err != nil {
+		t.Fatal(err)
+	}
+	properties := request.Params["properties"].(domain.Properties)
+	if properties["title"] != originalTitle || properties["note"] != originalProperty || request.Params["body"] != originalBody {
+		t.Fatalf("unchanged exact values were altered: properties=%#v body=%#v", properties, request.Params["body"])
+	}
+	if !reflectStringSlicesEqual(request.Query, node.Labels, request.Params) {
+		t.Fatalf("unchanged labels were altered: query=%s params=%#v", request.Query, request.Params)
+	}
+}
+
+func reflectStringSlicesEqual(query string, labels []string, _ map[string]any) bool {
+	for _, label := range labels {
+		if !strings.Contains(query, cypherIdentifierName(label)) {
+			return false
+		}
+	}
+	return true
+}
+
+func TestTextInputMakesPastedPresentationControlsVisible(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.workspace = QueryWorkspace
+	_, _ = model.Update(tea.KeyPressMsg{Code: '\u202e', Text: "\u202e"})
+	value := model.query.cypher.Value()
+	if strings.ContainsRune(value, '\u202e') || !strings.Contains(value, `\u202e`) {
+		t.Fatalf("query editor retained an unsafe pasted control: %q", value)
+	}
+}
+
+func TestQueryPresentationCopiesAreBounded(t *testing.T) {
+	rows := make([][]any, maxQueryTableRows+1)
+	for index := range rows {
+		rows[index] = []any{strings.Repeat("x", maxQueryCellWidth*4)}
+	}
+	query := newQueryModel(makeStyles(true, true), true)
+	query.setSize(300, 30)
+	query.setResult(app.BatchResult{Results: []app.Result{{Columns: []string{"value"}, Rows: rows}}}, nil)
+	if got := len(query.table.Rows()); got != maxQueryTableRows {
+		t.Fatalf("materialized table rows = %d, want %d", got, maxQueryTableRows)
+	}
+	if width := ansi.StringWidth(query.table.Rows()[0][0]); width > maxQueryCellWidth {
+		t.Fatalf("materialized cell width = %d, want <= %d", width, maxQueryCellWidth)
+	}
+	resultView, _ := query.resultViews()
+	if !strings.Contains(resultView, "showing first 10000/10001 rows") {
+		t.Fatalf("bounded-result disclosure is missing: %q", resultView)
+	}
+}
+
+func TestQueryPresentationBoundsRowsTimesColumnsAndColumnTitles(t *testing.T) {
+	columns := make([]string, maxQueryTableColumns+44)
+	for index := range columns {
+		columns[index] = fmt.Sprintf("column-%d-%s", index, strings.Repeat("x", maxQueryCellWidth*4))
+	}
+	rows := make([][]any, maxQueryTableRows)
+	query := newQueryModel(makeStyles(true, true), true)
+	query.setSize(2_000, 30)
+	result := app.Result{Columns: columns, Rows: rows}
+	query.setResult(app.BatchResult{Results: []app.Result{result}}, nil)
+	wantRows, wantColumns := queryDisplayShape(result)
+	if got := len(query.table.Rows()); got != wantRows || wantRows*wantColumns > maxQueryTableCells {
+		t.Fatalf("materialized shape = %dx%d, want %dx%d within %d cells", got, len(query.table.Columns()), wantRows, wantColumns, maxQueryTableCells)
+	}
+	if got := len(query.table.Columns()); got != wantColumns {
+		t.Fatalf("materialized columns = %d, want %d", got, wantColumns)
+	}
+	if width := ansi.StringWidth(query.table.Columns()[0].Title); width > maxQueryCellWidth {
+		t.Fatalf("column title width = %d, want <= %d", width, maxQueryCellWidth)
+	}
+	resultView, _ := query.resultViews()
+	if !strings.Contains(resultView, fmt.Sprintf("first %d/%d columns", wantColumns, len(columns))) {
+		t.Fatalf("column-bound disclosure is missing: %q", resultView)
+	}
+}
+
+func TestHierarchyAndSearchPresentationDoNotCopyHugeFields(t *testing.T) {
+	node := task("large", strings.Repeat("界", maxNodeTitleRunes*10))
+	node.Labels = []string{strings.Repeat("label", maxDisplayLabelRunes*10)}
+	node.Properties["payload"] = strings.Repeat("p", maxSearchTextBytes*100)
+	node.Body = strings.Repeat("b", maxSearchTextBytes*100)
+	if got := utf8.RuneCountInString(nodeTitle(node)); got > maxNodeTitleRunes+1 {
+		t.Fatalf("node title contains %d runes, want <= %d", got, maxNodeTitleRunes+1)
+	}
+	if search := nodeSearchValue(node); len(search) > maxSearchTextBytes {
+		t.Fatalf("search copy has %d bytes, want <= %d", len(search), maxSearchTextBytes)
 	}
 }
 

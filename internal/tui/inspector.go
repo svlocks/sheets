@@ -150,7 +150,16 @@ func nodeMarkdown(node domain.Node, graph graphState) string {
 	if len(node.Labels) == 0 {
 		result.WriteString("**Labels:** _(none)_\n\n")
 	} else {
-		fmt.Fprintf(&result, "**Labels:** %s\n\n", escapeMarkdown(strings.Join(node.Labels, ", ")))
+		displayed := min(len(node.Labels), maxDisplayLabels)
+		labels := make([]string, displayed)
+		for index, label := range node.Labels[:displayed] {
+			labels[index] = truncateRunes(label, maxDisplayLabelRunes)
+		}
+		text := strings.Join(labels, ", ")
+		if displayed < len(node.Labels) {
+			text += fmt.Sprintf(" (+%d more)", len(node.Labels)-displayed)
+		}
+		fmt.Fprintf(&result, "**Labels:** %s\n\n", escapeMarkdown(text))
 	}
 	fmt.Fprintf(&result, "**Validity:** revision %d", node.ValidFrom)
 	if node.ValidTo == nil {
@@ -160,7 +169,7 @@ func nodeMarkdown(node domain.Node, graph graphState) string {
 	}
 
 	result.WriteString("## Properties\n\n```json\n")
-	result.WriteString(prettyJSON(node.Properties))
+	result.WriteString(terminalBlock(prettyJSONPreview(node.Properties)))
 	result.WriteString("\n```\n\n")
 
 	result.WriteString("## Hierarchy\n\n")
@@ -179,20 +188,28 @@ func nodeMarkdown(node domain.Node, graph graphState) string {
 		result.WriteString("**Children:** none\n\n")
 	} else {
 		result.WriteString("**Children:**\n\n")
-		for _, link := range children {
+		for _, link := range children[:min(len(children), maxInspectorListItems)] {
 			position := "unordered"
 			if link.edge.Position != nil {
 				position = fmt.Sprintf("position %d", *link.edge.Position)
 			}
 			fmt.Fprintf(&result, "- %s (`%s`) · %s\n", escapeMarkdown(nodeTitle(graph.nodeByID[link.child])), link.child, position)
 		}
+		if len(children) > maxInspectorListItems {
+			fmt.Fprintf(&result, "- … %d additional children omitted from this preview\n", len(children)-maxInspectorListItems)
+		}
 		result.WriteByte('\n')
 	}
 
 	result.WriteString("## Relationships\n\n")
 	count := 0
+	omitted := 0
 	for _, edge := range graph.incoming[node.ID] {
 		if edge.Type == "CHILD" {
+			continue
+		}
+		if count >= maxInspectorListItems {
+			omitted++
 			continue
 		}
 		count++
@@ -202,18 +219,25 @@ func nodeMarkdown(node domain.Node, graph graphState) string {
 		if edge.Type == "CHILD" {
 			continue
 		}
+		if count >= maxInspectorListItems {
+			omitted++
+			continue
+		}
 		count++
 		fmt.Fprintf(&result, "- **%s** → %s (`%s`)\n", escapeMarkdown(edge.Type), escapeMarkdown(nodeTitle(graph.nodeByID[edge.To])), edge.To)
 	}
 	if count == 0 {
 		result.WriteString("No non-hierarchy relationships.\n")
+	} else if omitted > 0 {
+		fmt.Fprintf(&result, "- … %d additional relationships omitted from this preview\n", omitted)
 	}
 
 	result.WriteString("\n## Body\n\n")
 	if strings.TrimSpace(node.Body) == "" {
 		result.WriteString("_(empty)_\n")
 	} else {
-		result.WriteString(node.Body)
+		body := truncateRunes(node.Body, maxInspectorBodyRunes)
+		result.WriteString(truncateRunes(terminalBlock(body), maxInspectorBodyRunes))
 		result.WriteByte('\n')
 	}
 	return result.String()
@@ -248,7 +272,7 @@ func edgeMarkdown(edge domain.Edge, graph graphState) string {
 		fmt.Fprintf(&result, " → %d\n\n", *edge.ValidTo)
 	}
 	result.WriteString("## Properties\n\n```json\n")
-	result.WriteString(prettyJSON(edge.Properties))
+	result.WriteString(terminalBlock(prettyJSONPreview(edge.Properties)))
 	result.WriteString("\n```\n")
 	return result.String()
 }
@@ -258,13 +282,13 @@ func revisionMarkdown(info domain.RevisionInfo, live domain.Revision) string {
 	if !info.Time.IsZero() {
 		when = info.Time.Local().Format("Monday, 2 January 2006 at 15:04:05 MST")
 	}
-	actor := info.Actor
+	actor := truncateRunes(info.Actor, maxTimelineTextRunes)
 	if strings.TrimSpace(actor) == "" {
 		actor = "_(not recorded)_"
 	} else {
 		actor = escapeMarkdown(actor)
 	}
-	message := info.Message
+	message := truncateRunes(info.Message, maxTimelineTextRunes)
 	if strings.TrimSpace(message) == "" {
 		message = "_(not recorded)_"
 	} else {
@@ -278,6 +302,7 @@ func revisionMarkdown(info domain.RevisionInfo, live domain.Revision) string {
 }
 
 func escapeMarkdown(value string) string {
+	value = terminalLine(value)
 	replacer := strings.NewReplacer("\\", "\\\\", "*", "\\*", "_", "\\_", "`", "\\`", "[", "\\[", "]", "\\]")
 	return replacer.Replace(value)
 }

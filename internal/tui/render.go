@@ -162,7 +162,7 @@ func (m *Model) headerPrefix() string {
 	root := "project"
 	if m.backend != nil {
 		if value := filepath.Base(m.backend.ProjectRoot()); value != "." && value != "" {
-			root = value
+			root = terminalLine(value)
 		}
 	}
 	plain := " sheets · " + ansi.Truncate(root, 20, "…") + "  "
@@ -350,7 +350,7 @@ func (m *Model) contextShortHelp() []key.Binding {
 		if m.focus == focusInspector {
 			return append(global, m.keys.TogglePane, m.keys.Back)
 		}
-		local := []key.Binding{m.work.tree.KeyMap.Up, m.work.tree.KeyMap.Down, m.keys.Open, enabledBinding(m.keys.NewNode, !m.historical()), m.keys.Find}
+		local := []key.Binding{m.work.keys.Up, m.work.keys.Down, m.keys.Open, enabledBinding(m.keys.NewNode, !m.historical()), m.keys.Find}
 		return append(global, local...)
 	case RelationshipsWorkspace:
 		local := []key.Binding{m.relationships.list.KeyMap.CursorUp, m.relationships.list.KeyMap.CursorDown, m.relationships.list.KeyMap.Filter, enabledBinding(m.keys.Edit, !m.historical()), enabledBinding(m.keys.Connect, !m.historical())}
@@ -398,7 +398,7 @@ func (m *Model) contextFullHelp() [][]key.Binding {
 	var local []key.Binding
 	switch m.workspace {
 	case WorkWorkspace:
-		local = []key.Binding{m.work.tree.KeyMap.Up, m.work.tree.KeyMap.Down, m.work.tree.KeyMap.Open, m.work.tree.KeyMap.Close, m.work.tree.KeyMap.Toggle, m.keys.TogglePane, m.keys.Find, enabledBinding(m.keys.NewNode, !m.historical()), enabledBinding(m.keys.Edit, !m.historical()), enabledBinding(m.keys.Move, !m.historical()), enabledBinding(m.keys.Connect, !m.historical()), enabledBinding(m.keys.Delete, !m.historical())}
+		local = []key.Binding{m.work.keys.Up, m.work.keys.Down, m.work.keys.Open, m.work.keys.Close, m.work.keys.Toggle, m.keys.TogglePane, m.keys.Find, enabledBinding(m.keys.NewNode, !m.historical()), enabledBinding(m.keys.Edit, !m.historical()), enabledBinding(m.keys.Move, !m.historical()), enabledBinding(m.keys.Connect, !m.historical()), enabledBinding(m.keys.Delete, !m.historical())}
 	case RelationshipsWorkspace:
 		local = []key.Binding{m.relationships.list.KeyMap.CursorUp, m.relationships.list.KeyMap.CursorDown, m.relationships.list.KeyMap.Filter, m.keys.TogglePane, enabledBinding(m.keys.Edit, !m.historical()), enabledBinding(m.keys.Connect, !m.historical()), enabledBinding(m.keys.Delete, !m.historical())}
 	case QueryWorkspace:
@@ -474,7 +474,7 @@ func errorText(err error) string {
 	if err == nil {
 		return "Unknown error"
 	}
-	return err.Error()
+	return terminalBlock(err.Error())
 }
 
 // stripANSIColors removes SGR foreground/background parameters while leaving

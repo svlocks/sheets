@@ -77,11 +77,11 @@ func (m *timelineModel) setRevisions(revisions []domain.RevisionInfo, live domai
 		if info.Revision == live {
 			marker = " · LIVE"
 		}
-		actor := strings.TrimSpace(info.Actor)
+		actor := terminalLine(truncateRunes(strings.TrimSpace(info.Actor), maxTimelineTextRunes))
 		if actor == "" {
 			actor = "unknown actor"
 		}
-		message := strings.TrimSpace(info.Message)
+		message := terminalLine(truncateRunes(strings.TrimSpace(info.Message), maxTimelineTextRunes))
 		if message == "" {
 			message = "No revision message"
 		}

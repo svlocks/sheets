@@ -92,18 +92,19 @@ func newGraphState(nodes []domain.Node, edges []domain.Edge) graphState {
 	// Valid stores cannot contain CHILD cycles, but keeping unreachable nodes
 	// visible makes imported/corrupt test data fail safely instead of vanishing.
 	seen := make(map[domain.EntityID]bool, len(g.nodes))
-	var visit func(domain.EntityID)
-	visit = func(id domain.EntityID) {
+	stack := append([]domain.EntityID(nil), g.roots...)
+	for len(stack) > 0 {
+		last := len(stack) - 1
+		id := stack[last]
+		stack = stack[:last]
 		if seen[id] {
-			return
+			continue
 		}
 		seen[id] = true
-		for _, child := range g.children[id] {
-			visit(child.child)
+		children := g.children[id]
+		for index := len(children) - 1; index >= 0; index-- {
+			stack = append(stack, children[index].child)
 		}
-	}
-	for _, id := range g.roots {
-		visit(id)
 	}
 	for id := range g.nodeByID {
 		if !seen[id] {
@@ -137,38 +138,47 @@ func (g graphState) firstNodeID() domain.EntityID {
 
 func (g graphState) descendants(id domain.EntityID) map[domain.EntityID]bool {
 	result := make(map[domain.EntityID]bool)
-	var visit func(domain.EntityID)
-	visit = func(parent domain.EntityID) {
+	stack := []domain.EntityID{id}
+	for len(stack) > 0 {
+		last := len(stack) - 1
+		parent := stack[last]
+		stack = stack[:last]
 		for _, link := range g.children[parent] {
 			if result[link.child] {
 				continue
 			}
 			result[link.child] = true
-			visit(link.child)
+			stack = append(stack, link.child)
 		}
 	}
-	visit(id)
 	return result
 }
 
 func nodeTitle(node domain.Node) string {
 	if value, ok := node.Properties["title"].(string); ok && strings.TrimSpace(value) != "" {
-		return strings.TrimSpace(value)
+		return terminalLine(truncateRunes(strings.TrimSpace(value), maxNodeTitleRunes))
 	}
 	if len(node.Labels) > 0 {
-		return node.Labels[0] + " " + shortID(node.ID)
+		return terminalLine(truncateRunes(node.Labels[0], maxDisplayLabelRunes)) + " " + shortID(node.ID)
 	}
 	return "Node " + shortID(node.ID)
 }
 
 func nodeSubtitle(node domain.Node) string {
-	parts := append([]string(nil), node.Labels...)
+	displayed := min(len(node.Labels), maxDisplayLabels)
+	parts := make([]string, 0, displayed+2)
+	for _, label := range node.Labels[:displayed] {
+		parts = append(parts, terminalLine(truncateRunes(label, maxDisplayLabelRunes)))
+	}
+	if displayed < len(node.Labels) {
+		parts = append(parts, fmt.Sprintf("+%d labels", len(node.Labels)-displayed))
+	}
 	parts = append(parts, shortID(node.ID))
 	return strings.Join(parts, " · ")
 }
 
 func shortID(id domain.EntityID) string {
-	value := string(id)
+	value := terminalLine(string(id))
 	if len(value) <= 8 {
 		return value
 	}
@@ -179,29 +189,14 @@ func shortID(id domain.EntityID) string {
 }
 
 func nodeSearchValue(node domain.Node) string {
-	return strings.Join([]string{
-		nodeTitle(node),
-		string(node.ID),
-		strings.Join(node.Labels, " "),
-		stableJSON(node.Properties),
-		node.Body,
-	}, " ")
+	return boundedSearchText(nodeTitle(node), string(node.ID), node.Labels, node.Properties, node.Body)
 }
 
 func edgeSearchValue(edge domain.Edge, graph graphState) string {
-	return strings.Join([]string{
+	return boundedSearchText(
 		string(edge.ID), edge.Type, string(edge.From), string(edge.To),
-		nodeTitle(graph.nodeByID[edge.From]), nodeTitle(graph.nodeByID[edge.To]),
-		stableJSON(edge.Properties),
-	}, " ")
-}
-
-func stableJSON(value any) string {
-	encoded, err := json.Marshal(app.JSONValue(value))
-	if err != nil {
-		return fmt.Sprint(value)
-	}
-	return string(encoded)
+		nodeTitle(graph.nodeByID[edge.From]), nodeTitle(graph.nodeByID[edge.To]), edge.Properties,
+	)
 }
 
 func prettyJSON(value any) string {
@@ -209,5 +204,5 @@ func prettyJSON(value any) string {
 	if err != nil {
 		return fmt.Sprint(value)
 	}
-	return string(encoded)
+	return terminalSafeJSON(string(encoded))
 }

@@ -63,13 +63,18 @@ type formSubmittedMsg struct{ serial uint64 }
 var errConfirmationDeclined = errors.New("confirmation declined")
 
 type nodeFormData struct {
-	title      string
-	labels     string
-	properties string
-	body       string
-	parent     string
-	position   string
-	original   domain.Node
+	title                   string
+	labels                  string
+	properties              string
+	body                    string
+	parent                  string
+	position                string
+	original                domain.Node
+	titleEditorInitial      string
+	labelsEditorInitial     string
+	propertiesEditorInitial string
+	bodyEditorInitial       string
+	propertiesEditorOmitted bool
 }
 
 type moveFormData struct {
@@ -87,8 +92,10 @@ type connectionFormData struct {
 }
 
 type relationshipFormData struct {
-	edge       domain.Edge
-	properties string
+	edge                    domain.Edge
+	properties              string
+	propertiesEditorInitial string
+	propertiesEditorOmitted bool
 }
 
 type confirmFormData struct {
@@ -112,18 +119,25 @@ type formController struct {
 	validationErr string
 }
 
+const (
+	maxFormShortRunes    = 4 << 10
+	maxFormLabelsBytes   = 64 << 10
+	maxFormDocumentRunes = 4 << 20
+	maxFormPreviewRunes  = 1 << 20
+)
+
 func newCreateNodeForm(serial uint64, graph graphState, selected domain.EntityID, width, height int, dark, noColor bool) *formController {
 	data := &nodeFormData{
 		labels: "Task", properties: "{}", parent: string(selected),
 	}
 	parent := parentField("Parent", "Choose root or an existing node. Type / to filter.", &data.parent, graph, "")
 	fields := []huh.Field{
-		huh.NewInput().Title("Title").Description("A human-readable title; stored as the title property.").Value(&data.title).Validate(huh.ValidateNotEmpty()),
-		huh.NewInput().Title("Labels").Description("Comma-separated, for example Task, Feature.").Value(&data.labels).Validate(validateLabelInput),
+		huh.NewInput().Title("Title").Description("A human-readable title; stored as the title property.").CharLimit(maxFormShortRunes).Value(&data.title).Validate(huh.ValidateNotEmpty()),
+		huh.NewInput().Title("Labels").Description("Comma-separated, for example Task, Feature.").CharLimit(maxFormLabelsBytes).Value(&data.labels).Validate(validateLabelInput),
 		parent,
-		huh.NewInput().Title("Sibling position").Description("Integer for ordered siblings; leave blank for unordered.").Value(&data.position).Validate(validateOptionalInteger),
-		huh.NewText().Title("Other properties · JSON object").Description("Schema-free properties other than title and body.").Lines(5).ShowLineNumbers(true).Value(&data.properties).Validate(validateNodePropertiesJSON),
-		huh.NewText().Title("Markdown body").Description("Stored directly in the graph.").Lines(7).ShowLineNumbers(true).Value(&data.body),
+		huh.NewInput().Title("Sibling position").Description("Integer for ordered siblings; leave blank for unordered.").CharLimit(32).Value(&data.position).Validate(validateOptionalInteger),
+		huh.NewText().Title("Other properties · JSON object").Description("Schema-free properties other than title and body.").Lines(5).CharLimit(maxFormDocumentRunes).ShowLineNumbers(true).Value(&data.properties).Validate(validateNodePropertiesJSON),
+		huh.NewText().Title("Markdown body").Description("Stored directly in the graph.").Lines(7).CharLimit(maxFormDocumentRunes).ShowLineNumbers(true).Value(&data.body),
 	}
 	return newFormController(serial, formCreateNode, data, fields, width, height, dark, noColor)
 }
@@ -135,14 +149,21 @@ func newEditNodeForm(serial uint64, node domain.Node, width, height int, dark, n
 		title = value
 		delete(properties, "title")
 	}
+	title = terminalLine(truncateRunes(title, maxFormShortRunes))
+	labels := formLabelsPreview(node.Labels)
+	propertiesText, propertiesOmitted := jsonPreviewStatus(properties, true, maxFormDocumentRunes)
+	body := truncateRunes(terminalBlock(truncateRunes(node.Body, maxFormPreviewRunes)), maxFormDocumentRunes)
 	data := &nodeFormData{
-		title: title, labels: strings.Join(node.Labels, ", "), properties: prettyJSON(properties), body: node.Body, original: node,
+		title: title, labels: labels, properties: propertiesText, body: body, original: node,
+		titleEditorInitial: title, labelsEditorInitial: labels,
+		propertiesEditorInitial: propertiesText, bodyEditorInitial: body,
+		propertiesEditorOmitted: propertiesOmitted,
 	}
 	fields := []huh.Field{
-		huh.NewInput().Title("Title").Description("Optional for schema-free nodes; blank removes title.").Value(&data.title),
-		huh.NewInput().Title("Labels").Description("Comma-separated; blank removes all labels.").Value(&data.labels).Validate(validateLabelInput),
-		huh.NewText().Title("Other properties · JSON object").Description("Replacing this object removes properties not listed here.").Lines(6).ShowLineNumbers(true).Value(&data.properties).Validate(validateNodePropertiesJSON),
-		huh.NewText().Title("Markdown body").Lines(8).ShowLineNumbers(true).Value(&data.body),
+		huh.NewInput().Title("Title").Description("Optional for schema-free nodes; blank removes title.").CharLimit(maxFormShortRunes).Value(&data.title),
+		huh.NewInput().Title("Labels").Description("Comma-separated; blank removes all labels.").CharLimit(maxFormLabelsBytes).Value(&data.labels).Validate(validateLabelInput),
+		huh.NewText().Title("Other properties · JSON object").Description("Replacing this object removes properties not listed here.").Lines(6).CharLimit(maxFormDocumentRunes).ShowLineNumbers(true).Value(&data.properties).Validate(validateNodePropertiesJSON),
+		huh.NewText().Title("Markdown body").Lines(8).CharLimit(maxFormDocumentRunes).ShowLineNumbers(true).Value(&data.body),
 	}
 	return newFormController(serial, formEditNode, data, fields, width, height, dark, noColor)
 }
@@ -161,7 +182,7 @@ func newMoveNodeForm(serial uint64, graph graphState, node domain.Node, width, h
 	fields := []huh.Field{
 		huh.NewNote().Title("Move " + nodeTitle(node)).Description("This atomically removes the old CHILD edge and creates the new one."),
 		parent,
-		huh.NewInput().Title("Sibling position").Description("Integer for ordered siblings; leave blank for unordered.").Value(&data.position).Validate(validateOptionalInteger),
+		huh.NewInput().Title("Sibling position").Description("Integer for ordered siblings; leave blank for unordered.").CharLimit(32).Value(&data.position).Validate(validateOptionalInteger),
 	}
 	return newFormController(serial, formMoveNode, data, fields, width, height, dark, noColor)
 }
@@ -183,19 +204,23 @@ func newConnectionForm(serial uint64, graph graphState, selected domain.EntityID
 	}
 	fields := []huh.Field{
 		nodeField("From", "Relationship source. Type / to filter.", &data.from, graph, ""),
-		huh.NewInput().Title("Relationship type").Description("Any non-CHILD type, for example BLOCKED_BY or RELATES_TO.").Value(&data.typeName).Validate(validateRelationshipType),
+		huh.NewInput().Title("Relationship type").Description("Any non-CHILD type, for example BLOCKED_BY or RELATES_TO.").CharLimit(maxFormShortRunes).Value(&data.typeName).Validate(validateRelationshipType),
 		nodeField("To", "Relationship target. Self-relationships are allowed.", &data.to, graph, ""),
-		huh.NewText().Title("Properties · JSON object").Description("position is reserved for CHILD sibling order.").Lines(7).ShowLineNumbers(true).Value(&data.properties).Validate(validateRelationshipPropertiesJSON),
+		huh.NewText().Title("Properties · JSON object").Description("position is reserved for CHILD sibling order.").Lines(7).CharLimit(maxFormDocumentRunes).ShowLineNumbers(true).Value(&data.properties).Validate(validateRelationshipPropertiesJSON),
 	}
 	return newFormController(serial, formConnectNodes, data, fields, width, height, dark, noColor)
 }
 
 func newEditRelationshipForm(serial uint64, edge domain.Edge, width, height int, dark, noColor bool) *formController {
-	data := &relationshipFormData{edge: edge, properties: prettyJSON(edge.Properties)}
+	properties, propertiesOmitted := jsonPreviewStatus(edge.Properties, true, maxFormDocumentRunes)
+	data := &relationshipFormData{
+		edge: edge, properties: properties, propertiesEditorInitial: properties,
+		propertiesEditorOmitted: propertiesOmitted,
+	}
 	description := fmt.Sprintf("%s → %s. Type and endpoints are stable; recreate the relationship to change them.", edge.From, edge.To)
 	fields := []huh.Field{
-		huh.NewNote().Title("Edit " + edge.Type).Description(description),
-		huh.NewText().Title("Properties · JSON object").Description("Replacing this object removes properties not listed here; position is reserved.").Lines(9).ShowLineNumbers(true).Value(&data.properties).Validate(validateRelationshipPropertiesJSON),
+		huh.NewNote().Title("Edit " + terminalLine(truncateRunes(edge.Type, maxFormShortRunes))).Description(description),
+		huh.NewText().Title("Properties · JSON object").Description("Replacing this object removes properties not listed here; position is reserved.").Lines(9).CharLimit(maxFormDocumentRunes).ShowLineNumbers(true).Value(&data.properties).Validate(validateRelationshipPropertiesJSON),
 	}
 	return newFormController(serial, formEditRelationship, data, fields, width, height, dark, noColor)
 }
@@ -214,7 +239,7 @@ func newDeleteNodeForm(serial uint64, graph graphState, node domain.Node, width,
 
 func newDeleteRelationshipForm(serial uint64, graph graphState, edge domain.Edge, width, height int, dark, noColor bool) *formController {
 	data := &confirmFormData{edge: &edge}
-	description := fmt.Sprintf("Remove %s —%s→ %s. The relationship remains visible in earlier revisions.", nodeTitle(graph.nodeByID[edge.From]), edge.Type, nodeTitle(graph.nodeByID[edge.To]))
+	description := fmt.Sprintf("Remove %s —%s→ %s. The relationship remains visible in earlier revisions.", nodeTitle(graph.nodeByID[edge.From]), terminalLine(truncateRunes(edge.Type, maxFormShortRunes)), nodeTitle(graph.nodeByID[edge.To]))
 	fields := []huh.Field{
 		huh.NewNote().Title("Delete relationship?").Description(description),
 		huh.NewConfirm().Title("Confirm deletion").Affirmative("Delete relationship").Negative("Keep relationship").Value(&data.confirmed),
@@ -224,10 +249,7 @@ func newDeleteRelationshipForm(serial uint64, graph graphState, edge domain.Edge
 
 func newExecuteQueryForm(serial uint64, request app.ExecuteRequest, width, height int, dark, noColor bool) *formController {
 	data := &confirmFormData{request: &request}
-	preview := strings.TrimSpace(request.Query)
-	if len(preview) > 600 {
-		preview = preview[:600] + "…"
-	}
+	preview := truncateRunes(terminalBlock(strings.TrimSpace(request.Query)), 600)
 	fields := []huh.Field{
 		huh.NewNote().Title("Execute write-capable Cypher?").Description(preview),
 		huh.NewConfirm().Title("This request may create a new revision").Affirmative("Execute").Negative("Cancel").Value(&data.confirmed),
@@ -287,24 +309,44 @@ func (m *formController) request() (app.ExecuteRequest, error) {
 	request := app.ExecuteRequest{Actor: "tui", ReadOnly: false}
 	switch data := m.data.(type) {
 	case *nodeFormData:
-		labels, err := parseLabels(data.labels)
-		if err != nil {
-			return request, err
+		var labels []string
+		var err error
+		if m.purpose == formEditNode && data.labels == data.labelsEditorInitial {
+			labels = append([]string(nil), data.original.Labels...)
+		} else {
+			labels, err = parseLabels(data.labels)
+			if err != nil {
+				return request, err
+			}
 		}
-		properties, err := decodeNodeProperties(data.properties)
-		if err != nil {
-			return request, err
+		var properties domain.Properties
+		if m.purpose == formEditNode && data.propertiesEditorOmitted && data.properties == data.propertiesEditorInitial {
+			properties = copyProperties(data.original.Properties)
+			delete(properties, "title")
+		} else {
+			properties, err = decodeNodeProperties(data.properties)
+			if err != nil {
+				return request, err
+			}
 		}
-		if m.purpose == formEditNode {
+		if m.purpose == formEditNode && (!data.propertiesEditorOmitted || data.properties != data.propertiesEditorInitial) {
 			properties, err = restorePropertyMapTypes(properties, data.original.Properties)
 			if err != nil {
 				return request, err
 			}
 		}
-		if strings.TrimSpace(data.title) != "" {
-			properties["title"] = strings.TrimSpace(data.title)
+		if m.purpose == formEditNode && data.title == data.titleEditorInitial {
+			if originalTitle, exists := data.original.Properties["title"]; exists {
+				properties["title"] = originalTitle
+			}
+		} else if title := strings.TrimSpace(data.title); title != "" {
+			properties["title"] = title
 		}
-		request.Params = map[string]any{"properties": properties, "body": data.body}
+		body := data.body
+		if m.purpose == formEditNode && data.body == data.bodyEditorInitial {
+			body = data.original.Body
+		}
+		request.Params = map[string]any{"properties": properties, "body": body}
 		nodeSet := "SET n = $properties, n.body = $body"
 		if position, exists := properties["position"]; exists {
 			delete(properties, "position")
@@ -406,13 +448,19 @@ func (m *formController) request() (app.ExecuteRequest, error) {
 		}
 		request.Message = "connect nodes: " + typeName
 	case *relationshipFormData:
-		properties, err := decodeRelationshipProperties(data.properties)
-		if err != nil {
-			return request, err
-		}
-		properties, err = restorePropertyMapTypes(properties, data.edge.Properties)
-		if err != nil {
-			return request, err
+		var properties domain.Properties
+		var err error
+		if data.propertiesEditorOmitted && data.properties == data.propertiesEditorInitial {
+			properties = copyProperties(data.edge.Properties)
+		} else {
+			properties, err = decodeRelationshipProperties(data.properties)
+			if err != nil {
+				return request, err
+			}
+			properties, err = restorePropertyMapTypes(properties, data.edge.Properties)
+			if err != nil {
+				return request, err
+			}
 		}
 		request.Query = "MATCH ()-[r]->() WHERE elementId(r) = $id SET r = $properties RETURN r"
 		request.Params = map[string]any{"id": string(data.edge.ID), "properties": properties}
@@ -506,6 +554,20 @@ func nodeOptions(graph graphState, excluded map[domain.EntityID]bool) []huh.Opti
 		options = append(options, huh.NewOption(label, string(node.ID)))
 	}
 	return options
+}
+
+func formLabelsPreview(labels []string) string {
+	builder := searchTextBuilder{limit: maxFormLabelsBytes}
+	for index, label := range labels {
+		if index > 0 {
+			builder.write(", ")
+		}
+		builder.write(label)
+		if builder.truncated {
+			break
+		}
+	}
+	return truncateRunes(terminalLine(string(builder.text)), maxFormLabelsBytes)
 }
 
 func validateLabelInput(value string) error {
