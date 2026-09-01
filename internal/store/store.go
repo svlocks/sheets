@@ -188,14 +188,7 @@ func makeDSN(path string, busy time.Duration) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("resolve database path: %w", err)
 		}
-		// Build an opaque file URI (file:C:/x on Windows, file:/x elsewhere)
-		// using EscapedPath, which percent-encodes reserved characters but
-		// leaves ':' and '/' literal. Go's Path+String() would turn a Windows
-		// drive letter into file://C:/x, which SQLite reads as an "authority"
-		// and rejects. Opaque form has no authority, and anchorRelativeFileURI
-		// already decodes uri.Opaque as a path.
-		escaped := (&url.URL{Path: filepath.ToSlash(absolute)}).EscapedPath()
-		path = "file:" + escaped
+		path = opaqueFileURI(filepath.ToSlash(absolute))
 	}
 	uri, err := url.Parse(path)
 	if err != nil {
@@ -212,6 +205,15 @@ func makeDSN(path string, busy time.Duration) (string, error) {
 	query.Add("_pragma", "busy_timeout("+strconv.FormatInt(ms, 10)+")")
 	uri.RawQuery = query.Encode()
 	return uri.String(), nil
+}
+
+// opaqueFileURI builds an opaque file URI (file:C:/x on Windows, file:/x
+// elsewhere) using EscapedPath, which percent-encodes reserved characters but
+// leaves ':' and '/' literal. Go's url.URL.String() would turn a Windows drive
+// letter into file://C:/x, which SQLite's URI parser reads as an "authority"
+// and rejects. The opaque form has no authority.
+func opaqueFileURI(slashPath string) string {
+	return "file:" + (&url.URL{Path: slashPath}).EscapedPath()
 }
 
 // anchorRelativeFileURI prevents lazy connections in one sql.DB pool from
@@ -247,8 +249,8 @@ func anchorRelativeFileURI(uri *url.URL) error {
 	if err != nil {
 		return fmt.Errorf("resolve database URI path: %w", err)
 	}
-	uri.Opaque = ""
-	uri.Path = filepath.ToSlash(absolute)
+	uri.Opaque = strings.TrimPrefix(opaqueFileURI(filepath.ToSlash(absolute)), "file:")
+	uri.Path = ""
 	uri.RawPath = ""
 	return nil
 }
