@@ -3,6 +3,7 @@ package engine
 import (
 	"crypto/rand"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/svlocks/sheets/internal/cypher"
@@ -60,26 +61,56 @@ func durationValue(expression cypher.Expression, arguments []any) (any, error) {
 }
 
 func temporalFromClock(expression cypher.Expression, name string, now time.Time) (any, error) {
-	value := now.UTC()
-	date, err := temporal.NewDate(int64(value.Year()), int(value.Month()), value.Day())
-	if err != nil {
-		return nil, evalError(expression, "construct current %s: %v", name, err)
+	return temporalFromClockInZone(expression, name, now, "Z")
+}
+
+func (e evaluator) temporalClockFunction(expression cypher.Expression, name string, arguments []any) (any, error) {
+	if len(arguments) > 1 {
+		return nil, evalError(expression, "%s expects zero or one argument", name)
 	}
-	localTime, err := temporal.NewLocalTime(value.Hour(), value.Minute(), value.Second(), value.Nanosecond())
+	timezone := "Z"
+	if len(arguments) == 1 {
+		if arguments[0] == nil {
+			return nil, nil
+		}
+		var ok bool
+		timezone, ok = arguments[0].(string)
+		if !ok {
+			return nil, evalError(expression, "%s timezone must be a string", name)
+		}
+	}
+	parts := strings.Split(name, ".")
+	base, mode := parts[0], parts[1]
+	instant := e.now()
+	switch mode {
+	case "transaction":
+		instant = e.transactionNow
+	case "statement":
+		// e.now is captured once when the statement evaluator is created.
+	case "realtime":
+		instant = e.realtime()
+	default:
+		return nil, evalError(expression, "unknown clock mode %s", mode)
+	}
+	return temporalFromClockInZone(expression, base, instant, timezone)
+}
+
+func temporalFromClockInZone(expression cypher.Expression, name string, now time.Time, timezone string) (any, error) {
+	dateTime, err := temporal.DateTimeFromEpoch(now.Unix(), int64(now.Nanosecond()), timezone)
 	if err != nil {
-		return nil, evalError(expression, "construct current %s: %v", name, err)
+		return nil, evalError(expression, "construct current %s in timezone %q: %v", name, timezone, err)
 	}
 	switch name {
 	case "date":
-		return date, nil
+		return dateTime.Date(), nil
 	case "localtime":
-		return localTime, nil
+		return dateTime.LocalTime(), nil
 	case "time":
-		return temporal.NewTime(localTime, 0)
+		return temporal.NewTime(dateTime.LocalTime(), dateTime.OffsetSeconds())
 	case "localdatetime":
-		return temporal.NewLocalDateTime(date, localTime), nil
+		return dateTime.LocalDateTime(), nil
 	case "datetime":
-		return temporal.DateTimeFromEpoch(value.Unix(), int64(value.Nanosecond()), "Z")
+		return dateTime, nil
 	default:
 		return nil, evalError(expression, "unknown temporal constructor %s", name)
 	}

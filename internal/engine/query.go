@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/cypher"
@@ -13,6 +14,12 @@ import (
 )
 
 type revisionLister func(context.Context, domain.Page) ([]domain.RevisionInfo, domain.PageInfo, error)
+
+type queryClock struct {
+	transaction time.Time
+	statement   time.Time
+	realtime    func() time.Time
+}
 
 type queryExecution struct {
 	ctx       context.Context
@@ -57,9 +64,10 @@ func executeQuery(
 	graph *memoryGraph,
 	params map[string]any,
 	listRevisions revisionLister,
+	clock queryClock,
 ) (app.Result, error) {
 	execution := &queryExecution{
-		ctx: ctx, source: source, graph: graph, evaluator: newEvaluator(params), revisions: listRevisions,
+		ctx: ctx, source: source, graph: graph, evaluator: newEvaluatorWithClock(params, clock), revisions: listRevisions,
 	}
 	execution.evaluator.ctx = ctx
 	execution.evaluator.paths = &pathExpansionBudget{limit: maxPathExpansions}

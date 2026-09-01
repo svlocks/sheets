@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/cypher"
@@ -108,6 +109,18 @@ func executeDocument(
 	params map[string]any,
 	listRevisions revisionLister,
 ) (app.BatchResult, error) {
+	return executeDocumentWithClock(ctx, document, graph, params, listRevisions, time.Now)
+}
+
+func executeDocumentWithClock(
+	ctx context.Context,
+	document *cypher.Document,
+	graph *memoryGraph,
+	params map[string]any,
+	listRevisions revisionLister,
+	clock func() time.Time,
+) (app.BatchResult, error) {
+	transactionTime := clock()
 	batch := app.BatchResult{Results: make([]app.Result, 0, len(document.Statements))}
 	for _, statement := range document.Statements {
 		if err := ctx.Err(); err != nil {
@@ -121,7 +134,11 @@ func executeDocument(
 			batch.Results = append(batch.Results, explainQuery(query))
 			continue
 		}
-		result, err := executeQuery(ctx, document.Source, query, graph, params, listRevisions)
+		result, err := executeQuery(ctx, document.Source, query, graph, params, listRevisions, queryClock{
+			transaction: transactionTime,
+			statement:   clock(),
+			realtime:    clock,
+		})
 		if err != nil {
 			return app.BatchResult{}, err
 		}

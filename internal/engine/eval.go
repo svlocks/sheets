@@ -24,21 +24,40 @@ import (
 type row map[string]any
 
 type evaluator struct {
-	ctx      context.Context
-	params   map[string]any
-	now      func() time.Time
-	group    []row
-	graph    *memoryGraph
-	pattern  func(cypher.PatternElement, row) ([]Path, error)
-	subquery func(*cypher.QueryStatement, row) (bool, error)
-	shortest func(cypher.PatternElement, row, bool) (any, error)
-	paths    *pathExpansionBudget
-	rows     *rowBudget
+	ctx            context.Context
+	params         map[string]any
+	now            func() time.Time
+	transactionNow time.Time
+	realtime       func() time.Time
+	group          []row
+	graph          *memoryGraph
+	pattern        func(cypher.PatternElement, row) ([]Path, error)
+	subquery       func(*cypher.QueryStatement, row) (bool, error)
+	shortest       func(cypher.PatternElement, row, bool) (any, error)
+	paths          *pathExpansionBudget
+	rows           *rowBudget
 }
 
 func newEvaluator(params map[string]any) evaluator {
 	queryTime := time.Now()
-	return evaluator{ctx: context.Background(), params: params, now: func() time.Time { return queryTime }}
+	return newEvaluatorWithClock(params, queryClock{
+		transaction: queryTime,
+		statement:   queryTime,
+		realtime:    time.Now,
+	})
+}
+
+func newEvaluatorWithClock(params map[string]any, clock queryClock) evaluator {
+	if clock.realtime == nil {
+		clock.realtime = time.Now
+	}
+	return evaluator{
+		ctx:            context.Background(),
+		params:         params,
+		now:            func() time.Time { return clock.statement },
+		transactionNow: clock.transaction,
+		realtime:       clock.realtime,
+	}
 }
 
 // evaluationError adds a Cypher source location to a runtime expression error.
@@ -1224,6 +1243,12 @@ func (e evaluator) function(expression *cypher.FunctionInvocation, values row) (
 		return e.now().UnixMilli(), nil
 	case "datetime", "localdatetime", "date", "time", "localtime":
 		return temporalValue(expression, name, arguments, e.now())
+	case "date.transaction", "date.statement", "date.realtime",
+		"localtime.transaction", "localtime.statement", "localtime.realtime",
+		"time.transaction", "time.statement", "time.realtime",
+		"localdatetime.transaction", "localdatetime.statement", "localdatetime.realtime",
+		"datetime.transaction", "datetime.statement", "datetime.realtime":
+		return e.temporalClockFunction(expression, name, arguments)
 	case "duration":
 		return durationValue(expression, arguments)
 	case "datetime.fromepoch":
