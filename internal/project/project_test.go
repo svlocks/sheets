@@ -229,6 +229,18 @@ func TestInitContextCancellationDoesNotPublishPartialMetadata(t *testing.T) {
 	}
 }
 
+func TestInitContextPreCancellationDoesNotCreateTarget(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "missing", "project")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := InitContext(ctx, root); !errors.Is(err, context.Canceled) {
+		t.Fatalf("InitContext error = %v, want context.Canceled", err)
+	}
+	if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled initialization created target: %v", err)
+	}
+}
+
 func TestDiscoverIgnoresUnpublishedStagingDirectory(t *testing.T) {
 	root := t.TempDir()
 	staging := filepath.Join(root, ".sheets-init-interrupted")

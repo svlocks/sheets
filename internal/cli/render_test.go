@@ -9,6 +9,7 @@ import (
 
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/domain"
+	"github.com/svlocks/sheets/internal/engine"
 )
 
 func TestParseFormat(t *testing.T) {
@@ -214,5 +215,42 @@ func TestMachineFormatsUseStableEmptyArraysAndTaggedNonFiniteFloats(t *testing.T
 	}
 	if !strings.Contains(output.String(), `"$float":"NaN"`) {
 		t.Fatalf("JSONL output = %s", output.String())
+	}
+}
+
+func TestRenderJSONDoesNotMutatePathValues(t *testing.T) {
+	path := engine.PathValue{
+		Nodes:         []domain.Node{{Properties: domain.Properties{"score": math.NaN()}}},
+		Relationships: []domain.Edge{{Properties: domain.Properties{"weight": math.Inf(1)}}},
+	}
+	batch := app.BatchResult{Results: []app.Result{{Rows: [][]any{{path}}}}}
+	var output bytes.Buffer
+	if err := Render(&output, "json", batch); err != nil {
+		t.Fatal(err)
+	}
+	if score, ok := path.Nodes[0].Properties["score"].(float64); !ok || !math.IsNaN(score) {
+		t.Fatalf("Render mutated path node property to %#v", path.Nodes[0].Properties["score"])
+	}
+	if weight, ok := path.Relationships[0].Properties["weight"].(float64); !ok || !math.IsInf(weight, 1) {
+		t.Fatalf("Render mutated path relationship property to %#v", path.Relationships[0].Properties["weight"])
+	}
+}
+
+func TestRenderTableUsesTerminalCellWidths(t *testing.T) {
+	batch := app.BatchResult{Results: []app.Result{{
+		Columns: []string{"x", "value"},
+		Rows:    [][]any{{"界", 1}, {"e\u0301", 2}},
+	}}}
+	var output bytes.Buffer
+	if err := Render(&output, "table", batch); err != nil {
+		t.Fatal(err)
+	}
+	want := "Statement 1\n" +
+		"x  | value\n" +
+		"-- | -----\n" +
+		"界 | 1\n" +
+		"e\u0301  | 2\n"
+	if output.String() != want {
+		t.Fatalf("table output =\n%q\nwant =\n%q", output.String(), want)
 	}
 }

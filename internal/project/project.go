@@ -77,10 +77,13 @@ func Init(path string) (Project, error) {
 	return InitContext(context.Background(), path)
 }
 
-// InitContext is Init with cancellation for database initialization.
+// InitContext is Init with cancellation through the atomic publication point.
 func InitContext(ctx context.Context, path string) (Project, error) {
 	if ctx == nil {
 		return Project{}, fmt.Errorf("sheets init %q: nil context", path)
+	}
+	if err := ctx.Err(); err != nil {
+		return Project{}, fmt.Errorf("sheets init %q: %w", path, err)
 	}
 	root, err := canonicalInitDirectory(path)
 	if err != nil {
@@ -147,6 +150,9 @@ func InitContext(ctx context.Context, path string) (Project, error) {
 		return Project{}, fmt.Errorf("sheets init %q: close staging directory: %w", path, err)
 	}
 	stageOpen = false
+	if err := ctx.Err(); err != nil {
+		return Project{}, fmt.Errorf("sheets init %q: %w", path, err)
+	}
 	if err := rootHandle.Rename(stageName, MetadataDirName); err != nil {
 		// Another initializer can win the one atomic rename. Its fully staged
 		// project is the idempotent result; no partial .sheets is accepted.
@@ -201,6 +207,9 @@ func writeMarker(metadata *os.Root) error {
 }
 
 func completeExistingProject(ctx context.Context, p Project) (Project, error) {
+	if err := ctx.Err(); err != nil {
+		return Project{}, fmt.Errorf("initialize sheets project %s: %w", p.Root, err)
+	}
 	if err := validateMetadata(p); err != nil {
 		return Project{}, err
 	}

@@ -5,12 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/svlocks/sheets/internal/app"
+	"github.com/svlocks/sheets/internal/engine"
 	"github.com/svlocks/sheets/internal/project"
 )
 
@@ -181,5 +185,101 @@ func TestStatusReportsGraphCounts(t *testing.T) {
 	}
 	if !strings.Contains(stdout, `"revision"`) || !strings.Contains(stdout, `"relationships"`) {
 		t.Fatalf("status = %s", stdout)
+	}
+}
+
+type blockingReader struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingReader) Read([]byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return 0, io.EOF
+}
+
+func TestCancellationInterruptsBlockedStdin(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "query", args: []string{"query", "--file", "-"}},
+		{name: "parameters", args: []string{"query", "RETURN $value", "--params", "-"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reader := &blockingReader{started: make(chan struct{}), release: make(chan struct{})}
+			command := New(Options{})
+			command.SetIn(reader)
+			command.SetArgs(test.args)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- command.ExecuteContext(ctx) }()
+			select {
+			case <-reader.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("command did not start reading stdin")
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("command error = %v, want context.Canceled", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("command remained blocked after cancellation")
+			}
+			close(reader.release)
+		})
+	}
+}
+
+func TestTUILaunchesDiscoveredProjectFromNestedDirectory(t *testing.T) {
+	root := initializeProject(t)
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(root, "one", "two")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	command := New(Options{TUI: func(ctx context.Context, found project.Project, executor *engine.Engine, options TUIOptions) error {
+		called = true
+		if found.Root != canonicalRoot {
+			t.Fatalf("TUI project root = %q, want %q", found.Root, canonicalRoot)
+		}
+		if _, err := executor.Execute(ctx, app.ExecuteRequest{Query: "RETURN 1", ReadOnly: true}); err != nil {
+			t.Fatalf("TUI executor: %v", err)
+		}
+		if !options.NoColor {
+			t.Fatal("TUI no-color option was not forwarded")
+		}
+		return nil
+	}})
+	command.SetArgs([]string{"-C", nested, "tui", "--no-color"})
+	if err := command.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("TUI runner was not called")
+	}
+}
+
+func TestInvalidOutputFailsBeforeProjectDiscovery(t *testing.T) {
+	tests := [][]string{
+		{"history", "--output", "yaml"},
+		{"status", "--output", "yaml"},
+		{"query", "--output", "yaml", "RETURN 1"},
+		{"exec", "--output", "yaml", "RETURN 1"},
+	}
+	for _, args := range tests {
+		_, _, err := runCommand(t, "", append([]string{"-C", filepath.Join(t.TempDir(), "missing")}, args...)...)
+		if !errors.Is(err, ErrInvalidFormat) {
+			t.Fatalf("%s error = %v, want ErrInvalidFormat", args[0], err)
+		}
 	}
 }

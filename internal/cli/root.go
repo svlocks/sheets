@@ -47,7 +47,7 @@ func New(options Options) *cobra.Command {
 		SilenceUsage:  true,
 		Args:          cobra.NoArgs,
 	}
-	root.PersistentFlags().StringVarP(&environment.start, "directory", "C", ".", "start project discovery from `path`")
+	root.PersistentFlags().StringVarP(&environment.start, "directory", "C", ".", "start project discovery or initialization from `path`")
 	root.AddCommand(
 		environment.initCommand(),
 		environment.rootCommand(),
@@ -144,11 +144,7 @@ func (e *commandEnvironment) queryCommand(readOnly bool) *cobra.Command {
 		Short: short,
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(command *cobra.Command, args []string) (runErr error) {
-			query, err := flags.loadQuery(args, command.InOrStdin())
-			if err != nil {
-				return err
-			}
-			params, err := flags.params.load(command.InOrStdin())
+			format, err := ParseFormat(flags.format)
 			if err != nil {
 				return err
 			}
@@ -156,7 +152,11 @@ func (e *commandEnvironment) queryCommand(readOnly bool) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			format, err := ParseFormat(flags.format)
+			query, err := flags.loadQuery(command.Context(), args, command.InOrStdin())
+			if err != nil {
+				return err
+			}
+			params, err := flags.params.loadContext(command.Context(), command.InOrStdin())
 			if err != nil {
 				return err
 			}
@@ -189,7 +189,13 @@ func (e *commandEnvironment) queryCommand(readOnly bool) *cobra.Command {
 	return command
 }
 
-func (f queryFlags) loadQuery(args []string, stdin io.Reader) (string, error) {
+func (f queryFlags) loadQuery(ctx context.Context, args []string, stdin io.Reader) (string, error) {
+	if ctx == nil {
+		return "", errors.New("load query: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if f.file != "" && len(args) > 0 {
 		return "", fmt.Errorf("query argument and --file are mutually exclusive")
 	}
@@ -200,9 +206,12 @@ func (f queryFlags) loadQuery(args []string, stdin io.Reader) (string, error) {
 		var data []byte
 		var err error
 		if f.file == "-" {
-			data, err = io.ReadAll(stdin)
+			data, err = readAllContext(ctx, stdin)
 		} else {
 			data, err = os.ReadFile(f.file)
+		}
+		if contextErr := ctx.Err(); contextErr != nil {
+			return "", contextErr
 		}
 		if err != nil {
 			return "", fmt.Errorf("read query: %w", err)
@@ -246,6 +255,10 @@ func (e *commandEnvironment) historyCommand() *cobra.Command {
 		Short: "List committed graph revisions",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) (runErr error) {
+			parsed, err := ParseFormat(format)
+			if err != nil {
+				return err
+			}
 			_, database, _, err := e.open(command.Context())
 			if err != nil {
 				return err
@@ -264,10 +277,6 @@ func (e *commandEnvironment) historyCommand() *cobra.Command {
 				result.Page = &page
 			}
 			batch := app.BatchResult{Results: []app.Result{result}}
-			parsed, err := ParseFormat(format)
-			if err != nil {
-				return err
-			}
 			return Render(command.OutOrStdout(), string(parsed), batch)
 		},
 	}
@@ -284,6 +293,10 @@ func (e *commandEnvironment) statusCommand() *cobra.Command {
 		Short: "Show project and current graph statistics",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) (runErr error) {
+			parsed, err := ParseFormat(format)
+			if err != nil {
+				return err
+			}
 			found, database, _, err := e.open(command.Context())
 			if err != nil {
 				return err
@@ -305,10 +318,6 @@ func (e *commandEnvironment) statusCommand() *cobra.Command {
 				Columns: []string{"root", "revision", "nodes", "relationships"},
 				Rows:    [][]any{{found.Root, view.Revision(), nodes, edges}},
 			}}}
-			parsed, err := ParseFormat(format)
-			if err != nil {
-				return err
-			}
 			return Render(command.OutOrStdout(), string(parsed), batch)
 		},
 	}

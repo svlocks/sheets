@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -68,6 +70,35 @@ func TestParameterInputRejectsDuplicatesAndInvalidAssignments(t *testing.T) {
 func TestParameterInputRejectsTrailingJSON(t *testing.T) {
 	if _, err := (parameterInput{Object: `{"x":1} {"y":2}`}).load(strings.NewReader("")); err == nil {
 		t.Fatal("trailing JSON was accepted")
+	}
+}
+
+func TestParameterInputRequiresObjectAndRejectsDuplicateKeys(t *testing.T) {
+	tests := []struct {
+		name  string
+		input parameterInput
+		want  string
+	}{
+		{name: "null object", input: parameterInput{Object: "null"}, want: "expected a JSON object"},
+		{name: "duplicate object key", input: parameterInput{Object: `{"x":1,"\u0078":2}`}, want: `duplicate object key "x"`},
+		{name: "nested duplicate key", input: parameterInput{Values: []string{`x={"nested":{"a":1,"a":2}}`}}, want: `duplicate object key "a"`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := test.input.load(strings.NewReader(""))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("load error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestParameterInputHonorsPreCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := (parameterInput{Object: "-"}).loadContext(ctx, strings.NewReader(`{"x":1}`))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("loadContext error = %v, want context.Canceled", err)
 	}
 }
 

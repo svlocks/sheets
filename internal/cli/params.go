@@ -2,7 +2,9 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,14 +20,27 @@ type parameterInput struct {
 }
 
 func (p parameterInput) load(stdin io.Reader) (map[string]any, error) {
+	return p.loadContext(context.Background(), stdin)
+}
+
+func (p parameterInput) loadContext(ctx context.Context, stdin io.Reader) (map[string]any, error) {
+	if ctx == nil {
+		return nil, errors.New("load parameters: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	params := make(map[string]any)
 	if p.Object != "" {
-		data, err := readParameterSource(p.Object, stdin)
+		data, err := readParameterSource(ctx, p.Object, stdin)
 		if err != nil {
 			return nil, err
 		}
 		if err := decodeJSON(data, &params); err != nil {
 			return nil, fmt.Errorf("decode --params: %w", err)
+		}
+		if params == nil {
+			return nil, fmt.Errorf("decode --params: expected a JSON object, got null")
 		}
 	}
 
@@ -47,10 +62,13 @@ func (p parameterInput) load(stdin io.Reader) (map[string]any, error) {
 	return params, nil
 }
 
-func readParameterSource(source string, stdin io.Reader) ([]byte, error) {
+func readParameterSource(ctx context.Context, source string, stdin io.Reader) ([]byte, error) {
 	switch {
 	case source == "-":
-		data, err := io.ReadAll(stdin)
+		data, err := readAllContext(ctx, stdin)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, contextErr
+		}
 		if err != nil {
 			return nil, fmt.Errorf("read parameters from stdin: %w", err)
 		}
@@ -60,6 +78,9 @@ func readParameterSource(source string, stdin io.Reader) ([]byte, error) {
 			return nil, fmt.Errorf("parameter file path is empty")
 		}
 		data, err := os.ReadFile(source[1:])
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, contextErr
+		}
 		if err != nil {
 			return nil, fmt.Errorf("read parameter file: %w", err)
 		}
@@ -69,7 +90,44 @@ func readParameterSource(source string, stdin io.Reader) ([]byte, error) {
 	}
 }
 
+type readAllResult struct {
+	data []byte
+	err  error
+}
+
+// readAllContext allows process cancellation to win over a reader that does
+// not itself accept a context. The result channel is buffered so a reader that
+// eventually unblocks can finish without retaining command-owned state.
+func readAllContext(ctx context.Context, reader io.Reader) ([]byte, error) {
+	if ctx == nil {
+		return nil, errors.New("read input: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if reader == nil {
+		return nil, errors.New("read input: nil reader")
+	}
+	result := make(chan readAllResult, 1)
+	go func() {
+		data, err := io.ReadAll(reader)
+		result <- readAllResult{data: data, err: err}
+	}()
+	select {
+	case value := <-result:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return value.data, value.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func decodeJSON(data []byte, dst any) error {
+	if err := rejectDuplicateObjectKeys(data); err != nil {
+		return err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
 	if err := decoder.Decode(dst); err != nil {
@@ -86,6 +144,67 @@ func decodeJSON(data []byte, dst any) error {
 		return err
 	}
 	return normalizeJSONNumbers(dst)
+}
+
+func rejectDuplicateObjectKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := scanJSONValue(decoder); err != nil {
+		return err
+	}
+	return nil
+}
+
+func scanJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, composite := token.(json.Delim)
+	if !composite {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		keys := make(map[string]struct{})
+		for decoder.More() {
+			rawKey, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := rawKey.(string)
+			if !ok {
+				return errors.New("invalid JSON object key")
+			}
+			if _, exists := keys[key]; exists {
+				return fmt.Errorf("duplicate object key %q", key)
+			}
+			keys[key] = struct{}{}
+			if err := scanJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for decoder.More() {
+			if err := scanJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("invalid JSON delimiter %q", delimiter)
+	}
+	closing, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	want := json.Delim('}')
+	if delimiter == '[' {
+		want = ']'
+	}
+	if closing != want {
+		return fmt.Errorf("invalid JSON delimiter %q", closing)
+	}
+	return nil
 }
 
 // normalizeJSONNumbers changes json.Number values in decoded data into int64

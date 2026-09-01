@@ -12,6 +12,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/domain"
 	"github.com/svlocks/sheets/internal/engine"
@@ -242,13 +243,17 @@ func jsonValue(value any) any {
 		value.Properties = jsonValue(value.Properties).(map[string]any)
 		return value
 	case engine.PathValue:
-		for index := range value.Nodes {
-			value.Nodes[index] = jsonValue(value.Nodes[index]).(domain.Node)
+		result := engine.PathValue{
+			Nodes:         make([]domain.Node, len(value.Nodes)),
+			Relationships: make([]domain.Edge, len(value.Relationships)),
 		}
-		for index := range value.Relationships {
-			value.Relationships[index] = jsonValue(value.Relationships[index]).(domain.Edge)
+		for index, node := range value.Nodes {
+			result.Nodes[index] = jsonValue(node).(domain.Node)
 		}
-		return value
+		for index, relationship := range value.Relationships {
+			result.Relationships[index] = jsonValue(relationship).(domain.Edge)
+		}
+		return result
 	default:
 		return value
 	}
@@ -481,7 +486,7 @@ func safeTableString(value string) string {
 }
 
 func displayWidth(value string) int {
-	return utf8.RuneCountInString(value)
+	return ansi.StringWidth(value)
 }
 
 func max(a, b int) int {
