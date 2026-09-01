@@ -208,7 +208,7 @@ func (f queryFlags) loadQuery(ctx context.Context, args []string, stdin io.Reade
 		if f.file == "-" {
 			data, err = readAllContext(ctx, stdin)
 		} else {
-			data, err = os.ReadFile(f.file)
+			data, err = readFileContext(ctx, f.file)
 		}
 		if contextErr := ctx.Err(); contextErr != nil {
 			return "", contextErr
@@ -326,7 +326,7 @@ func (e *commandEnvironment) statusCommand() *cobra.Command {
 }
 
 func (e *commandEnvironment) tuiCommand() *cobra.Command {
-	noColorDefault := os.Getenv("NO_COLOR") != ""
+	_, noColorDefault := os.LookupEnv("NO_COLOR")
 	var noColor bool
 	command := &cobra.Command{
 		Use:     "tui",

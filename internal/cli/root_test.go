@@ -269,6 +269,26 @@ func TestTUILaunchesDiscoveredProjectFromNestedDirectory(t *testing.T) {
 	}
 }
 
+func TestTUIHonorsEmptyNoColorEnvironment(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	root := initializeProject(t)
+	called := false
+	command := New(Options{TUI: func(_ context.Context, _ project.Project, _ *engine.Engine, options TUIOptions) error {
+		called = true
+		if !options.NoColor {
+			t.Fatal("NO_COLOR presence was ignored when its value was empty")
+		}
+		return nil
+	}})
+	command.SetArgs([]string{"-C", root, "tui"})
+	if err := command.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("TUI runner was not called")
+	}
+}
+
 func TestInvalidOutputFailsBeforeProjectDiscovery(t *testing.T) {
 	tests := [][]string{
 		{"history", "--output", "yaml"},

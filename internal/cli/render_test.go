@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"math"
 	"reflect"
 	"strings"
@@ -330,5 +332,63 @@ func TestRenderTableUsesTerminalCellWidths(t *testing.T) {
 		"e\u0301  | 2\n"
 	if output.String() != want {
 		t.Fatalf("table output =\n%q\nwant =\n%q", output.String(), want)
+	}
+}
+
+func TestRenderTableEscapesTerminalPresentationControlsEverywhere(t *testing.T) {
+	danger := "prefix\u0085\u202e\x1b[31msuffix"
+	batch := app.BatchResult{Results: []app.Result{{
+		Columns: []string{danger, "nested"},
+		Rows:    [][]any{{danger, map[string]any{"value": danger}}},
+	}}}
+	var output bytes.Buffer
+	if err := Render(&output, "table", batch); err != nil {
+		t.Fatal(err)
+	}
+	for _, character := range output.String() {
+		if character != '\n' && unsafeTableRune(character) {
+			t.Fatalf("table output contains unsafe terminal rune U+%04X: %q", character, output.String())
+		}
+	}
+	for _, escaped := range []string{`\u0085`, `\u202e`, `\x1b`} {
+		if !strings.Contains(output.String(), escaped) {
+			t.Errorf("table output lacks visible escape %q: %q", escaped, output.String())
+		}
+	}
+}
+
+func BenchmarkRenderTableLarge(b *testing.B) {
+	rows := make([][]any, 10_000)
+	for index := range rows {
+		rows[index] = []any{int64(index), fmt.Sprintf("row-%05d", index), strings.Repeat("value", 8)}
+	}
+	batch := app.BatchResult{Results: []app.Result{{
+		Columns: []string{"index", "name", "description"},
+		Rows:    rows,
+	}}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := Render(io.Discard, "table", batch); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRenderJSONLarge(b *testing.B) {
+	rows := make([][]any, 10_000)
+	for index := range rows {
+		rows[index] = []any{int64(index), fmt.Sprintf("row-%05d", index), strings.Repeat("value", 8)}
+	}
+	batch := app.BatchResult{Results: []app.Result{{
+		Columns: []string{"index", "name", "description"},
+		Rows:    rows,
+	}}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := Render(io.Discard, "json", batch); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

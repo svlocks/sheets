@@ -116,3 +116,14 @@ func TestParameterInputPreservesIntegerPrecisionAndRejectsOverflow(t *testing.T)
 		}
 	}
 }
+
+func TestContextReaderEnforcesAllocationBound(t *testing.T) {
+	data, err := readAllContextLimit(context.Background(), strings.NewReader("12345"), 4)
+	if !errors.Is(err, ErrInputTooLarge) || data != nil {
+		t.Fatalf("oversized read = %q, %v; want nil ErrInputTooLarge", data, err)
+	}
+	data, err = readAllContextLimit(context.Background(), strings.NewReader("1234"), 4)
+	if err != nil || string(data) != "1234" {
+		t.Fatalf("boundary read = %q, %v", data, err)
+	}
+}

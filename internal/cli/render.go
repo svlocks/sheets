@@ -1,7 +1,7 @@
 package cli
 
 import (
-	"bytes"
+	"bufio"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -65,17 +65,20 @@ func Render(w io.Writer, format string, batch app.BatchResult) error {
 		return err
 	}
 
+	// Rendering is incremental so large result sets do not require a second
+	// whole-result buffer. A fixed-size output buffer avoids turning that into
+	// one syscall for every JSON token or table row.
+	buffered := bufio.NewWriterSize(w, 64<<10)
 	switch parsed {
 	case FormatTable:
-		var output bytes.Buffer
-		err = renderTable(&output, batch)
-		if err == nil {
-			_, err = io.Copy(w, &output)
-		}
+		err = renderTable(buffered, batch)
 	case FormatJSON:
-		err = renderJSON(w, batch)
+		err = renderJSON(buffered, batch)
 	case FormatJSONL:
-		err = renderJSONL(w, batch)
+		err = renderJSONL(buffered, batch)
+	}
+	if err == nil {
+		err = buffered.Flush()
 	}
 	if err != nil {
 		return fmt.Errorf("write %s output: %w", parsed, err)
@@ -84,44 +87,99 @@ func Render(w io.Writer, format string, batch app.BatchResult) error {
 }
 
 func renderJSON(w io.Writer, batch app.BatchResult) error {
-	normalized := jsonBatch{
-		Results:  make([]jsonResult, len(batch.Results)),
-		Revision: batch.Revision,
-	}
-	for index, result := range batch.Results {
-		columns := result.Columns
-		if columns == nil {
-			columns = []string{}
+	stream := prettyJSONStream{writer: w}
+	stream.write("{\n  \"results\": [")
+	for statement, result := range batch.Results {
+		if statement == 0 {
+			stream.write("\n")
+		} else {
+			stream.write(",\n")
 		}
-		rows := make([][]any, len(result.Rows))
-		for rowIndex, row := range result.Rows {
-			rows[rowIndex] = make([]any, len(row))
-			for columnIndex, value := range row {
-				rows[rowIndex][columnIndex] = jsonValue(value)
+		stream.write("    {\n      \"columns\": [")
+		for index, column := range result.Columns {
+			if index == 0 {
+				stream.write("\n")
+			} else {
+				stream.write(",\n")
 			}
+			stream.write("        ")
+			stream.value(column, 8)
 		}
-		normalized.Results[index] = jsonResult{
-			Columns: columns,
-			Rows:    rows,
-			Summary: result.Summary,
-			Page:    result.Page,
+		if len(result.Columns) > 0 {
+			stream.write("\n      ")
 		}
+		stream.write("],\n      \"rows\": [")
+		for rowIndex, row := range result.Rows {
+			if rowIndex == 0 {
+				stream.write("\n")
+			} else {
+				stream.write(",\n")
+			}
+			stream.write("        [")
+			for valueIndex, value := range row {
+				if valueIndex == 0 {
+					stream.write("\n")
+				} else {
+					stream.write(",\n")
+				}
+				stream.write("          ")
+				stream.value(jsonValue(value), 10)
+			}
+			if len(row) > 0 {
+				stream.write("\n        ")
+			}
+			stream.write("]")
+		}
+		if len(result.Rows) > 0 {
+			stream.write("\n      ")
+		}
+		stream.write("],\n      \"summary\": ")
+		stream.value(result.Summary, 6)
+		if result.Page != nil {
+			stream.write(",\n      \"page\": ")
+			stream.value(result.Page, 6)
+		}
+		stream.write("\n    }")
 	}
-	encoder := json.NewEncoder(w)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(normalized)
+	if len(batch.Results) > 0 {
+		stream.write("\n  ")
+	}
+	stream.write("]")
+	if batch.Revision != nil {
+		stream.write(",\n  \"revision\": ")
+		stream.value(*batch.Revision, 2)
+	}
+	stream.write("\n}\n")
+	return stream.err
 }
 
-type jsonBatch struct {
-	Results  []jsonResult     `json:"results"`
-	Revision *domain.Revision `json:"revision,omitempty"`
+type prettyJSONStream struct {
+	writer io.Writer
+	err    error
 }
 
-type jsonResult struct {
-	Columns []string         `json:"columns"`
-	Rows    [][]any          `json:"rows"`
-	Summary app.Summary      `json:"summary"`
-	Page    *domain.PageInfo `json:"page,omitempty"`
+func (s *prettyJSONStream) write(value string) {
+	if s.err != nil {
+		return
+	}
+	written, err := io.WriteString(s.writer, value)
+	if err == nil && written != len(value) {
+		err = io.ErrShortWrite
+	}
+	s.err = err
+}
+
+func (s *prettyJSONStream) value(value any, indentation int) {
+	if s.err != nil {
+		return
+	}
+	encoded, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		s.err = err
+		return
+	}
+	prefix := "\n" + strings.Repeat(" ", indentation)
+	s.write(strings.ReplaceAll(string(encoded), "\n", prefix))
 }
 
 // JSONL records deliberately use a small envelope so a consumer can process
@@ -274,24 +332,18 @@ func renderTableResult(w io.Writer, result app.Result) error {
 	columns := make([]string, columnCount)
 	for index := range columns {
 		if index < len(result.Columns) && result.Columns[index] != "" {
-			columns[index] = result.Columns[index]
+			columns[index] = safeTableString(result.Columns[index])
 		} else {
 			columns[index] = fmt.Sprintf("column_%d", index+1)
 		}
 	}
-	rows := make([][]string, len(result.Rows))
 	widths := make([]int, columnCount)
 	for index, column := range columns {
 		widths[index] = displayWidth(column)
 	}
-	for rowIndex, row := range result.Rows {
-		rows[rowIndex] = make([]string, columnCount)
-		for column := range rows[rowIndex] {
-			value := "null"
-			if column < len(row) {
-				value = formatTableValue(row[column])
-			}
-			rows[rowIndex][column] = value
+	for _, row := range result.Rows {
+		for column := range columnCount {
+			value := tableCell(row, column)
 			if width := displayWidth(value); width > widths[column] {
 				widths[column] = width
 			}
@@ -308,16 +360,27 @@ func renderTableResult(w io.Writer, result app.Result) error {
 	if err := writeTableRow(w, separator, widths); err != nil {
 		return err
 	}
-	if len(rows) == 0 {
+	if len(result.Rows) == 0 {
 		_, err := io.WriteString(w, "(no rows)\n")
 		return err
 	}
-	for _, row := range rows {
-		if err := writeTableRow(w, row, widths); err != nil {
+	rowText := make([]string, columnCount)
+	for _, row := range result.Rows {
+		for column := range rowText {
+			rowText[column] = tableCell(row, column)
+		}
+		if err := writeTableRow(w, rowText, widths); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func tableCell(row []any, column int) string {
+	if column >= len(row) {
+		return "null"
+	}
+	return formatTableValue(row[column])
 }
 
 func writeTableRow(w io.Writer, cells []string, widths []int) error {
@@ -404,7 +467,7 @@ func formatTableValue(value any) string {
 	case temporal.Duration:
 		return "duration(" + value.String() + ")"
 	case time.Time:
-		return "legacy_time(" + value.Format(time.RFC3339Nano) + "[" + value.Location().String() + "])"
+		return safeTableComposite("legacy_time(" + value.Format(time.RFC3339Nano) + "[" + value.Location().String() + "])")
 	case time.Duration:
 		return "legacy_duration(" + value.String() + ")"
 	case []byte:
@@ -414,7 +477,7 @@ func formatTableValue(value any) string {
 	// JSON gives maps, lists, and domain values a compact deterministic form
 	// (encoding/json sorts string map keys).
 	if encoded, err := json.Marshal(app.JSONValue(value)); err == nil {
-		return string(encoded)
+		return safeTableComposite(string(encoded))
 	}
 	return safeTableString(fmt.Sprint(value))
 }
@@ -438,7 +501,7 @@ func safeTableString(value string) string {
 	}
 	needsQuote := strings.TrimSpace(value) != value || strings.Contains(value, "|")
 	for _, character := range value {
-		if character < 0x20 || character == 0x7f || character == utf8.RuneError {
+		if unsafeTableRune(character) || character == utf8.RuneError {
 			needsQuote = true
 			break
 		}
@@ -447,6 +510,35 @@ func safeTableString(value string) string {
 		return strconv.Quote(value)
 	}
 	return value
+}
+
+func safeTableComposite(value string) string {
+	var result strings.Builder
+	result.Grow(len(value))
+	for _, character := range value {
+		if !unsafeTableRune(character) {
+			result.WriteRune(character)
+			continue
+		}
+		switch {
+		case character <= 0xff:
+			fmt.Fprintf(&result, `\u%04x`, character)
+		case character <= 0xffff:
+			fmt.Fprintf(&result, `\u%04x`, character)
+		default:
+			fmt.Fprintf(&result, `\U%08x`, character)
+		}
+	}
+	return result.String()
+}
+
+func unsafeTableRune(character rune) bool {
+	if character < 0x20 || character == 0x7f || character >= 0x80 && character <= 0x9f {
+		return true
+	}
+	return character == 0x061c || character == 0x200e || character == 0x200f ||
+		character >= 0x202a && character <= 0x202e ||
+		character >= 0x2066 && character <= 0x2069
 }
 
 func displayWidth(value string) int {

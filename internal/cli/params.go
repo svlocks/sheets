@@ -14,6 +14,12 @@ import (
 	"github.com/svlocks/sheets/internal/app"
 )
 
+const maxInputBytes int64 = 64 << 20
+
+// ErrInputTooLarge identifies query or parameter input that exceeds the
+// explicit frontend allocation bound.
+var ErrInputTooLarge = errors.New("CLI input exceeds size limit")
+
 // parameterInput describes the two CLI parameter forms. Object accepts a JSON
 // object, @path, or - for stdin. Values contains name=JSON assignments.
 type parameterInput struct {
@@ -79,7 +85,7 @@ func readParameterSource(ctx context.Context, source string, stdin io.Reader) ([
 		if len(source) == 1 {
 			return nil, fmt.Errorf("parameter file path is empty")
 		}
-		data, err := os.ReadFile(source[1:])
+		data, err := readFileContext(ctx, source[1:])
 		if contextErr := ctx.Err(); contextErr != nil {
 			return nil, contextErr
 		}
@@ -101,6 +107,19 @@ type readAllResult struct {
 // not itself accept a context. The result channel is buffered so a reader that
 // eventually unblocks can finish without retaining command-owned state.
 func readAllContext(ctx context.Context, reader io.Reader) ([]byte, error) {
+	return readAllContextLimit(ctx, reader, maxInputBytes)
+}
+
+func readFileContext(ctx context.Context, path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	data, readErr := readAllContext(ctx, file)
+	return data, errors.Join(readErr, file.Close())
+}
+
+func readAllContextLimit(ctx context.Context, reader io.Reader, limit int64) ([]byte, error) {
 	if ctx == nil {
 		return nil, errors.New("read input: nil context")
 	}
@@ -110,9 +129,17 @@ func readAllContext(ctx context.Context, reader io.Reader) ([]byte, error) {
 	if reader == nil {
 		return nil, errors.New("read input: nil reader")
 	}
+	if limit < 0 {
+		return nil, errors.New("read input: negative size limit")
+	}
 	result := make(chan readAllResult, 1)
 	go func() {
-		data, err := io.ReadAll(reader)
+		limited := &io.LimitedReader{R: reader, N: limit + 1}
+		data, err := io.ReadAll(limited)
+		if err == nil && int64(len(data)) > limit {
+			data = nil
+			err = fmt.Errorf("%w (%d bytes)", ErrInputTooLarge, limit)
+		}
 		result <- readAllResult{data: data, err: err}
 	}()
 	select {
