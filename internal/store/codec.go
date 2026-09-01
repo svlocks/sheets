@@ -1056,17 +1056,22 @@ func (s *encodeState) encodeValue(value any, depth int) (encodedValue, error) {
 		return encodeTemporalBinary("cypher_duration", v.MarshalBinary)
 	case time.Time:
 		_, offset := v.Zone()
-		location := v.Location().String()
-		wireZone := location
-		if location == "" || location == "Local" || isCanonicalFixedZone(location) {
+		location := v.Location()
+		locationName := location.String()
+		wireZone := locationName
+		if location == time.Local || locationName == "Local" {
+			// time.Local is process configuration, not a durable zone identity.
+			// Its String value may become "UTC" or an IANA name after lazy
+			// initialization, so recognize the pointer and retain the historical
+			// Local wire tag with only the observed offset.
+			wireZone = "Local"
+			v = v.In(time.FixedZone(canonicalFixedZone(offset), offset))
+		} else if locationName == "" || isCanonicalFixedZone(locationName) {
 			// Normalize an unnamed fixed offset before MarshalBinary so the
 			// decoder never has to guess whether it was time.Local. Preserve the
-			// empty/Local Zone field for compatibility with previously stored
-			// values.
+			// empty Zone field for compatibility with previously stored values.
 			v = v.In(time.FixedZone(canonicalFixedZone(offset), offset))
-			if location == "" || isCanonicalFixedZone(location) {
-				wireZone = ""
-			}
+			wireZone = ""
 		}
 		data, err := v.MarshalBinary()
 		if err != nil {
@@ -1366,7 +1371,14 @@ func (s *decodeState) decodeValue(v encodedValue, depth int) (any, error) {
 		if err := result.UnmarshalBinary(data); err != nil {
 			return nil, fmt.Errorf("decode time: %w", err)
 		}
-		if v.Zone != "" {
+		if v.Zone == "Local" {
+			// Legacy writers persisted the process-local sentinel plus the
+			// observed offset. Local carries no portable rule identity, and its
+			// String value depends on host initialization. Reconstruct a fixed
+			// zone named Local so legacy bytes recanonicalize identically on every
+			// host instead of consulting the current process configuration.
+			result = result.In(time.FixedZone("Local", v.Offset))
+		} else if v.Zone != "" {
 			location, err := time.LoadLocation(v.Zone)
 			if err != nil {
 				location = time.FixedZone(v.Zone, v.Offset)

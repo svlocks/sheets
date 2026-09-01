@@ -281,18 +281,35 @@ func TestPropertyCodecTimeCanonicalizationAndIndexedPredicates(t *testing.T) {
 }
 
 func TestPropertyCodecAcceptsLegacyLocalTimestampEncoding(t *testing.T) {
-	// Older writers marshaled a Local time directly. On a host whose Local
-	// offset matched the value, UnmarshalBinary could later choose a different
-	// representation. The decoder must still accept that on-disk data.
+	// Older writers marshaled a Local time directly. Local.String changes from
+	// "Local" to values such as "UTC" or "America/Chicago" depending on host
+	// initialization, but neither that process configuration nor its name is a
+	// durable zone identity.
 	legacy := time.Date(2026, time.August, 31, 12, 34, 56, 123456789, time.Local)
+	canonical, err := encodeProperties(domain.Properties{"when": legacy})
+	if err != nil {
+		t.Fatalf("encode Local timestamp: %v", err)
+	}
+	var envelope encodedValue
+	if err := json.Unmarshal(canonical, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if got := envelope.Map["when"].Zone; got != "Local" {
+		t.Fatalf("Local timestamp wire zone = %q, want Local", got)
+	}
+	if _, err := decodeProperties(canonical); err != nil {
+		t.Fatalf("canonical Local timestamp decode: %v", err)
+	}
+
 	data, err := legacy.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, offset := legacy.Zone()
-	wire, err := json.Marshal(encodedValue{Kind: "map", Map: map[string]encodedValue{
+	legacyEnvelope := encodedValue{Kind: "map", Map: map[string]encodedValue{
 		"when": {Kind: "time", Text: base64.StdEncoding.EncodeToString(data), Zone: "Local", Offset: offset},
-	}})
+	}}
+	wire, err := json.Marshal(legacyEnvelope)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,6 +320,49 @@ func TestPropertyCodecAcceptsLegacyLocalTimestampEncoding(t *testing.T) {
 	got := decoded["when"].(time.Time)
 	if !got.Equal(legacy) || got.Nanosecond() != legacy.Nanosecond() {
 		t.Fatalf("legacy Local timestamp = %s, want %s", got, legacy)
+	}
+	if got.Location() == time.Local || got.Location().String() != "Local" {
+		t.Fatalf("legacy Local timestamp location = %q (%p), want stable fixed Local distinct from process Local %p",
+			got.Location(), got.Location(), time.Local)
+	}
+	_, gotOffset := got.Zone()
+	if gotOffset != offset {
+		t.Fatalf("legacy Local timestamp offset = %d, want %d", gotOffset, offset)
+	}
+	reencoded, err := encodeProperties(decoded)
+	if err != nil || !bytes.Equal(reencoded, wire) {
+		t.Fatalf("legacy Local timestamp re-encode = %s, %v; want %s", reencoded, err, wire)
+	}
+	tamperedTime := legacyEnvelope.Map["when"]
+	tamperedTime.Offset += 60
+	tampered, err := json.Marshal(encodedValue{Kind: "map", Map: map[string]encodedValue{"when": tamperedTime}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeProperties(tampered); err == nil || !strings.Contains(err.Error(), "non-canonical scalar encoding") {
+		t.Fatalf("mismatched legacy Local offset error = %v", err)
+	}
+}
+
+func TestPropertyCodecAcceptsLegacyTimeBinaryV2NegativeOffset(t *testing.T) {
+	// Go's binary time v2 stores a signed sub-minute offset remainder. Go 1.27
+	// sign-extends this final byte while older toolchains interpreted it as
+	// unsigned. The separately persisted offset makes both decoder behaviors
+	// converge on the same stable value and canonical legacy bytes.
+	wire := []byte(`{"k":"map","o":{"when":{"k":"time","s":"AgAAAA3OSmHBAAAABv/V+A==","u":-2588}}}`)
+	decoded, err := decodeProperties(wire)
+	if err != nil {
+		t.Fatalf("legacy binary-v2 timestamp decode: %v", err)
+	}
+	got := decoded["when"].(time.Time)
+	want := time.Date(1880, time.January, 2, 3, 4, 5, 6, time.FixedZone("", -(43*60+8)))
+	_, offset := got.Zone()
+	if !got.Equal(want) || got.Nanosecond() != want.Nanosecond() || offset != -(43*60+8) {
+		t.Fatalf("legacy binary-v2 timestamp = %s (offset %d), want %s", got, offset, want)
+	}
+	reencoded, err := encodeProperties(decoded)
+	if err != nil || !bytes.Equal(reencoded, wire) {
+		t.Fatalf("legacy binary-v2 timestamp re-encode = %s, %v; want %s", reencoded, err, wire)
 	}
 }
 
