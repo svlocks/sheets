@@ -188,15 +188,14 @@ func makeDSN(path string, busy time.Duration) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("resolve database path: %w", err)
 		}
-		path = (&url.URL{Scheme: "file", Path: filepath.ToSlash(absolute)}).String()
-		// Go serializes a Path that begins with a drive letter (Windows) as
-		// file://C:/x, which SQLite's URI parser reads as an "authority" and
-		// rejects. Rewrite drive-letter paths to the opaque form file:C:/x,
-		// which carries no authority. All other paths keep the authority-free
-		// file:/... form that already percent-encodes reserved characters.
-		if parsed, err := url.Parse(path); err == nil && parsed.Host != "" && len(parsed.Host) == 2 && parsed.Host[1] == ':' {
-			path = "file:" + parsed.Host + filepath.ToSlash(parsed.Path)
-		}
+		// Build an opaque file URI (file:C:/x on Windows, file:/x elsewhere)
+		// using EscapedPath, which percent-encodes reserved characters but
+		// leaves ':' and '/' literal. Go's Path+String() would turn a Windows
+		// drive letter into file://C:/x, which SQLite reads as an "authority"
+		// and rejects. Opaque form has no authority, and anchorRelativeFileURI
+		// already decodes uri.Opaque as a path.
+		escaped := (&url.URL{Path: filepath.ToSlash(absolute)}).EscapedPath()
+		path = "file:" + escaped
 	}
 	uri, err := url.Parse(path)
 	if err != nil {

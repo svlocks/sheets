@@ -99,7 +99,7 @@ func TestMakeDSNAnchorsRelativeFileURIButPreservesMemoryURI(t *testing.T) {
 
 func TestMakeDSNAnchorsWindowsDriveWithoutAuthority(t *testing.T) {
 	if runtime.GOOS != "windows" {
-		t.Skip("Windows drive-letter URI behavior is only reproducible on Windows")
+		t.Skip("drive-letter paths only exist on Windows")
 	}
 	// Drive-letter paths must not serialize as file://C:/x, which SQLite's
 	// URI parser reads as an "invalid uri authority: C:". They should use the
@@ -115,8 +115,24 @@ func TestMakeDSNAnchorsWindowsDriveWithoutAuthority(t *testing.T) {
 	if uri.Host != "" {
 		t.Fatalf("drive path produced an authority %q: %s", uri.Host, dsn)
 	}
-	if uri.Opaque == "" {
+	if !strings.HasPrefix(dsn, "file:C:/work/sheets.db") {
 		t.Fatalf("drive path did not use opaque form: %s", dsn)
+	}
+}
+
+func TestMakeDSNEncodesReservedCharacters(t *testing.T) {
+	// Reserved characters in a path must be percent-encoded so the DSN parses
+	// cleanly on every platform.
+	path := filepath.Join(t.TempDir(), "graph ?# %.db")
+	dsn, err := makeDSN(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(dsn, " ?# %") {
+		t.Fatalf("reserved characters left unencoded: %s", dsn)
+	}
+	if _, err := url.Parse(dsn); err != nil {
+		t.Fatalf("DSN did not parse: %v: %s", err, dsn)
 	}
 }
 
