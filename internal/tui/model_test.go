@@ -1,9 +1,13 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"math"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,422 +17,1116 @@ import (
 	"github.com/svlocks/sheets/internal/domain"
 )
 
+type fakeSnapshot struct {
+	nodes []domain.Node
+	edges []domain.Edge
+}
+
 type fakeBackend struct {
-	root          string
-	revision      domain.Revision
-	current       GraphSnapshot
-	snapshots     map[domain.Revision]GraphSnapshot
-	history       []domain.RevisionInfo
-	revisionErr   error
-	graphErr      error
-	historyErr    error
-	executeErr    error
-	requests      []app.ExecuteRequest
-	result        app.BatchResult
-	revisionCalls int
-	graphCalls    int
+	mu           sync.Mutex
+	root         string
+	revision     domain.Revision
+	snapshots    map[domain.Revision]fakeSnapshot
+	revisions    []domain.RevisionInfo
+	requests     []app.ExecuteRequest
+	currentReads int
+	currentErr   error
+	historyErr   error
+	executeErr   error
+	nextResult   app.BatchResult
 }
 
-var _ Backend = (*fakeBackend)(nil)
-
-func (f *fakeBackend) ProjectRoot() string { return f.root }
-
-func (f *fakeBackend) CurrentRevision(context.Context) (domain.Revision, error) {
-	f.revisionCalls++
-	return f.revision, f.revisionErr
-}
-
-func (f *fakeBackend) Graph(_ context.Context, snapshot domain.Snapshot) ([]domain.Node, []domain.Edge, error) {
-	f.graphCalls++
-	if f.graphErr != nil {
-		return nil, nil, f.graphErr
+func (b *fakeBackend) ProjectRoot() string {
+	if b.root == "" {
+		return "/tmp/example"
 	}
-	graph := f.current
-	if snapshot.Revision != nil {
-		graph = f.snapshots[*snapshot.Revision]
+	return b.root
+}
+
+func (b *fakeBackend) CurrentRevision(context.Context) (domain.Revision, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.currentReads++
+	return b.revision, b.currentErr
+}
+
+func (b *fakeBackend) Revisions(context.Context) ([]domain.RevisionInfo, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]domain.RevisionInfo(nil), b.revisions...), b.historyErr
+}
+
+func (b *fakeBackend) Execute(_ context.Context, request app.ExecuteRequest) (app.BatchResult, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.requests = append(b.requests, request)
+	if b.executeErr != nil {
+		return app.BatchResult{}, b.executeErr
 	}
-	return append([]domain.Node(nil), graph.Nodes...), append([]domain.Edge(nil), graph.Edges...), nil
+	if request.Query != snapshotQuery {
+		return b.nextResult, nil
+	}
+	revision := b.revision
+	if request.Snapshot.Revision != nil {
+		revision = *request.Snapshot.Revision
+	}
+	snapshot := b.snapshots[revision]
+	nodeRows := make([][]any, len(snapshot.nodes))
+	for index, node := range snapshot.nodes {
+		nodeRows[index] = []any{node}
+	}
+	edgeRows := make([][]any, len(snapshot.edges))
+	for index, edge := range snapshot.edges {
+		edgeRows[index] = []any{edge}
+	}
+	return app.BatchResult{Results: []app.Result{
+		{Columns: []string{"node"}, Rows: nodeRows},
+		{Columns: []string{"relationship"}, Rows: edgeRows},
+	}}, nil
 }
 
-func (f *fakeBackend) Revisions(context.Context) ([]domain.RevisionInfo, error) {
-	return append([]domain.RevisionInfo(nil), f.history...), f.historyErr
-}
-
-func (f *fakeBackend) Execute(_ context.Context, request app.ExecuteRequest) (app.BatchResult, error) {
-	f.requests = append(f.requests, request)
-	return f.result, f.executeErr
-}
-
-func testGraph() GraphSnapshot {
-	position0, position2 := int64(0), int64(2)
-	return GraphSnapshot{
-		Nodes: []domain.Node{
-			{ID: "root", Labels: []string{"Project"}, Properties: domain.Properties{"title": "Alpha"}, Body: "# Alpha\nRoot body", ValidFrom: 1},
-			{ID: "late", Labels: []string{"Task"}, Properties: domain.Properties{"title": "Late"}, ValidFrom: 2},
-			{ID: "first", Labels: []string{"Task"}, Properties: domain.Properties{"title": "First", "priority": int64(1)}, ValidFrom: 2},
-			{ID: "free", Labels: []string{"Task"}, Properties: domain.Properties{"title": "Unordered"}, ValidFrom: 2},
-			{ID: "deep", Properties: domain.Properties{"name": "Deep"}, ValidFrom: 3},
-			{ID: "orphan", Labels: []string{"Lost"}, Properties: domain.Properties{"title": "Orphan"}, ValidFrom: 3},
-		},
-		Edges: []domain.Edge{
-			{ID: "e-late", From: "root", Type: "CHILD", To: "late", Position: &position2, ValidFrom: 2},
-			{ID: "e-first", From: "root", Type: "CHILD", To: "first", Position: &position0, ValidFrom: 2},
-			{ID: "e-free", From: "root", Type: "CHILD", To: "free", ValidFrom: 2},
-			{ID: "e-deep", From: "first", Type: "CHILD", To: "deep", ValidFrom: 3},
-			{ID: "e-orphan", From: "missing", Type: "CHILD", To: "orphan", ValidFrom: 3},
-			{ID: "e-link", From: "deep", Type: "BLOCKS", To: "late", Properties: domain.Properties{"reason": "test"}, ValidFrom: 3},
-			{ID: "e-dangling", From: "gone", Type: "REF", To: "root", ValidFrom: 3},
-		},
+func task(id, title string) domain.Node {
+	return domain.Node{
+		ID: domain.EntityID(id), Labels: []string{"Task"},
+		Properties: domain.Properties{"title": title}, ValidFrom: 1,
 	}
 }
 
-func loadedModel(t *testing.T, options ...Option) (*Model, *fakeBackend) {
-	t.Helper()
-	graph := testGraph()
+func child(id, from, to string, position *int64) domain.Edge {
+	return domain.Edge{
+		ID: domain.EntityID(id), From: domain.EntityID(from), To: domain.EntityID(to),
+		Type: "CHILD", Position: position, ValidFrom: 1,
+	}
+}
+
+func TestSnapshotLoadsThroughExecutorAtPinnedRevision(t *testing.T) {
 	backend := &fakeBackend{
-		root: "/work/project", revision: 3, current: graph,
-		snapshots: map[domain.Revision]GraphSnapshot{1: {Nodes: graph.Nodes[:1]}},
-		history: []domain.RevisionInfo{
-			{Revision: 1, Time: time.Date(2026, 1, 2, 3, 4, 0, 0, time.UTC), Actor: "sam", Message: "created"},
-			{Revision: 3, Time: time.Date(2026, 1, 3, 3, 4, 0, 0, time.UTC), Actor: "agent", Message: "organized"},
+		revision: 7,
+		snapshots: map[domain.Revision]fakeSnapshot{
+			7: {nodes: []domain.Node{task("n1", "One")}, edges: []domain.Edge{{ID: "e1", From: "n1", To: "n1", Type: "RELATES_TO"}}},
 		},
 	}
-	options = append(options, WithPollInterval(0), WithNoColor(true))
-	m := NewModel(context.Background(), backend, options...)
-	load := m.loadGraphCmd(domain.Snapshot{})
-	m.Update(load())
-	history := m.loadHistoryCmd()
-	m.Update(history())
-	return m, backend
-}
-
-func TestOutlineBuildsArbitraryDepthOrderedAndOrphanRows(t *testing.T) {
-	m, _ := loadedModel(t)
-	var ids []domain.EntityID
-	depth := map[domain.EntityID]int{}
-	var orphan outlineRow
-	for _, row := range m.outlineRows {
-		ids = append(ids, row.ID)
-		depth[row.ID] = row.Depth
-		if row.ID == "orphan" {
-			orphan = row
-		}
+	loaded, err := loadSnapshot(context.Background(), backend, domain.Snapshot{})
+	if err != nil {
+		t.Fatalf("loadSnapshot() error = %v", err)
 	}
-	want := []domain.EntityID{"root", "first", "deep", "late", "free", "orphan"}
-	if strings.Join(entityStrings(ids), ",") != strings.Join(entityStrings(want), ",") {
-		t.Fatalf("outline order = %v, want %v", ids, want)
+	if loaded.revision != 7 || len(loaded.graph.nodes) != 1 || len(loaded.graph.edges) != 1 {
+		t.Fatalf("loaded = revision %d, %d nodes, %d edges", loaded.revision, len(loaded.graph.nodes), len(loaded.graph.edges))
 	}
-	if depth["deep"] != 2 {
-		t.Fatalf("deep depth = %d, want 2", depth["deep"])
-	}
-	if !orphan.Orphan || orphan.Section != "Orphans" {
-		t.Fatalf("orphan row = %+v", orphan)
-	}
-
-	m.selectNode("first")
-	m.toggleSelected(false)
-	if containsOutline(m.outlineRows, "deep") {
-		t.Fatal("collapsed child's descendant remained visible")
-	}
-	m.search.SetValue("priority")
-	m.rebuildNavigation()
-	if len(m.outlineRows) != 1 || m.outlineRows[0].ID != "first" {
-		t.Fatalf("property filter rows = %+v", m.outlineRows)
-	}
-}
-
-func TestOutlineKeepsCyclesVisible(t *testing.T) {
-	m, _ := loadedModel(t)
-	m.nodes = []domain.Node{
-		{ID: "a", Properties: domain.Properties{"title": "A"}},
-		{ID: "b", Properties: domain.Properties{"title": "B"}},
-	}
-	m.nodeByID = map[domain.EntityID]domain.Node{"a": m.nodes[0], "b": m.nodes[1]}
-	m.edges = []domain.Edge{{ID: "ab", From: "a", Type: "CHILD", To: "b"}, {ID: "ba", From: "b", Type: "CHILD", To: "a"}}
-	m.search.SetValue("")
-	m.rebuildOutline()
-	if len(m.outlineRows) != 2 {
-		t.Fatalf("cycle rows = %+v", m.outlineRows)
-	}
-	if m.outlineRows[0].Section != "Orphans / cycles" || !m.outlineRows[0].Orphan {
-		t.Fatalf("cycle component not clearly marked: %+v", m.outlineRows)
-	}
-}
-
-func TestGraphRowsIncludeEdgesAndDanglingSources(t *testing.T) {
-	m, _ := loadedModel(t)
-	rendered := m.renderGraph(100, 30)
-	for _, want := range []string{"BLOCKS→ Late", "<missing:gone> ─REF→ root", "zoom 2/3"} {
-		if !strings.Contains(rendered, want) {
-			t.Errorf("graph missing %q:\n%s", want, rendered)
-		}
-	}
-	previous := m.graphZoom
-	m.handleGraphKey("+")
-	if m.graphZoom != previous+1 {
-		t.Fatalf("zoom = %d", m.graphZoom)
-	}
-	m.handleGraphKey("l")
-	if m.graphPanX != 4 {
-		t.Fatalf("pan x = %d", m.graphPanX)
-	}
-}
-
-func TestKeyNavigationTabsAndHistoricalWriteProtection(t *testing.T) {
-	m, _ := loadedModel(t)
-	m.Update(printableKey("2"))
-	if m.tab != GraphTab {
-		t.Fatalf("tab = %v", m.tab)
-	}
-	before := m.selected
-	m.Update(printableKey("j"))
-	if m.selected == before {
-		t.Fatal("j did not move graph selection")
-	}
-	revision := domain.Revision(1)
-	load := m.loadGraphCmd(domain.Snapshot{Revision: &revision})
-	m.Update(load())
-	m.openMutation(mutationCreate)
-	if m.overlay != overlayNone || !strings.Contains(m.status, "read-only") {
-		t.Fatalf("historical mutation not blocked: overlay=%v status=%q", m.overlay, m.status)
-	}
-}
-
-func TestQueryReadAndExecRequestsAndJSONNumbers(t *testing.T) {
-	m, backend := loadedModel(t)
-	m.setTab(QueryTab)
-	m.query.SetValue("RETURN $count")
-	m.params.SetValue(`{"count": 7, "ratio": 1.5}`)
-	cmd := m.handleQueryKey(ctrlKey('r'))
-	if cmd == nil {
-		t.Fatal("read query produced no command")
-	}
-	m.Update(cmd())
-	if len(backend.requests) != 1 || !backend.requests[0].ReadOnly {
-		t.Fatalf("request = %+v", backend.requests)
-	}
-	if _, ok := backend.requests[0].Params["count"].(int64); !ok {
-		t.Fatalf("integer param type = %T", backend.requests[0].Params["count"])
-	}
-
-	m.params.SetValue(`{"broken":`)
-	if cmd := m.handleQueryKey(ctrlKey('r')); cmd != nil || m.queryErr == nil {
-		t.Fatalf("invalid JSON command=%v error=%v", cmd, m.queryErr)
-	}
-
-	revision := domain.Revision(1)
-	m.snapshot = domain.Snapshot{Revision: &revision}
-	m.params.SetValue("{}")
-	if cmd := m.handleQueryKey(ctrlKey('x')); cmd != nil || !strings.Contains(m.queryErr.Error(), "read-only") {
-		t.Fatalf("historical exec command=%v error=%v", cmd, m.queryErr)
-	}
-}
-
-func TestMutationFormsExecuteCypherOnly(t *testing.T) {
-	m, backend := loadedModel(t)
-	m.selectNode("first")
-	m.openMutation(mutationEdit)
-	m.mutationInput.SetValue(`{"labels":["Task","Needs Review"],"properties":{"title":"Changed","rank":2},"body":"# Done"}`)
-	cmd := m.submitMutation()
-	if cmd == nil {
-		t.Fatalf("edit error: %v", m.mutationErr)
-	}
-	m.Update(cmd())
-	if len(backend.requests) != 1 {
-		t.Fatalf("requests = %d", len(backend.requests))
+	if backend.currentReads != 1 || len(backend.requests) != 1 {
+		t.Fatalf("backend calls = %d token reads, %d executor calls", backend.currentReads, len(backend.requests))
 	}
 	request := backend.requests[0]
-	for _, fragment := range []string{"MATCH (n)", "elementId(n) = $id", "SET n = $properties", "REMOVE n:Task", "SET n:Task:`Needs Review`"} {
-		if !strings.Contains(request.Query, fragment) {
-			t.Errorf("edit query missing %q: %s", fragment, request.Query)
-		}
-	}
-	if request.ReadOnly || request.Actor != "tui" {
-		t.Fatalf("mutation metadata = %+v", request)
-	}
-	if _, ok := request.Params["properties"].(domain.Properties)["rank"].(int64); !ok {
-		t.Fatalf("rank type = %T", request.Params["properties"].(domain.Properties)["rank"])
-	}
-
-	m.openMutation(mutationReparent)
-	m.mutationInput.SetValue(`{"parent_id":"root","position":4}`)
-	cmd = m.submitMutation()
-	cmd()
-	if got := backend.requests[1].Query; !strings.Contains(got, "DELETE old") || !strings.Contains(got, "CREATE (p)-[:CHILD {position: $position}]->(n)") {
-		t.Fatalf("reparent query = %s", got)
-	}
-
-	m.openMutation(mutationDelete)
-	cmd = m.submitMutation()
-	cmd()
-	if got := backend.requests[2].Query; got != "MATCH (n) WHERE elementId(n) = $id DETACH DELETE n" {
-		t.Fatalf("delete query = %s", got)
+	if !request.ReadOnly || request.Query != snapshotQuery || request.Snapshot.Revision == nil || *request.Snapshot.Revision != 7 {
+		t.Fatalf("snapshot executor request = %#v", request)
 	}
 }
 
-func TestHistoryLoadsWholeSnapshotAndReturnsLive(t *testing.T) {
-	m, backend := loadedModel(t)
-	m.setTab(HistoryTab)
-	// History is sorted newest first; choose revision 1.
-	m.historyIndex = 1
-	cmd := m.openSelectedRevision()
-	m.Update(cmd())
-	if m.snapshot.IsCurrent() || snapshotRevision(m.snapshot) != 1 || len(m.nodes) != 1 {
-		t.Fatalf("snapshot=%+v nodes=%d", m.snapshot, len(m.nodes))
+func TestHierarchyUsesOrderedThenUnorderedChildrenAtArbitraryDepth(t *testing.T) {
+	zero, two := int64(0), int64(2)
+	graph := newGraphState(
+		[]domain.Node{task("root", "Root"), task("a", "Alpha"), task("b", "Beta"), task("c", "Charlie"), task("deep", "Deep")},
+		[]domain.Edge{child("e-c", "root", "c", nil), child("e-b", "root", "b", &two), child("e-a", "root", "a", &zero), child("e-deep", "a", "deep", &zero)},
+	)
+	work := newWorkModel(makeStyles(true, true), true)
+	work.setGraph(graph)
+	view := work.view()
+	alpha, beta, charlie, deep := strings.Index(view, "Alpha"), strings.Index(view, "Beta"), strings.Index(view, "Charlie"), strings.Index(view, "Deep")
+	if alpha < 0 || alpha >= beta || beta >= charlie {
+		t.Fatalf("ordered/unordered hierarchy rendered in wrong order:\n%s", view)
 	}
-	if backend.graphCalls < 2 {
-		t.Fatalf("graph calls = %d", backend.graphCalls)
+	if deep < alpha || graph.parent["deep"].From != "a" {
+		t.Fatalf("deep child was not retained:\n%s", view)
 	}
-	view := ansi.Strip(m.View().Content)
-	if !strings.Contains(view, "HISTORICAL · r1 · READ-ONLY") {
+	if !work.selectID("deep") || work.selected != "deep" {
+		t.Fatalf("selectID(deep) selected %q", work.selected)
+	}
+}
+
+func TestPollDoesNotReloadUntilRevisionTokenChanges(t *testing.T) {
+	backend := &fakeBackend{revision: 4, snapshots: map[domain.Revision]fakeSnapshot{4: {}}}
+	model := NewModel(context.Background(), backend, WithPollInterval(0), WithNoColor(true))
+	model.liveRevision = 4
+	initialSerial := model.loadSeq
+	if cmd := model.applyRevisionChecked(revisionCheckedMsg{revision: 4}); cmd != nil {
+		// A disabled poll interval produces a nil Batch command.
+		_ = cmd
+	}
+	if model.loadSeq != initialSerial || len(backend.requests) != 0 {
+		t.Fatalf("unchanged token started graph load: serial %d -> %d, requests %d", initialSerial, model.loadSeq, len(backend.requests))
+	}
+	_ = model.applyRevisionChecked(revisionCheckedMsg{revision: 5})
+	if model.loadSeq != initialSerial+1 || !model.loadingGraph {
+		t.Fatalf("changed token did not schedule load: serial %d, loading %v", model.loadSeq, model.loadingGraph)
+	}
+	if len(backend.requests) != 0 {
+		t.Fatal("async graph query ran inside Update instead of its command")
+	}
+}
+
+func TestStaleSnapshotResultIsIgnored(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.loadSeq = 2
+	oldGraph := newGraphState([]domain.Node{task("old", "Old")}, nil)
+	_ = model.applySnapshotLoaded(snapshotLoadedMsg{serial: 1, loaded: snapshotLoad{graph: oldGraph, revision: 1}})
+	if len(model.graph.nodes) != 0 {
+		t.Fatal("stale snapshot mutated the model")
+	}
+	newGraph := newGraphState([]domain.Node{task("new", "New")}, nil)
+	_ = model.applySnapshotLoaded(snapshotLoadedMsg{serial: 2, loaded: snapshotLoad{graph: newGraph, revision: 2}})
+	if _, ok := model.graph.nodeByID["new"]; !ok {
+		t.Fatal("current snapshot was not applied")
+	}
+}
+
+func TestHistoricalModeIsProminentAndBlocksMutationForms(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	revision := domain.Revision(3)
+	model.loadSeq = 1
+	graph := newGraphState([]domain.Node{task("n1", "One")}, nil)
+	_ = model.applySnapshotLoaded(snapshotLoadedMsg{serial: 1, snapshot: domain.Snapshot{Revision: &revision}, loaded: snapshotLoad{graph: graph, revision: revision}})
+	_ = model.openCreateForm()
+	if model.overlay.kind == overlayForm {
+		t.Fatal("historical mode opened a mutation form")
+	}
+	if !strings.Contains(model.notice.text, "read-only") {
+		t.Fatalf("notice = %q", model.notice.text)
+	}
+	view := model.View().Content
+	if !strings.Contains(view, "READ-ONLY HISTORY") || !strings.Contains(view, "return to Live") {
 		t.Fatalf("historical banner missing:\n%s", view)
 	}
-	cmd = m.returnLive()
-	m.Update(cmd())
-	if !m.snapshot.IsCurrent() || len(m.nodes) != len(backend.current.Nodes) {
-		t.Fatalf("did not return live: snapshot=%+v nodes=%d", m.snapshot, len(m.nodes))
+}
+
+func TestCreateFormBuildsParameterizedCypher(t *testing.T) {
+	graph := newGraphState([]domain.Node{task("parent", "Parent")}, nil)
+	form := newCreateNodeForm(1, graph, "parent", 80, 24, true, true)
+	data := form.data.(*nodeFormData)
+	data.title = "Ship it"
+	data.labels = "Task, Needs Review"
+	data.properties = `{"priority": 2, "nested": {"ok": true}}`
+	data.position = "4"
+	data.body = "# Notes"
+	request, err := form.request()
+	if err != nil {
+		t.Fatalf("request() error = %v", err)
+	}
+	if strings.Contains(request.Query, "Ship it") || !strings.Contains(request.Query, "$properties") || !strings.Contains(request.Query, "[:CHILD {position: $position}]") {
+		t.Fatalf("query was not safely parameterized: %s", request.Query)
+	}
+	if got := request.Params["position"]; got != int64(4) {
+		t.Fatalf("position param = %#v", got)
+	}
+	properties := request.Params["properties"].(domain.Properties)
+	if properties["title"] != "Ship it" || properties["priority"] != int64(2) {
+		t.Fatalf("properties = %#v", properties)
+	}
+	if !strings.Contains(request.Query, ":`Needs Review`") {
+		t.Fatalf("label was not escaped: %s", request.Query)
 	}
 }
 
-func TestResponsiveRenderHasExactBoundsAndInspector(t *testing.T) {
-	m, _ := loadedModel(t)
-	for _, size := range []tea.WindowSizeMsg{{Width: 132, Height: 36}, {Width: 64, Height: 20}, {Width: 30, Height: 10}} {
-		m.Update(size)
-		view := ansi.Strip(m.View().Content)
+func TestPropertyFormsPreserveTypedNestedValuesAndCLIIntegerRules(t *testing.T) {
+	zone := time.FixedZone("Audit/Offset", -6*60*60)
+	when := time.Date(2026, time.August, 31, 12, 34, 56, 789, zone)
+	node := task("typed", "Typed")
+	node.Properties["finite_float"] = float64(1)
+	node.Properties["nan"] = math.NaN()
+	node.Properties["when"] = when
+	node.Properties["duration"] = 90 * time.Minute
+	node.Properties["bytes"] = []byte{0, 1, 2, 255}
+	node.Properties["position"] = "node-local-position"
+	node.Properties["nested"] = map[string]any{"values": []any{math.Inf(1), when}}
+
+	form := newEditNodeForm(1, node, 80, 24, true, true)
+	data := form.data.(*nodeFormData)
+	if !strings.Contains(data.properties, `"$float": "+Infinity"`) || !strings.Contains(data.properties, `"$float": "NaN"`) {
+		t.Fatalf("editable JSON lost non-finite values:\n%s", data.properties)
+	}
+	request, err := form.request()
+	if err != nil {
+		t.Fatalf("typed edit request error = %v", err)
+	}
+	properties := request.Params["properties"].(domain.Properties)
+	if _, exists := properties["position"]; exists || request.Params["node_position"] != "node-local-position" || !strings.Contains(request.Query, "n.position = $node_position") {
+		t.Fatalf("node position was not preserved explicitly: query=%s params=%#v", request.Query, request.Params)
+	}
+	if value, ok := properties["finite_float"].(float64); !ok || value != 1 {
+		t.Fatalf("finite float changed type/value: %#v (%T)", properties["finite_float"], properties["finite_float"])
+	}
+	if value, ok := properties["nan"].(float64); !ok || !math.IsNaN(value) {
+		t.Fatalf("NaN did not round-trip: %#v", properties["nan"])
+	}
+	if value, ok := properties["when"].(time.Time); !ok || !value.Equal(when) || value.Location().String() != when.Location().String() {
+		t.Fatalf("temporal value did not round-trip: %#v", properties["when"])
+	}
+	if value, ok := properties["duration"].(time.Duration); !ok || value != 90*time.Minute {
+		t.Fatalf("duration did not round-trip: %#v (%T)", properties["duration"], properties["duration"])
+	}
+	if value, ok := properties["bytes"].([]byte); !ok || !bytes.Equal(value, []byte{0, 1, 2, 255}) {
+		t.Fatalf("bytes did not round-trip: %#v (%T)", properties["bytes"], properties["bytes"])
+	}
+	nested := properties["nested"].(domain.Properties)["values"].([]any)
+	if value, ok := nested[0].(float64); !ok || !math.IsInf(value, 1) {
+		t.Fatalf("nested infinity did not round-trip: %#v", nested)
+	}
+	if _, ok := nested[1].(time.Time); !ok {
+		t.Fatalf("nested temporal value changed type: %#v", nested[1])
+	}
+
+	edge := domain.Edge{ID: "edge", From: "a", To: "b", Type: "REL", Properties: domain.Properties{"body": "ordinary edge property"}}
+	edgeForm := newEditRelationshipForm(2, edge, 80, 24, true, true)
+	edgeRequest, err := edgeForm.request()
+	if err != nil {
+		t.Fatalf("edge body request error = %v", err)
+	}
+	if edgeRequest.Params["relationship_body"] != "ordinary edge property" || !strings.Contains(edgeRequest.Query, "r.body = $relationship_body") {
+		t.Fatalf("edge body was silently dropped: query=%s params=%#v", edgeRequest.Query, edgeRequest.Params)
+	}
+
+	if _, err := decodeProperties(`{"value":9223372036854775808}`); err == nil || !strings.Contains(err.Error(), "signed 64-bit") {
+		t.Fatalf("overflowing JSON integer error = %v", err)
+	}
+	if _, err := decodeNodeProperties(`{"body":"ambiguous"}`); err == nil {
+		t.Fatal("node properties accepted reserved body")
+	}
+	if _, err := decodeRelationshipProperties(`{"position":1}`); err == nil {
+		t.Fatal("relationship properties accepted reserved position")
+	}
+	params, err := decodeParams(`{"value":{"$float":"NaN"}}`)
+	if err != nil {
+		t.Fatalf("decodeParams() error = %v", err)
+	}
+	if _, ok := params["value"].(map[string]any); !ok {
+		t.Fatalf("TUI console reinterpreted plain CLI JSON parameter: %#v", params["value"])
+	}
+}
+
+func TestMoveAndRelationshipRequestsPreserveGraphSemantics(t *testing.T) {
+	position := int64(1)
+	graph := newGraphState(
+		[]domain.Node{task("a", "A"), task("b", "B"), task("c", "C")},
+		[]domain.Edge{child("old", "a", "b", &position)},
+	)
+	move := newMoveNodeForm(1, graph, graph.nodeByID["b"], 80, 24, true, true)
+	data := move.data.(*moveFormData)
+	data.parent = "c"
+	data.position = ""
+	request, err := move.request()
+	if err != nil {
+		t.Fatalf("move request error = %v", err)
+	}
+	if !strings.Contains(request.Query, "DELETE old") || !strings.Contains(request.Query, "CREATE (p)-[:CHILD]->(n)") {
+		t.Fatalf("move is not atomic: %s", request.Query)
+	}
+	parentMatch, deleteOld := strings.Index(request.Query, "MATCH (p)"), strings.Index(request.Query, "DELETE old")
+	if parentMatch < 0 || deleteOld < 0 || parentMatch > deleteOld {
+		t.Fatalf("move deletes before resolving its destination: %s", request.Query)
+	}
+
+	unchanged := newMoveNodeForm(2, graph, graph.nodeByID["b"], 80, 24, true, true)
+	unchangedRequest, err := unchanged.request()
+	if err != nil {
+		t.Fatalf("unchanged move request error = %v", err)
+	}
+	if strings.Contains(unchangedRequest.Query, "DELETE") || strings.Contains(unchangedRequest.Query, "CREATE") || strings.Contains(unchangedRequest.Query, " SET ") {
+		t.Fatalf("unchanged move would create a revision: %s", unchangedRequest.Query)
+	}
+	reorder := newMoveNodeForm(3, graph, graph.nodeByID["b"], 80, 24, true, true)
+	reorder.data.(*moveFormData).position = ""
+	reorderRequest, err := reorder.request()
+	if err != nil {
+		t.Fatalf("unordered move request error = %v", err)
+	}
+	if !strings.Contains(reorderRequest.Query, "SET old.position = $position") || reorderRequest.Params["position"] != nil {
+		t.Fatalf("ordered-to-unordered move = %s %#v", reorderRequest.Query, reorderRequest.Params)
+	}
+
+	connect := newConnectionForm(2, graph, "a", 80, 24, true, true)
+	connection := connect.data.(*connectionFormData)
+	connection.to = "c"
+	connection.typeName = "BLOCKED BY"
+	connection.properties = `{"reason":"waiting"}`
+	relationshipRequest, err := connect.request()
+	if err != nil {
+		t.Fatalf("relationship request error = %v", err)
+	}
+	if !strings.Contains(relationshipRequest.Query, "[r:`BLOCKED BY`]") {
+		t.Fatalf("relationship type was not escaped: %s", relationshipRequest.Query)
+	}
+	connection.typeName = "child"
+	if _, err := connect.request(); err == nil {
+		t.Fatal("generic relationship form accepted CHILD")
+	}
+}
+
+func TestDestructiveFormsRequireConfirmation(t *testing.T) {
+	graph := newGraphState([]domain.Node{task("n", "Node")}, nil)
+	form := newDeleteNodeForm(1, graph, graph.nodeByID["n"], 80, 20, true, true)
+	if _, err := form.request(); err == nil {
+		t.Fatal("delete request succeeded without confirmation")
+	}
+	form.data.(*confirmFormData).confirmed = true
+	request, err := form.request()
+	if err != nil {
+		t.Fatalf("confirmed request error = %v", err)
+	}
+	if request.Query != "MATCH (n) WHERE elementId(n) = $id DETACH DELETE n" {
+		t.Fatalf("delete query = %q", request.Query)
+	}
+}
+
+func TestQueryReadRunsDirectlyButWriteRequiresConfirmation(t *testing.T) {
+	backend := &fakeBackend{}
+	model := NewModel(context.Background(), backend, WithPollInterval(0), WithNoColor(true))
+	model.workspace = QueryWorkspace
+	model.query.cypher.SetValue("RETURN $value")
+	model.query.params.SetValue(`{"value": 1}`)
+	cmd := model.runQuery(true)
+	if cmd == nil || model.pending == nil || !model.pending.request.ReadOnly {
+		t.Fatal("read-only query was not scheduled directly")
+	}
+	if model.pending.request.Params["value"] != int64(1) {
+		t.Fatalf("params = %#v", model.pending.request.Params)
+	}
+	model.executing = false
+	model.pending = nil
+	_ = model.runQuery(false)
+	if model.overlay.kind != overlayForm || model.form == nil || model.form.purpose != formExecuteQuery {
+		t.Fatal("write-capable query did not open a confirmation form")
+	}
+	if len(backend.requests) != 0 {
+		t.Fatal("query executed before its asynchronous command / confirmation")
+	}
+}
+
+func TestFocusAndBackBehavior(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	_, _ = model.Update(keyPress("tab"))
+	if model.focus != focusInspector {
+		t.Fatalf("Tab focus = %v", model.focus)
+	}
+	_, _ = model.Update(keyPress("esc"))
+	if model.focus != focusPrimary {
+		t.Fatalf("Esc focus = %v", model.focus)
+	}
+	_ = model.openCreateForm()
+	if model.overlay.kind != overlayForm {
+		t.Fatal("create form did not open")
+	}
+	_, _ = model.Update(keyPress("esc"))
+	if model.overlay.kind != overlayNone || model.form != nil {
+		t.Fatal("Esc did not cancel visible form")
+	}
+}
+
+func TestResponsiveNoColorRenderingAndTinyState(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{root: "/tmp/demo"}, WithPollInterval(0), WithNoColor(true))
+	model.loadSeq = 1
+	graph := newGraphState([]domain.Node{task("n", "A task")}, nil)
+	_ = model.applySnapshotLoaded(snapshotLoadedMsg{serial: 1, loaded: snapshotLoad{graph: graph, revision: 1}})
+	for _, size := range []struct{ width, height int }{{60, 18}, {140, 40}} {
+		_, _ = model.Update(tea.WindowSizeMsg{Width: size.width, Height: size.height})
+		view := model.View().Content
+		if containsANSIColor(view) {
+			t.Fatalf("NO_COLOR output contains ANSI color at %dx%d: %q", size.width, size.height, view)
+		}
 		lines := strings.Split(view, "\n")
-		if len(lines) != size.Height {
-			t.Errorf("%dx%d line count = %d", size.Width, size.Height, len(lines))
+		if len(lines) != size.height {
+			t.Fatalf("rendered %d lines at height %d", len(lines), size.height)
 		}
-		for lineNo, line := range lines {
-			if ansi.StringWidth(line) != size.Width {
-				t.Fatalf("%dx%d line %d width = %d: %q", size.Width, size.Height, lineNo, ansi.StringWidth(line), line)
+		for lineNumber, line := range lines {
+			if ansi.StringWidth(line) != size.width {
+				t.Fatalf("line %d width = %d, want %d: %q", lineNumber, ansi.StringWidth(line), size.width, line)
 			}
 		}
-		if size.Width >= 46 {
-			if !strings.Contains(view, "Outline") || !strings.Contains(view, "Graph") || !strings.Contains(view, "Query") || !strings.Contains(view, "History") {
-				t.Fatalf("tabs missing at %dx%d", size.Width, size.Height)
-			}
-		} else if !strings.Contains(view, "1 O") || !strings.Contains(view, "4 H") {
-			t.Fatalf("compact tabs missing at %dx%d", size.Width, size.Height)
+	}
+	for workspace := WorkWorkspace; workspace <= TimelineWorkspace; workspace++ {
+		model.workspace = workspace
+		_ = model.layoutComponents()
+		if view := model.View().Content; containsANSIColor(view) {
+			t.Fatalf("NO_COLOR workspace %s contains ANSI color: %q", workspace, view)
+		} else if workspace == QueryWorkspace && strings.Contains(view, "\n|…") {
+			t.Fatalf("query layout introduced truncation-only rows:\n%s", view)
 		}
-		if size.Width >= 110 && !strings.Contains(view, "Inspector") {
-			t.Fatalf("wide inspector missing:\n%s", view)
+	}
+	model.workspace = WorkWorkspace
+	_ = model.openCreateForm()
+	if view := model.View().Content; containsANSIColor(view) {
+		t.Fatalf("NO_COLOR Huh form contains ANSI color: %q", view)
+	}
+	model.form = nil
+	model.overlay.kind = overlayNone
+	_, _ = model.Update(tea.WindowSizeMsg{Width: 32, Height: 8})
+	if view := model.View().Content; !strings.Contains(view, "Resize") {
+		t.Fatalf("tiny state missing resize guidance:\n%s", view)
+	}
+}
+
+var ansiColorPattern = regexp.MustCompile(`\x1b\[(?:3[0-9]|4[0-9]|9[0-7]|10[0-7]|38;|48;)`)
+
+func containsANSIColor(value string) bool { return ansiColorPattern.MatchString(value) }
+
+func TestNoColorActiveWorkspaceHasStructuralMarker(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	header := strings.Split(model.renderHeader(), "\n")[0]
+	if !strings.Contains(header, "[F1 Work]") {
+		t.Fatalf("active no-color tab is not distinguishable: %q", header)
+	}
+}
+
+func TestFinderUsesBubblesFilteringAndOpensSelectedNode(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.graph = newGraphState([]domain.Node{task("a", "Alpha"), task("b", "Beta")}, nil)
+	model.work.setGraph(model.graph)
+	_ = model.openFinder()
+	if !model.overlay.picker.filtering() {
+		t.Fatal("finder did not start in Bubbles filtering state")
+	}
+	_, _ = model.Update(keyPress("b"))
+	if model.overlay.picker.list.FilterInput.Value() != "b" {
+		t.Fatalf("finder filter = %q", model.overlay.picker.list.FilterInput.Value())
+	}
+}
+
+func TestDecliningConfirmationClosesFormWithoutExecution(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	graph := newGraphState([]domain.Node{task("n", "Node")}, nil)
+	model.graph = graph
+	model.work.setGraph(graph)
+	model.formSeq = 1
+	model.form = newDeleteNodeForm(1, graph, graph.nodeByID["n"], 80, 20, true, true)
+	model.overlay.kind = overlayForm
+	_ = model.submitForm(formSubmittedMsg{serial: 1})
+	if model.form != nil || model.overlay.kind != overlayNone || model.executing {
+		t.Fatal("declined confirmation did not cancel cleanly")
+	}
+}
+
+func TestSelectedRowPreservesDuplicateColumnNames(t *testing.T) {
+	model := newQueryModel(makeStyles(true, true), true)
+	model.setResult(app.BatchResult{Results: []app.Result{{
+		Columns: []string{"value", "value"}, Rows: [][]any{{"first", "second"}},
+	}}}, nil)
+	detail := model.rowViewport.GetContent()
+	if !strings.Contains(detail, "1. value") || !strings.Contains(detail, "first") || !strings.Contains(detail, "2. value") || !strings.Contains(detail, "second") {
+		t.Fatalf("duplicate columns were not preserved:\n%s", detail)
+	}
+}
+
+func TestEmptyAndErrorStatesAreActionable(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.loadSeq = 1
+	_ = model.applySnapshotLoaded(snapshotLoadedMsg{serial: 1, loaded: snapshotLoad{graph: newGraphState(nil, nil)}})
+	if view := model.View().Content; !strings.Contains(view, "No work items yet") || !strings.Contains(view, "create") {
+		t.Fatalf("empty state is not actionable:\n%s", view)
+	}
+	model.loadSeq = 2
+	_ = model.applySnapshotLoaded(snapshotLoadedMsg{serial: 2, err: errors.New("database unavailable")})
+	if !strings.Contains(model.notice.text, "database unavailable") {
+		t.Fatalf("load error notice = %q", model.notice.text)
+	}
+}
+
+func TestMouseCanSwitchVisibleWorkspaceTabs(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	start := ansi.StringWidth(model.headerPrefix())
+	firstWidth := ansi.StringWidth(model.renderTab(WorkWorkspace))
+	click := tea.MouseClickMsg{X: start + firstWidth + 1, Y: 0, Button: tea.MouseLeft}
+	_, _ = model.Update(click)
+	if model.workspace != RelationshipsWorkspace {
+		t.Fatalf("mouse selected workspace %v", model.workspace)
+	}
+}
+
+func TestQueryResultKeepsFullSelectedRowInViewport(t *testing.T) {
+	model := newQueryModel(makeStyles(true, true), true)
+	model.setSize(100, 24)
+	model.setResult(app.BatchResult{Results: []app.Result{{
+		Columns: []string{"name", "payload"},
+		Rows:    [][]any{{"first", map[string]any{"long": strings.Repeat("x", 100)}}},
+	}}}, nil)
+	if !strings.Contains(model.rowViewport.GetContent(), strings.Repeat("x", 100)) {
+		t.Fatalf("selected row detail was truncated: %s", model.rowViewport.GetContent())
+	}
+	if len(model.table.Columns()) != 2 {
+		t.Fatalf("table columns = %#v", model.table.Columns())
+	}
+}
+
+func TestInspectorRejectsStaleRender(t *testing.T) {
+	inspector := newInspectorModel(true, true)
+	first := inspector.clear("first")
+	firstMessage := first().(inspectorRenderedMsg)
+	second := inspector.clear("second")
+	secondMessage := second().(inspectorRenderedMsg)
+	inspector.apply(firstMessage)
+	if inspector.rendered != "" {
+		t.Fatal("stale inspector render was applied")
+	}
+	inspector.apply(secondMessage)
+	if !strings.Contains(inspector.rendered, "second") {
+		t.Fatalf("current inspector render = %q", inspector.rendered)
+	}
+}
+
+func keyPress(value string) tea.KeyPressMsg {
+	switch value {
+	case "tab":
+		return tea.KeyPressMsg{Code: tea.KeyTab}
+	case "esc":
+		return tea.KeyPressMsg{Code: tea.KeyEscape}
+	case "enter":
+		return tea.KeyPressMsg{Code: tea.KeyEnter}
+	case "ctrl+r":
+		return tea.KeyPressMsg{Code: 'r', Mod: tea.ModCtrl}
+	case "ctrl+pgup":
+		return tea.KeyPressMsg{Code: tea.KeyPgUp, Mod: tea.ModCtrl}
+	case "ctrl+pgdown":
+		return tea.KeyPressMsg{Code: tea.KeyPgDown, Mod: tea.ModCtrl}
+	case "f1":
+		return tea.KeyPressMsg{Code: tea.KeyF1}
+	case "f2":
+		return tea.KeyPressMsg{Code: tea.KeyF2}
+	case "f3":
+		return tea.KeyPressMsg{Code: tea.KeyF3}
+	case "f4":
+		return tea.KeyPressMsg{Code: tea.KeyF4}
+	case "f10":
+		return tea.KeyPressMsg{Code: tea.KeyF10}
+	default:
+		return tea.KeyPressMsg{Code: []rune(value)[0], Text: value}
+	}
+}
+
+func lastCommandMessage(t *testing.T, cmd tea.Cmd) tea.Msg {
+	t.Helper()
+	if cmd == nil {
+		t.Fatal("command is nil")
+	}
+	msg := cmd()
+	for {
+		batch, ok := msg.(tea.BatchMsg)
+		if !ok {
+			return msg
+		}
+		if len(batch) == 0 {
+			t.Fatal("command returned an empty batch")
+		}
+		msg = batch[len(batch)-1]()
+	}
+}
+
+func TestAsyncListFiltersAreRoutedToTheirOrigin(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.workspace = RelationshipsWorkspace
+	model.graph = newGraphState(
+		[]domain.Node{task("a", "Alpha"), task("b", "Beta"), task("c", "Charlie")},
+		[]domain.Edge{
+			{ID: "z-blocks", From: "a", To: "b", Type: "BLOCKS"},
+			{ID: "a-child", From: "a", To: "c", Type: "CHILD"},
+		},
+	)
+	_ = model.relationships.setGraph(model.graph)
+	_ = model.refreshInspector()
+	_, _ = model.Update(keyPress("/"))
+	var cmd tea.Cmd
+	for _, value := range []string{"B", "L", "O", "C", "K"} {
+		_, cmd = model.Update(keyPress(value))
+	}
+	filterMsg := lastCommandMessage(t, cmd)
+	if _, ok := filterMsg.(listFilterMatchesMsg); !ok {
+		t.Fatalf("filter command returned %T, want scoped list message", filterMsg)
+	}
+	_, _ = model.Update(filterMsg)
+	_, _ = model.Update(keyPress("enter"))
+	visible := model.relationships.list.VisibleItems()
+	if len(visible) != 1 || visible[0].(relationshipItem).edge.ID != "z-blocks" {
+		t.Fatalf("filtered relationships = %#v", visible)
+	}
+	if !strings.Contains(model.inspector.markdown, "# BLOCKS") {
+		t.Fatalf("filter selection left stale inspector content: %q", model.inspector.markdown)
+	}
+}
+
+func TestCommandPaletteFiltersAndActivatesWithOneEnter(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	_ = model.openCommands()
+	var cmd tea.Cmd
+	for _, value := range []string{"t", "i", "m", "e", "l", "i", "n", "e"} {
+		_, cmd = model.Update(keyPress(value))
+	}
+	_, _ = model.Update(lastCommandMessage(t, cmd))
+	_, _ = model.Update(keyPress("enter"))
+	if model.workspace != TimelineWorkspace || model.overlay.kind != overlayNone {
+		t.Fatalf("palette activation left workspace=%v overlay=%v", model.workspace, model.overlay.kind)
+	}
+}
+
+func TestPickerEscapeClosesImmediatelyWhileFiltering(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	_ = model.openCommands()
+	_, _ = model.Update(keyPress("x"))
+	_, _ = model.Update(keyPress("esc"))
+	if model.overlay.kind != overlayNone {
+		t.Fatalf("Esc left picker overlay %v open", model.overlay.kind)
+	}
+}
+
+func TestTimelineDefaultsToNewestRevisionInEitherStartupOrder(t *testing.T) {
+	revisions := []domain.RevisionInfo{{Revision: 1}, {Revision: 2}, {Revision: 3}}
+	graph := newGraphState([]domain.Node{task("n", "Current")}, nil)
+
+	snapshotFirst := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	snapshotFirst.loadSeq = 1
+	_ = snapshotFirst.applySnapshotLoaded(snapshotLoadedMsg{serial: 1, loaded: snapshotLoad{graph: graph, revision: 3}})
+	if len(snapshotFirst.timeline.list.Items()) != 0 {
+		t.Fatal("snapshot populated a provisional revision-0 timeline before history was ready")
+	}
+	snapshotFirst.historySeq = 1
+	_ = snapshotFirst.applyHistoryLoaded(historyLoadedMsg{serial: 1, revisions: revisions})
+	if selected, _ := snapshotFirst.timeline.selectedRevision(); selected != 3 {
+		t.Fatalf("snapshot-first selection = %d, want live revision 3", selected)
+	}
+
+	historyFirst := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	historyFirst.historySeq = 1
+	_ = historyFirst.applyHistoryLoaded(historyLoadedMsg{serial: 1, revisions: revisions})
+	historyFirst.loadSeq = 1
+	_ = historyFirst.applySnapshotLoaded(snapshotLoadedMsg{serial: 1, loaded: snapshotLoad{graph: graph, revision: 3}})
+	if selected, _ := historyFirst.timeline.selectedRevision(); selected != 3 {
+		t.Fatalf("history-first selection = %d, want live revision 3", selected)
+	}
+}
+
+func TestCompactQueryKeepsEveryFocusedSectionVisible(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.workspace = QueryWorkspace
+	_, _ = model.Update(tea.WindowSizeMsg{Width: 60, Height: 18})
+	if !model.query.singleSection {
+		t.Fatal("short query layout did not enter focused-section mode")
+	}
+	checks := []struct {
+		focus queryFocus
+		text  string
+	}{
+		{queryFocusCypher, "CYPHER"},
+		{queryFocusParams, "PARAMETERS"},
+		{queryFocusResults, "RESULTS"},
+		{queryFocusRow, "SELECTED ROW"},
+	}
+	for _, check := range checks {
+		model.query.focus = check.focus
+		view := model.query.view()
+		if !strings.Contains(view, check.text) {
+			t.Fatalf("focus %v is invisible:\n%s", check.focus, view)
+		}
+		if lines := strings.Count(view, "\n") + 1; lines > model.query.height {
+			t.Fatalf("focus %v rendered %d lines into height %d", check.focus, lines, model.query.height)
 		}
 	}
 }
 
-func TestInspectorIncludesPropertiesMarkdownEdgesAndValidity(t *testing.T) {
-	m, _ := loadedModel(t)
-	m.selectNode("deep")
-	rendered := ansi.Strip(m.renderInspector(70, 100))
-	for _, want := range []string{"ID  deep", "Validity  [r3, ∞)", "Markdown body", "Incoming · 1", "Outgoing · 1", "BLOCKS", "properties {\"reason\":\"test\"}"} {
-		if !strings.Contains(rendered, want) {
-			t.Errorf("inspector missing %q:\n%s", want, rendered)
+func TestWideQueryGuidanceDoesNotWidenComposition(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.workspace = QueryWorkspace
+	_, _ = model.Update(tea.WindowSizeMsg{Width: 132, Height: 38})
+	for lineNumber, line := range strings.Split(model.query.view(), "\n") {
+		if width := ansi.StringWidth(line); width > model.query.width {
+			t.Fatalf("query line %d width = %d, limit %d: %q", lineNumber, width, model.query.width, line)
 		}
 	}
 }
 
-func TestRevisionPollingUsesTokenAndReloadsOnlyLive(t *testing.T) {
-	m, backend := loadedModel(t)
-	initialCalls := backend.graphCalls
-	backend.revision = 4
-	_, cmd := m.Update(revisionCheckedMsg{revision: 4})
-	if cmd == nil || m.liveRev != 4 {
-		t.Fatalf("live invalidation cmd=%v revision=%d", cmd, m.liveRev)
+func TestTinyResizeGuidanceRetainsBothRequiredDimensions(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	_, _ = model.Update(tea.WindowSizeMsg{Width: 43, Height: 11})
+	view := model.View().Content
+	if !strings.Contains(view, "44×12") || !strings.Contains(view, "Ctrl+C") {
+		t.Fatalf("tiny guidance lost its action or dimensions:\n%s", view)
+	}
+}
+
+func TestShortIDsDisambiguateTimeOrderedUUIDs(t *testing.T) {
+	left := domain.EntityID("01a05a8c-87c7-77fc-9f3a-7b759098eb81")
+	right := domain.EntityID("01a05a8c-87c8-7cc1-b4f1-ff57284be4a7")
+	if shortID(left) == shortID(right) {
+		t.Fatalf("compact IDs collide: %q", shortID(left))
+	}
+}
+
+func TestInitialLoadErrorsRemainActionableAfterNoticeClears(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.loadSeq = 1
+	_ = model.applySnapshotLoaded(snapshotLoadedMsg{serial: 1, err: errors.New("database unavailable")})
+	model.notice.text = ""
+	if view := model.View().Content; !strings.Contains(view, "Graph unavailable") || !strings.Contains(view, "F5") {
+		t.Fatalf("graph load error is not persistently actionable:\n%s", view)
+	}
+	model.workspace = TimelineWorkspace
+	model.historySeq = 1
+	_ = model.applyHistoryLoaded(historyLoadedMsg{serial: 1, err: errors.New("history unavailable")})
+	model.notice.text = ""
+	if view := model.View().Content; !strings.Contains(view, "Timeline unavailable") || !strings.Contains(view, "F5") {
+		t.Fatalf("history load error is not persistently actionable:\n%s", view)
+	}
+}
+
+func TestNoMatchEditKeepsExactRetryRequest(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.execSeq = 1
+	model.executing = true
+	operation := pendingOperation{
+		kind: executionMutation, purpose: formEditNode,
+		request: app.ExecuteRequest{Query: "MATCH (n) WHERE elementId(n) = $id SET n = $properties RETURN n"},
+	}
+	_ = model.applyExecutionFinished(executionFinishedMsg{serial: 1, operation: operation, result: app.BatchResult{Results: []app.Result{{}}}})
+	if model.overlay.kind != overlayOperationError || model.pending == nil || model.pending.request.Query != operation.request.Query {
+		t.Fatalf("no-match edit lost retry state: overlay=%v pending=%#v", model.overlay.kind, model.pending)
+	}
+}
+
+func TestNoOpRootMoveIsNotMisreportedAsAConflict(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.execSeq = 1
+	model.executing = true
+	node := task("root", "Root")
+	operation := pendingOperation{kind: executionMutation, purpose: formMoveNode, request: app.ExecuteRequest{Query: "MATCH (n) RETURN n"}}
+	_ = model.applyExecutionFinished(executionFinishedMsg{
+		serial: 1, operation: operation,
+		result: app.BatchResult{Results: []app.Result{{Rows: [][]any{{node}}}}},
+	})
+	if model.overlay.kind == overlayOperationError || model.operationErr != nil {
+		t.Fatalf("matched no-op move was treated as a conflict: %v", model.operationErr)
+	}
+}
+
+func TestFormValidationIsVisibleAtMinimumWidth(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	_, _ = model.Update(tea.WindowSizeMsg{Width: minimumWidth, Height: minimumHeight})
+	_ = model.openCreateForm()
+	_, _ = model.Update(keyPress("enter"))
+	if !strings.Contains(model.notice.text, "cannot be empty") {
+		t.Fatalf("form validation notice = %q", model.notice.text)
+	}
+	status := model.renderStatus()
+	if !strings.Contains(status, "cannot be empty") {
+		t.Fatalf("minimum-width status hid validation feedback: %q", status)
+	}
+}
+
+func TestCrossFieldRequestErrorKeepsFormEditable(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.form = newCreateNodeForm(9, newGraphState(nil, nil), "", 80, 24, true, true)
+	data := model.form.data.(*nodeFormData)
+	data.title = "Root"
+	data.position = "1"
+	model.overlay.kind = overlayForm
+	_ = model.submitForm(formSubmittedMsg{serial: 9})
+	if model.overlay.kind != overlayForm || model.form == nil || model.operationErr != nil || model.pending != nil {
+		t.Fatalf("request validation escaped the form: overlay=%v form=%v error=%v pending=%v", model.overlay.kind, model.form != nil, model.operationErr, model.pending)
+	}
+	if !strings.Contains(model.notice.text, "position requires a parent") {
+		t.Fatalf("cross-field validation notice = %q", model.notice.text)
+	}
+}
+
+func TestMinimumHeightFormKeepsSelectedOptionVisible(t *testing.T) {
+	graph := newGraphState([]domain.Node{task("a", "Alpha"), task("z", "Zulu")}, nil)
+	form := newCreateNodeForm(1, graph, "z", 38, 5, true, true)
+	form.data.(*nodeFormData).title = "New node"
+	_ = form.form.NextField()
+	_ = form.form.NextField()
+	view := form.view()
+	if !strings.Contains(view, "> Zulu · z") {
+		t.Fatalf("minimum-height selector hid its selected option:\n%s", view)
+	}
+	if strings.HasPrefix(view, "Create node\n") {
+		t.Fatalf("form duplicated the surrounding modal title:\n%s", view)
+	}
+}
+
+func TestRevisionTimelineIncludesInitialStateAndNewestFirst(t *testing.T) {
+	styles := makeStyles(true, true)
+	timeline := newTimelineModel(styles, true)
+	timeline.setRevisions([]domain.RevisionInfo{
+		{Revision: 1, Time: time.Unix(1, 0), Message: "one"},
+		{Revision: 2, Time: time.Unix(2, 0), Message: "two"},
+	}, 2)
+	items := timeline.list.Items()
+	if len(items) != 3 {
+		t.Fatalf("timeline item count = %d", len(items))
+	}
+	if items[0].(revisionItem).info.Revision != 2 || items[2].(revisionItem).info.Revision != 0 {
+		t.Fatalf("timeline order = %#v", items)
+	}
+}
+
+func TestHistoricalPollTracksLiveWithoutReplacingSnapshot(t *testing.T) {
+	backend := &fakeBackend{revision: 9}
+	model := NewModel(context.Background(), backend, WithPollInterval(0), WithNoColor(true))
+	historical := domain.Revision(3)
+	model.snapshot.Revision = &historical
+	model.liveRevision = 8
+	initialLoad := model.loadSeq
+	_ = model.applyRevisionChecked(revisionCheckedMsg{revision: 9})
+	if model.liveRevision != 9 || model.loadSeq != initialLoad || model.snapshot.Revision == nil || *model.snapshot.Revision != 3 {
+		t.Fatalf("historical poll changed snapshot: live=%d load=%d snapshot=%v", model.liveRevision, model.loadSeq, model.snapshot.Revision)
+	}
+}
+
+func TestPendingHistoricalSelectionSurvivesPollAndScopesQueries(t *testing.T) {
+	backend := &fakeBackend{revision: 4}
+	model := NewModel(context.Background(), backend, WithPollInterval(0), WithNoColor(true))
+	model.loadedRevision = 3
+	model.liveRevision = 3
+	target := domain.Revision(2)
+	_ = model.startSnapshotLoad(domain.Snapshot{Revision: &target})
+	pendingLoad := model.loadSeq
+	if !model.historical() || model.selectedSnapshot().Revision == nil || *model.selectedSnapshot().Revision != target {
+		t.Fatalf("pending historical intent was not visible: historical=%v target=%#v", model.historical(), model.selectedSnapshot())
+	}
+	model.workspace = QueryWorkspace
+	model.query.cypher.SetValue("RETURN 1")
+	model.query.params.SetValue("{}")
+	_ = model.runQuery(true)
+	if model.pending == nil || model.pending.request.Snapshot.Revision == nil || *model.pending.request.Snapshot.Revision != target {
+		t.Fatalf("query bypassed pending historical target: %#v", model.pending)
+	}
+	_ = model.applyRevisionChecked(revisionCheckedMsg{revision: 4})
+	if model.loadSeq != pendingLoad || model.liveRevision != 4 || model.selectedSnapshot().Revision == nil || *model.selectedSnapshot().Revision != target {
+		t.Fatalf("poll canceled pending history: load=%d live=%d target=%#v", model.loadSeq, model.liveRevision, model.selectedSnapshot())
+	}
+	if !strings.Contains(model.renderHeader(), "loading revision 2") {
+		t.Fatalf("pending-history banner = %q", model.renderHeader())
+	}
+}
+
+func TestDecodeSnapshotRejectsMalformedExecutorShape(t *testing.T) {
+	_, _, err := decodeSnapshot(app.BatchResult{Results: []app.Result{{}}})
+	if err == nil || !strings.Contains(err.Error(), "want 2") {
+		t.Fatalf("decodeSnapshot error = %v", err)
+	}
+}
+
+func TestExecutionErrorsKeepMutationRetryButNotQueryModal(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	mutation := pendingOperation{kind: executionMutation, purpose: formEditNode, request: app.ExecuteRequest{Query: "RETURN 1"}}
+	model.execSeq = 1
+	model.executing = true
+	_ = model.applyExecutionFinished(executionFinishedMsg{serial: 1, operation: mutation, err: errors.New("conflict")})
+	if model.overlay.kind != overlayOperationError || model.pending == nil {
+		t.Fatal("mutation error did not expose retry state")
+	}
+	query := pendingOperation{kind: executionQuery, request: app.ExecuteRequest{Query: "bad"}}
+	model.execSeq = 2
+	model.executing = true
+	_ = model.applyExecutionFinished(executionFinishedMsg{serial: 2, operation: query, err: errors.New("syntax")})
+	if model.overlay.kind != overlayNone || model.query.err == nil {
+		t.Fatal("query error did not stay in query workspace")
+	}
+	console := pendingOperation{kind: executionConsole, purpose: formExecuteQuery, request: app.ExecuteRequest{Query: "CREATE (:Task)"}}
+	model.execSeq = 3
+	model.executing = true
+	_ = model.applyExecutionFinished(executionFinishedMsg{serial: 3, operation: console, err: errors.New("busy")})
+	if model.overlay.kind != overlayOperationError || model.pending == nil || model.pending.request.Query != console.request.Query {
+		t.Fatal("confirmed write-capable query error lost exact retry state")
+	}
+}
+
+func TestNoBlockingExecutorCallOccursInsideUpdate(t *testing.T) {
+	backend := &fakeBackend{revision: 1, snapshots: map[domain.Revision]fakeSnapshot{1: {}}}
+	model := NewModel(context.Background(), backend, WithPollInterval(0), WithNoColor(true))
+	cmd := model.startSnapshotLoad(domain.Snapshot{})
+	if len(backend.requests) != 0 || backend.currentReads != 0 {
+		t.Fatal("startSnapshotLoad performed backend I/O synchronously")
 	}
 	batch, ok := cmd().(tea.BatchMsg)
 	if !ok || len(batch) != 2 {
-		t.Fatalf("reload message = %T %#v", cmd(), cmd())
+		t.Fatalf("load command returned an unexpected batch")
 	}
-	for _, child := range batch {
-		m.Update(child())
+	message := batch[1]()
+	if _, ok := message.(snapshotLoadedMsg); !ok {
+		t.Fatalf("load command returned %T", message)
 	}
-	if backend.graphCalls != initialCalls+1 {
-		t.Fatalf("graph calls = %d", backend.graphCalls)
-	}
-
-	revision := domain.Revision(1)
-	m.snapshot = domain.Snapshot{Revision: &revision}
-	_, cmd = m.Update(revisionCheckedMsg{revision: 5})
-	if cmd != nil {
-		t.Fatalf("historical token change started command: %T", cmd())
+	if len(backend.requests) != 1 || backend.currentReads != 1 {
+		t.Fatalf("load command calls = %d executor, %d token", len(backend.requests), backend.currentReads)
 	}
 }
 
-func TestCanceledLoadDoesNotCallBackendOrSurfaceError(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	backend := &fakeBackend{root: "/tmp/project"}
-	m := NewModel(ctx, backend, WithPollInterval(0))
-	cancel()
-	cmd := m.loadGraphCmd(domain.Snapshot{})
-	m.Update(cmd())
-	if backend.graphCalls != 0 || backend.revisionCalls != 0 {
-		t.Fatalf("backend called after cancellation: revision=%d graph=%d", backend.revisionCalls, backend.graphCalls)
+func TestSuccessfulCreateSelectsReturnedNodeAfterSnapshotReload(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.execSeq = 1
+	model.executing = true
+	created := task("created", "Created")
+	revision := domain.Revision(2)
+	operation := pendingOperation{kind: executionMutation, purpose: formCreateNode}
+	_ = model.applyExecutionFinished(executionFinishedMsg{
+		serial: 1, operation: operation,
+		result: app.BatchResult{
+			Results:  []app.Result{{Rows: [][]any{{created}}, Summary: app.Summary{NodesCreated: 1}}},
+			Revision: &revision,
+		},
+	})
+	if model.selectAfterLoad != created.ID || !model.loadingGraph {
+		t.Fatalf("post-create selection = %q, loading = %v", model.selectAfterLoad, model.loadingGraph)
 	}
-	if m.err != nil {
-		t.Fatalf("cancellation surfaced as UI error: %v", m.err)
-	}
-}
-
-func TestLoadingAndBackendErrorsRender(t *testing.T) {
-	backend := &fakeBackend{root: "/tmp/project", graphErr: errors.New("disk unavailable")}
-	m := NewModel(context.Background(), backend, WithPollInterval(0), WithNoColor(true))
-	cmd := m.loadGraphCmd(domain.Snapshot{})
-	m.Update(cmd())
-	view := ansi.Strip(m.View().Content)
-	if !strings.Contains(view, "disk unavailable") || !strings.Contains(view, "Press r to retry") {
-		t.Fatalf("error view:\n%s", view)
-	}
-}
-
-func TestMouseSelectsRenderedNodeAndTab(t *testing.T) {
-	m, _ := loadedModel(t)
-	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	m.View()
-	var nodeHit, graphTab hitArea
-	for _, hit := range m.hits {
-		if hit.Kind == hitNode && hit.Node != m.selected && nodeHit.Node == "" {
-			nodeHit = hit
-		}
-		if hit.Kind == hitTab && hit.Tab == GraphTab {
-			graphTab = hit
-		}
-	}
-	if nodeHit.Node == "" {
-		t.Fatal("no secondary node hit area")
-	}
-	m.Update(tea.MouseClickMsg(tea.Mouse{X: nodeHit.X0, Y: nodeHit.Y0, Button: tea.MouseLeft}))
-	if m.selected != nodeHit.Node {
-		t.Fatalf("mouse selected %q, want %q", m.selected, nodeHit.Node)
-	}
-	m.Update(tea.MouseClickMsg(tea.Mouse{X: graphTab.X0, Y: graphTab.Y0, Button: tea.MouseLeft}))
-	if m.tab != GraphTab {
-		t.Fatalf("mouse tab = %v", m.tab)
+	serial := model.loadSeq
+	graph := newGraphState([]domain.Node{task("old", "Old"), created}, nil)
+	_ = model.applySnapshotLoaded(snapshotLoadedMsg{serial: serial, loaded: snapshotLoad{graph: graph, revision: revision}})
+	if model.work.selected != created.ID || model.selectAfterLoad != "" {
+		t.Fatalf("reloaded selection = %q, pending = %q", model.work.selected, model.selectAfterLoad)
 	}
 }
 
-func printableKey(text string) tea.KeyPressMsg {
-	runes := []rune(text)
-	return tea.KeyPressMsg(tea.Key{Text: text, Code: runes[0]})
-}
-
-func ctrlKey(code rune) tea.KeyPressMsg {
-	return tea.KeyPressMsg(tea.Key{Code: code, Mod: tea.ModCtrl})
-}
-
-func entityStrings(ids []domain.EntityID) []string {
-	result := make([]string, len(ids))
-	for index, id := range ids {
-		result[index] = string(id)
+func TestNoMatchMutationOffersExactRetryAndStaleExecutionIsIgnored(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	operation := pendingOperation{
+		kind: executionMutation, purpose: formDeleteNode,
+		request: app.ExecuteRequest{Query: "MATCH (n) WHERE elementId(n) = $id DETACH DELETE n"},
 	}
-	return result
+	model.execSeq = 2
+	model.executing = true
+	_ = model.applyExecutionFinished(executionFinishedMsg{serial: 1, operation: operation})
+	if !model.executing || model.overlay.kind != overlayNone {
+		t.Fatal("stale execution result mutated active execution state")
+	}
+	_ = model.applyExecutionFinished(executionFinishedMsg{serial: 2, operation: operation})
+	if model.executing || model.overlay.kind != overlayOperationError || model.pending == nil {
+		t.Fatal("no-match mutation did not expose retry state")
+	}
+	if model.operationErr == nil || !strings.Contains(model.operationErr.Error(), "matched no current graph entity") {
+		t.Fatalf("no-match error = %v", model.operationErr)
+	}
 }
 
-func containsOutline(rows []outlineRow, id domain.EntityID) bool {
-	for _, row := range rows {
-		if row.ID == id {
-			return true
+func TestResponsiveHeaderAndPaneComposition(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.graph = newGraphState([]domain.Node{task("n", "Node")}, nil)
+	model.work.setGraph(model.graph)
+	model.inspector.markdown = "# Sentinel"
+	model.inspector.rendered = "INSPECTOR_SENTINEL"
+	model.inspector.viewport.SetContent(model.inspector.rendered)
+
+	_, _ = model.Update(tea.WindowSizeMsg{Width: minimumWidth, Height: 20})
+	header := strings.Split(model.renderHeader(), "\n")[0]
+	for _, tab := range []string{"F1 Work", "F2 Rel", "F3 Query", "F4 Time"} {
+		if !strings.Contains(header, tab) {
+			t.Fatalf("minimum-width header hides %q: %q", tab, header)
 		}
 	}
-	return false
+
+	_, _ = model.Update(tea.WindowSizeMsg{Width: 140, Height: 36})
+	if view := model.View().Content; !strings.Contains(view, "INSPECTOR_SENTINEL") {
+		t.Fatalf("wide layout did not compose primary and inspector panes:\n%s", view)
+	}
+	_, _ = model.Update(tea.WindowSizeMsg{Width: 80, Height: 28})
+	if view := model.View().Content; strings.Contains(view, "INSPECTOR_SENTINEL") {
+		t.Fatalf("compact primary pane leaked inspector content:\n%s", view)
+	}
+	_, _ = model.Update(keyPress("tab"))
+	if view := model.View().Content; !strings.Contains(view, "INSPECTOR_SENTINEL") {
+		t.Fatalf("compact details pane was not reachable with Tab:\n%s", view)
+	}
+}
+
+func TestWorkspaceNavigationNeverConsumesPrintableEditorOrFormInput(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	model.workspace = QueryWorkspace
+	model.query.focus = queryFocusCypher
+	model.query.cypher.SetValue("")
+	_ = model.query.focusCurrent()
+	_, _ = model.Update(keyPress("1"))
+	if model.workspace != QueryWorkspace || model.query.cypher.Value() != "1" {
+		t.Fatalf("Cypher digit changed workspace or was lost: workspace=%v value=%q", model.workspace, model.query.cypher.Value())
+	}
+	_, _ = model.Update(keyPress("f1"))
+	if model.workspace != WorkWorkspace {
+		t.Fatalf("F1 workspace = %v", model.workspace)
+	}
+	_, _ = model.Update(keyPress("f3"))
+	model.query.focus = queryFocusParams
+	model.query.params.SetValue("")
+	_ = model.query.focusCurrent()
+	_, _ = model.Update(keyPress("2"))
+	if model.workspace != QueryWorkspace || model.query.params.Value() != "2" {
+		t.Fatalf("parameter digit changed workspace or was lost: workspace=%v value=%q", model.workspace, model.query.params.Value())
+	}
+	_, _ = model.Update(keyPress("ctrl+pgdown"))
+	if model.workspace != TimelineWorkspace {
+		t.Fatalf("Ctrl+PageDown workspace = %v", model.workspace)
+	}
+	_, _ = model.Update(keyPress("ctrl+pgup"))
+	if model.workspace != QueryWorkspace {
+		t.Fatalf("Ctrl+PageUp workspace = %v", model.workspace)
+	}
+
+	_, _ = model.Update(keyPress("f1"))
+	_ = model.openCreateForm()
+	_, _ = model.Update(keyPress("3"))
+	data := model.form.data.(*nodeFormData)
+	if data.title != "3" || model.workspace != WorkWorkspace {
+		t.Fatalf("form digit changed workspace or was lost: workspace=%v title=%q", model.workspace, data.title)
+	}
+	_, _ = model.Update(keyPress("f2"))
+	if model.workspace != RelationshipsWorkspace || model.overlay.kind != overlayForm || model.form == nil {
+		t.Fatalf("F2 discarded active form: workspace=%v overlay=%v form=%v", model.workspace, model.overlay.kind, model.form != nil)
+	}
+	_, _ = model.Update(keyPress("4"))
+	if data.title != "34" || model.workspace != RelationshipsWorkspace {
+		t.Fatalf("second form digit changed workspace or was lost: workspace=%v title=%q", model.workspace, data.title)
+	}
+}
+
+func TestGlobalHelpRestoresActiveForm(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	_ = model.openCreateForm()
+	form := model.form
+	_, _ = model.Update(keyPress("f10"))
+	if model.overlay.kind != overlayHelp || model.overlayReturn != overlayForm {
+		t.Fatalf("F10 did not stack help over form: overlay=%v return=%v", model.overlay.kind, model.overlayReturn)
+	}
+	_, _ = model.Update(keyPress("f10"))
+	if model.overlay.kind != overlayForm || model.form != form {
+		t.Fatal("closing global help did not restore the active form")
+	}
+}
+
+func TestModalWidgetsUseInnerPanelDimensions(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	_, _ = model.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	_ = model.openHelp()
+	_ = model.layoutComponents()
+	wantWidth, wantHeight := model.modalContentDimensions()
+	if model.helpViewport.Width() != wantWidth || model.helpViewport.Height() != wantHeight {
+		t.Fatalf("help viewport = %dx%d, want modal content %dx%d", model.helpViewport.Width(), model.helpViewport.Height(), wantWidth, wantHeight)
+	}
+	if outerWidth, _ := model.modalDimensions(); model.helpViewport.Width() >= outerWidth {
+		t.Fatalf("help viewport width %d was sized to or beyond outer panel %d", model.helpViewport.Width(), outerWidth)
+	}
+}
+
+func TestHistoricalShortHelpOmitsMutationAffordances(t *testing.T) {
+	model := NewModel(context.Background(), &fakeBackend{}, WithPollInterval(0), WithNoColor(true))
+	revision := domain.Revision(3)
+	model.snapshot.Revision = &revision
+	model.width = 180
+	help := model.renderShortHelp()
+	if !strings.Contains(help, "return live") {
+		t.Fatalf("historical help omitted Return Live: %q", help)
+	}
+	if strings.Contains(help, "new node") {
+		t.Fatalf("historical help advertised a disabled mutation: %q", help)
+	}
+}
+
+func TestStripANSIColorsPreservesNonColorCursorAffordance(t *testing.T) {
+	input := "\x1b[31mred\x1b[0m \x1b[38;5;212mextended\x1b[39m \x1b[7mcursor\x1b[27m"
+	output := stripANSIColors(input)
+	if containsANSIColor(output) || strings.Contains(output, "38;5;212") {
+		t.Fatalf("color SGR survived: %q", output)
+	}
+	if !strings.Contains(output, "\x1b[7mcursor\x1b[27m") {
+		t.Fatalf("reverse-video cursor affordance was removed: %q", output)
+	}
 }

@@ -4,653 +4,677 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
-	"strings"
-	"time"
 
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/domain"
 )
 
-type graphLoadedMsg struct {
-	serial   uint64
-	snapshot domain.Snapshot
-	revision domain.Revision
-	nodes    []domain.Node
-	edges    []domain.Edge
-	err      error
-}
-
-type historyLoadedMsg struct {
-	history []domain.RevisionInfo
-	err     error
-}
-
-type pollTickMsg time.Time
-
-type revisionCheckedMsg struct {
-	revision domain.Revision
-	err      error
-}
-
-type executedMsg struct {
-	serial   uint64
-	mutation mutationKind
-	result   app.BatchResult
-	err      error
-}
-
-func (m *Model) loadGraphCmd(snapshot domain.Snapshot) tea.Cmd {
-	m.loadSerial++
-	serial := m.loadSerial
-	m.loading = true
-	return func() tea.Msg {
-		if err := m.ctx.Err(); err != nil {
-			return graphLoadedMsg{serial: serial, snapshot: snapshot, err: err}
-		}
-		var revision domain.Revision
-		var err error
-		if snapshot.IsCurrent() {
-			revision, err = m.backend.CurrentRevision(m.ctx)
-			if err != nil {
-				return graphLoadedMsg{serial: serial, snapshot: snapshot, err: err}
-			}
-		} else if snapshot.Revision != nil {
-			revision = *snapshot.Revision
-		}
-		nodes, edges, err := m.backend.Graph(m.ctx, snapshot)
-		return graphLoadedMsg{serial: serial, snapshot: snapshot, revision: revision, nodes: nodes, edges: edges, err: err}
-	}
-}
-
-func (m *Model) loadHistoryCmd() tea.Cmd {
-	return func() tea.Msg {
-		if err := m.ctx.Err(); err != nil {
-			return historyLoadedMsg{err: err}
-		}
-		history, err := m.backend.Revisions(m.ctx)
-		return historyLoadedMsg{history: history, err: err}
-	}
-}
-
-func (m *Model) pollCmd() tea.Cmd {
-	return tea.Tick(m.pollInterval, func(now time.Time) tea.Msg { return pollTickMsg(now) })
-}
-
-func (m *Model) checkRevisionCmd() tea.Cmd {
-	return func() tea.Msg {
-		revision, err := m.backend.CurrentRevision(m.ctx)
-		return revisionCheckedMsg{revision: revision, err: err}
-	}
-}
-
-func (m *Model) executeCmd(request app.ExecuteRequest, mutation mutationKind) tea.Cmd {
-	m.execSerial++
-	serial := m.execSerial
-	m.executing = true
-	return func() tea.Msg {
-		if err := m.ctx.Err(); err != nil {
-			return executedMsg{serial: serial, mutation: mutation, err: err}
-		}
-		result, err := m.backend.Execute(m.ctx, request)
-		return executedMsg{serial: serial, mutation: mutation, result: result, err: err}
-	}
-}
-
-// Update applies terminal and backend messages. It returns the same pointer so
-// tests can inspect model state without type conversions or terminal setup.
 func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
 	case tea.WindowSizeMsg:
-		m.resize(msg.Width, msg.Height)
-		return m, nil
+		m.width, m.height = msg.Width, msg.Height
+		return m, m.layoutComponents()
 	case tea.BackgroundColorMsg:
-		m.dark = msg.IsDark()
-		m.styles = makeStyles(m.dark, m.noColor)
+		if !m.noColor && m.dark != msg.IsDark() {
+			appearance := m.applyAppearance(msg.IsDark())
+			if m.form != nil {
+				appearance = tea.Batch(appearance, m.form.update(msg))
+			}
+			return m, appearance
+		}
+		if m.form != nil {
+			return m, m.form.update(msg)
+		}
 		return m, nil
-	case graphLoadedMsg:
-		return m, m.acceptGraph(msg)
+	case snapshotLoadedMsg:
+		return m, m.applySnapshotLoaded(msg)
 	case historyLoadedMsg:
-		if msg.err != nil {
-			if !isCancellation(msg.err) {
-				m.err = fmt.Errorf("load history: %w", msg.err)
-			}
-			return m, nil
-		}
-		m.history = append([]domain.RevisionInfo(nil), msg.history...)
-		sort.SliceStable(m.history, func(i, j int) bool { return m.history[i].Revision > m.history[j].Revision })
-		if len(m.history) > 0 && m.history[0].Revision > m.liveRev {
-			m.liveRev = m.history[0].Revision
-		}
-		m.clampHistory()
-		return m, nil
-	case pollTickMsg:
-		if m.ctx.Err() != nil || m.pollInterval <= 0 {
-			return m, nil
-		}
-		return m, m.checkRevisionCmd()
+		return m, m.applyHistoryLoaded(msg)
 	case revisionCheckedMsg:
-		var cmds []tea.Cmd
-		if msg.err != nil {
-			if !isCancellation(msg.err) {
-				m.status = "Refresh check failed: " + msg.err.Error()
-			}
-		} else {
-			changed := msg.revision != m.liveRev
-			m.liveRev = msg.revision
-			if changed && m.snapshot.IsCurrent() {
-				cmds = append(cmds, m.loadGraphCmd(domain.Snapshot{}), m.loadHistoryCmd())
-			}
+		return m, m.applyRevisionChecked(msg)
+	case pollTickMsg:
+		return m, m.checkRevisionCmd()
+	case executionFinishedMsg:
+		return m, m.applyExecutionFinished(msg)
+	case inspectorRenderedMsg:
+		m.inspector.apply(msg)
+		return m, nil
+	case listFilterMatchesMsg:
+		return m, m.applyListFilterMatches(msg)
+	case formSubmittedMsg:
+		return m, m.submitForm(msg)
+	case clearNoticeMsg:
+		if msg.serial == m.notice.serial {
+			m.notice.text = ""
 		}
-		if m.ctx.Err() == nil && m.pollInterval > 0 {
-			cmds = append(cmds, m.pollCmd())
+		return m, nil
+	case spinner.TickMsg:
+		if m.busy() {
+			var command tea.Cmd
+			m.spinner, command = m.spinner.Update(msg)
+			return m, command
 		}
-		return m, tea.Batch(cmds...)
-	case executedMsg:
-		return m, m.acceptExecution(msg)
+		return m, nil
 	case tea.MouseClickMsg:
-		return m, m.handleMouse(msg.Mouse())
+		return m, m.handleMouseClick(msg)
 	case tea.MouseWheelMsg:
-		return m, m.handleWheel(msg.Mouse())
-	case tea.KeyPressMsg:
-		return m, m.handleKey(msg)
+		return m, m.handleMouseWheel(msg)
 	}
-	return m, nil
+
+	keyMessage, isKey := message.(tea.KeyPressMsg)
+	if !isKey {
+		return m, m.updateFocusedComponent(message)
+	}
+
+	if key.Matches(keyMessage, m.keys.Quit) {
+		return m, tea.Quit
+	}
+	// Non-text global bindings are routed before editors, filters, and forms.
+	// Printable input therefore has the same meaning in every text field.
+	switch {
+	case key.Matches(keyMessage, m.keys.Work):
+		return m, m.navigateWorkspace(WorkWorkspace)
+	case key.Matches(keyMessage, m.keys.Relationships):
+		return m, m.navigateWorkspace(RelationshipsWorkspace)
+	case key.Matches(keyMessage, m.keys.Query):
+		return m, m.navigateWorkspace(QueryWorkspace)
+	case key.Matches(keyMessage, m.keys.Timeline):
+		return m, m.navigateWorkspace(TimelineWorkspace)
+	case key.Matches(keyMessage, m.keys.PreviousTab):
+		return m, m.navigateWorkspace((m.workspace + 3) % 4)
+	case key.Matches(keyMessage, m.keys.NextTab):
+		return m, m.navigateWorkspace((m.workspace + 1) % 4)
+	case key.Matches(keyMessage, m.keys.Help):
+		if m.overlay.kind == overlayHelp {
+			return m, m.closeHelp()
+		}
+		return m, m.openHelp()
+	case key.Matches(keyMessage, m.keys.Refresh):
+		return m, tea.Batch(m.startSnapshotLoad(m.selectedSnapshot()), m.startHistoryLoad())
+	case key.Matches(keyMessage, m.keys.ReturnLive) && m.historical():
+		return m, m.returnLive()
+	case key.Matches(keyMessage, m.keys.Palette) && m.overlay.kind == overlayNone:
+		return m, m.openCommands()
+	}
+	if m.overlay.kind != overlayNone {
+		return m, m.updateOverlay(keyMessage)
+	}
+
+	// Active list filters own ordinary keys, including escape and q.
+	if m.workspace == RelationshipsWorkspace && m.relationships.filtering() {
+		return m, m.relationships.update(keyMessage)
+	}
+	if m.workspace == TimelineWorkspace && m.timeline.filtering() {
+		return m, m.timeline.update(keyMessage)
+	}
+
+	switch m.workspace {
+	case WorkWorkspace:
+		return m, m.updateWork(keyMessage)
+	case RelationshipsWorkspace:
+		return m, m.updateRelationships(keyMessage)
+	case QueryWorkspace:
+		return m, m.updateQuery(keyMessage)
+	case TimelineWorkspace:
+		return m, m.updateTimeline(keyMessage)
+	default:
+		return m, nil
+	}
 }
 
-func (m *Model) acceptGraph(msg graphLoadedMsg) tea.Cmd {
-	if msg.serial != m.loadSerial {
-		return nil
-	}
-	m.loading = false
-	if msg.err != nil {
-		if !isCancellation(msg.err) {
-			m.err = fmt.Errorf("load graph: %w", msg.err)
+func (m *Model) updateOverlay(msg tea.KeyPressMsg) tea.Cmd {
+	switch m.overlay.kind {
+	case overlayFinder, overlayCommands:
+		if key.Matches(msg, m.keys.Back) {
+			m.overlay.kind = overlayNone
+			m.overlay.picker.openWhenReady = false
+			return nil
 		}
-		return nil
-	}
-	m.err = nil
-	m.snapshot = msg.snapshot
-	if msg.snapshot.IsCurrent() {
-		m.liveRev = msg.revision
-	}
-	m.nodes = append([]domain.Node(nil), msg.nodes...)
-	m.edges = append([]domain.Edge(nil), msg.edges...)
-	m.nodeByID = make(map[domain.EntityID]domain.Node, len(m.nodes))
-	for _, node := range m.nodes {
-		m.nodeByID[node.ID] = node
-	}
-	previous := m.selected
-	m.rebuildNavigation()
-	if _, exists := m.nodeByID[previous]; exists {
-		m.selectNode(previous)
-	} else if len(m.outlineRows) > 0 {
-		m.selectNode(m.outlineRows[0].ID)
-	} else {
-		m.selected = ""
-	}
-	mode := "live"
-	if !m.snapshot.IsCurrent() {
-		mode = fmt.Sprintf("revision %d", snapshotRevision(m.snapshot))
-	}
-	m.status = fmt.Sprintf("Loaded %d nodes and %d edges at %s", len(m.nodes), len(m.edges), mode)
-	return nil
-}
-
-func (m *Model) acceptExecution(msg executedMsg) tea.Cmd {
-	if msg.serial != m.execSerial {
-		return nil
-	}
-	m.executing = false
-	if msg.err != nil {
-		if msg.mutation != 0 {
-			m.mutationErr = msg.err
-		} else {
-			m.queryErr = msg.err
+		if key.Matches(msg, m.keys.Open) {
+			if m.overlay.picker.filtering() && m.overlay.picker.filteredValue != m.overlay.picker.list.FilterValue() {
+				m.overlay.picker.openWhenReady = true
+				return nil
+			}
+			return m.activatePickerSelection()
 		}
-		return nil
-	}
-	result := msg.result
-	m.result = &result
-	m.queryErr = nil
-	if msg.mutation != 0 {
-		m.overlay = overlayNone
-		m.mutationErr = nil
-		m.status = mutationName(msg.mutation) + " completed"
-	}
-	changed := msg.result.Revision != nil
-	if !changed {
-		for _, result := range msg.result.Results {
-			if result.Summary.Changed() {
-				changed = true
-				break
+		return m.overlay.picker.update(msg)
+	case overlayHelp:
+		if key.Matches(msg, m.keys.Back) || key.Matches(msg, m.keys.Help) {
+			return m.closeHelp()
+		}
+		updated, cmd := m.helpViewport.Update(msg)
+		m.helpViewport = updated
+		return cmd
+	case overlayForm:
+		if m.form == nil {
+			m.overlay.kind = overlayNone
+			return nil
+		}
+		if key.Matches(msg, m.keys.Back) && m.form.escapeCancels() {
+			m.form = nil
+			m.overlay.kind = overlayNone
+			return m.setNotice(noticeInfo, "Form cancelled")
+		}
+		previousError := m.form.validationErr
+		cmd := m.form.update(msg)
+		if m.form.validationErr != "" && m.form.validationErr != previousError {
+			return tea.Batch(cmd, m.setNotice(noticeError, m.form.validationErr))
+		}
+		if previousError != "" && m.form.validationErr == "" && m.notice.text == previousError {
+			m.notice.serial++
+			m.notice.text = ""
+		}
+		return cmd
+	case overlayOperationError:
+		switch msg.String() {
+		case "esc":
+			m.overlay.kind = overlayNone
+			m.pending = nil
+			m.operationErr = nil
+			return nil
+		case "r":
+			if m.pending != nil {
+				m.overlay.kind = overlayNone
+				return m.startExecution(*m.pending)
 			}
 		}
 	}
-	if changed {
-		return tea.Batch(m.loadGraphCmd(domain.Snapshot{}), m.loadHistoryCmd())
-	}
-	if msg.mutation != 0 {
-		return nil
-	}
-	m.status = fmt.Sprintf("Query returned %d statement result(s)", len(msg.result.Results))
 	return nil
 }
 
-func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
-	key := msg.String()
-	if key == "ctrl+c" {
-		return tea.Quit
-	}
-	if m.overlay != overlayNone {
-		return m.handleOverlayKey(msg)
-	}
-	if key == "ctrl+k" {
-		m.openPalette()
-		return nil
-	}
-	if key == "?" && m.tab != QueryTab {
-		m.overlay = overlayHelp
-		return nil
-	}
-	// Plain digits remain available inside the Cypher/JSON editors. Query users
-	// can still switch tabs with ctrl+arrows, mouse, or the command palette.
-	if key >= "1" && key <= "4" && m.tab != QueryTab {
-		m.setTab(Tab(key[0] - '1'))
-		return nil
-	}
-	if key == "ctrl+left" {
-		m.setTab((m.tab + 3) % 4)
-		return nil
-	}
-	if key == "ctrl+right" {
-		m.setTab((m.tab + 1) % 4)
-		return nil
-	}
-	if key == "q" && m.tab != QueryTab {
-		return tea.Quit
-	}
-	if key == "r" && m.tab != QueryTab {
-		m.status = "Refreshing…"
-		return tea.Batch(m.loadGraphCmd(m.snapshot), m.loadHistoryCmd())
-	}
-
-	switch m.tab {
-	case OutlineTab:
-		return m.handleOutlineKey(key)
-	case GraphTab:
-		return m.handleGraphKey(key)
-	case QueryTab:
-		return m.handleQueryKey(msg)
-	case HistoryTab:
-		return m.handleHistoryKey(key)
-	}
-	return nil
-}
-
-func (m *Model) handleOutlineKey(key string) tea.Cmd {
-	switch key {
-	case "up", "k":
-		m.moveOutline(-1)
-	case "down", "j":
-		m.moveOutline(1)
-	case "home", "g":
-		m.outlineIndex = 0
-		m.syncOutlineSelection()
-	case "end", "G":
-		m.outlineIndex = max(0, len(m.outlineRows)-1)
-		m.syncOutlineSelection()
-	case "enter", "right", "l":
-		m.toggleSelected(false)
-	case "left", "h":
-		m.toggleSelected(true)
-	case "/":
-		m.openSearch()
-	case "i":
-		m.overlay = overlayInspector
-	case "c":
-		m.openMutation(mutationCreate)
-	case "e":
-		m.openMutation(mutationEdit)
-	case "p":
-		m.openMutation(mutationReparent)
-	case "d":
-		m.openMutation(mutationDelete)
-	}
-	return nil
-}
-
-func (m *Model) handleGraphKey(key string) tea.Cmd {
-	switch key {
-	case "up", "k":
-		m.moveGraph(-1)
-	case "down", "j":
-		m.moveGraph(1)
-	case "left", "h":
-		m.graphPanX = max(0, m.graphPanX-4)
-	case "right", "l":
-		m.graphPanX += 4
-	case "pgup":
-		m.graphPanY = max(0, m.graphPanY-5)
-	case "pgdown":
-		m.graphPanY = min(max(0, len(m.graphRows)-1), m.graphPanY+5)
-	case "+", "=":
-		m.graphZoom = min(3, m.graphZoom+1)
-		m.rebuildGraph()
-	case "-", "_":
-		m.graphZoom = max(1, m.graphZoom-1)
-		m.rebuildGraph()
-	case "0":
-		m.graphPanX, m.graphPanY, m.graphZoom = 0, 0, 2
-		m.rebuildGraph()
-	case "/":
-		m.openSearch()
-	case "i", "enter":
-		m.overlay = overlayInspector
-	case "c":
-		m.openMutation(mutationCreate)
-	case "e":
-		m.openMutation(mutationEdit)
-	case "p":
-		m.openMutation(mutationReparent)
-	case "d":
-		m.openMutation(mutationDelete)
-	}
-	return nil
-}
-
-func (m *Model) handleQueryKey(msg tea.KeyPressMsg) tea.Cmd {
-	key := msg.String()
-	switch key {
-	case "ctrl+r", "ctrl+enter":
-		return m.runQuery(true)
-	case "ctrl+x":
-		return m.runQuery(false)
-	case "tab":
-		m.cycleQueryFocus(1)
-		return nil
-	case "shift+tab":
-		m.cycleQueryFocus(-1)
-		return nil
-	case "ctrl+j":
-		if m.queryFocus == focusResults {
-			m.resultY++
+func (m *Model) activatePickerSelection() tea.Cmd {
+	switch m.overlay.kind {
+	case overlayFinder:
+		id, ok := m.overlay.picker.selectedNode()
+		if !ok {
 			return nil
 		}
-	case "ctrl+u":
-		if m.queryFocus == focusResults {
-			m.resultY = max(0, m.resultY-1)
-			return nil
+		m.overlay.kind = overlayNone
+		m.workspace = WorkWorkspace
+		m.focus = focusPrimary
+		m.work.selectID(id)
+		return tea.Batch(m.layoutComponents(), m.refreshInspector())
+	case overlayCommands:
+		command, ok := m.overlay.picker.selectedCommand()
+		if ok {
+			return m.runCommand(command)
 		}
 	}
-	var cmd tea.Cmd
-	switch m.queryFocus {
-	case focusParams:
-		m.params, cmd = m.params.Update(msg)
-	case focusQuery:
-		m.query, cmd = m.query.Update(msg)
+	return nil
+}
+
+func (m *Model) applyListFilterMatches(msg listFilterMatchesMsg) tea.Cmd {
+	switch msg.target {
+	case listTargetRelationships:
+		if msg.filter != m.relationships.list.FilterValue() {
+			return nil
+		}
+		before := m.relationships.selectedID()
+		cmd := m.relationships.update(msg.msg)
+		if m.workspace == RelationshipsWorkspace && before != m.relationships.selectedID() {
+			return tea.Batch(cmd, m.refreshInspector())
+		}
+		return cmd
+	case listTargetTimeline:
+		if msg.filter != m.timeline.list.FilterValue() {
+			return nil
+		}
+		before, _ := m.timeline.selectedRevision()
+		cmd := m.timeline.update(msg.msg)
+		after, _ := m.timeline.selectedRevision()
+		if m.workspace == TimelineWorkspace && before != after {
+			return tea.Batch(cmd, m.refreshInspector())
+		}
+		return cmd
+	case listTargetPicker:
+		if msg.serial != m.overlay.picker.serial || msg.filter != m.overlay.picker.list.FilterValue() {
+			return nil
+		}
+		cmd := m.overlay.picker.update(msg.msg)
+		m.overlay.picker.filteredValue = msg.filter
+		if m.overlay.picker.openWhenReady {
+			m.overlay.picker.openWhenReady = false
+			if m.overlay.kind == overlayFinder || m.overlay.kind == overlayCommands {
+				return tea.Batch(cmd, m.activatePickerSelection())
+			}
+		}
+		return cmd
 	default:
-		switch key {
-		case "up", "k":
-			m.resultY = max(0, m.resultY-1)
-		case "down", "j":
-			m.resultY++
-		case "left", "h":
-			m.resultX = max(0, m.resultX-4)
-		case "right", "l":
-			m.resultX += 4
+		return nil
+	}
+}
+
+// updateFocusedComponent routes component lifecycle messages such as cursor
+// blinks and viewport updates. Bubbles widgets are models, so forwarding only
+// key presses leaves them partially functional even when ordinary navigation
+// appears to work.
+func (m *Model) updateFocusedComponent(msg tea.Msg) tea.Cmd {
+	switch m.overlay.kind {
+	case overlayFinder, overlayCommands:
+		return m.overlay.picker.update(msg)
+	case overlayForm:
+		if m.form != nil {
+			return m.form.update(msg)
 		}
+		return nil
+	case overlayHelp:
+		updated, cmd := m.helpViewport.Update(msg)
+		m.helpViewport = updated
+		return cmd
+	case overlayOperationError:
+		return nil
+	}
+
+	if m.focus == focusInspector && m.workspace != QueryWorkspace {
+		return m.inspector.update(msg)
+	}
+	switch m.workspace {
+	case WorkWorkspace:
+		return m.work.update(msg)
+	case RelationshipsWorkspace:
+		return m.relationships.update(msg)
+	case QueryWorkspace:
+		return m.query.update(msg)
+	case TimelineWorkspace:
+		return m.timeline.update(msg)
+	default:
+		return nil
+	}
+}
+
+func (m *Model) updateWork(msg tea.KeyPressMsg) tea.Cmd {
+	if key.Matches(msg, m.keys.TogglePane) {
+		if m.focus == focusPrimary {
+			m.focus = focusInspector
+		} else {
+			m.focus = focusPrimary
+		}
+		return nil
+	}
+	if m.focus == focusInspector {
+		if key.Matches(msg, m.keys.Back) {
+			m.focus = focusPrimary
+			return nil
+		}
+		return m.inspector.update(msg)
+	}
+	switch {
+	case key.Matches(msg, m.keys.Find):
+		return m.openFinder()
+	case key.Matches(msg, m.keys.NewNode):
+		return m.openCreateForm()
+	case key.Matches(msg, m.keys.Edit):
+		return m.openEditNodeForm()
+	case key.Matches(msg, m.keys.Move):
+		return m.openMoveNodeForm()
+	case key.Matches(msg, m.keys.Connect):
+		return m.openConnectionForm()
+	case key.Matches(msg, m.keys.Delete):
+		return m.openDeleteNodeForm()
+	}
+	before := m.work.selected
+	cmd := m.work.update(msg)
+	if before != m.work.selected {
+		return tea.Batch(cmd, m.refreshInspector())
 	}
 	return cmd
 }
 
-func (m *Model) handleHistoryKey(key string) tea.Cmd {
-	switch key {
-	case "up", "k":
-		m.moveHistory(-1)
-	case "down", "j":
-		m.moveHistory(1)
-	case "enter":
-		return m.openSelectedRevision()
-	case "l":
-		return m.returnLive()
-	case "home", "g":
-		m.historyIndex = 0
-	case "end", "G":
-		m.historyIndex = max(0, len(m.history)-1)
-	}
-	return nil
-}
-
-func (m *Model) handleOverlayKey(msg tea.KeyPressMsg) tea.Cmd {
-	key := msg.String()
-	switch m.overlay {
-	case overlayHelp, overlayInspector:
-		if key == "esc" || key == "?" || key == "q" || key == "i" {
-			m.overlay = overlayNone
-		} else if m.overlay == overlayInspector {
-			switch key {
-			case "up", "k":
-				m.inspectorScroll = max(0, m.inspectorScroll-1)
-			case "down", "j":
-				m.inspectorScroll++
-			case "pgup":
-				m.inspectorScroll = max(0, m.inspectorScroll-8)
-			case "pgdown":
-				m.inspectorScroll += 8
-			}
+func (m *Model) updateRelationships(msg tea.KeyPressMsg) tea.Cmd {
+	if key.Matches(msg, m.keys.TogglePane) {
+		if m.focus == focusPrimary {
+			m.focus = focusInspector
+		} else {
+			m.focus = focusPrimary
 		}
-	case overlaySearch:
-		if key == "esc" {
-			m.search.SetValue("")
-			m.search.Blur()
-			m.overlay = overlayNone
-			m.rebuildNavigation()
-			return nil
-		}
-		if key == "enter" {
-			m.search.Blur()
-			m.overlay = overlayNone
-			return nil
-		}
-		var cmd tea.Cmd
-		m.search, cmd = m.search.Update(msg)
-		m.rebuildNavigation()
-		return cmd
-	case overlayPalette:
-		if key == "esc" {
-			m.palette.Blur()
-			m.overlay = overlayNone
-			return nil
-		}
-		commands := m.filteredCommands()
-		switch key {
-		case "up", "ctrl+p":
-			m.paletteIndex = max(0, m.paletteIndex-1)
-			return nil
-		case "down", "ctrl+n":
-			m.paletteIndex = min(max(0, len(commands)-1), m.paletteIndex+1)
-			return nil
-		case "enter":
-			if len(commands) > 0 {
-				return m.runPaletteCommand(commands[m.paletteIndex])
-			}
-			return nil
-		}
-		var cmd tea.Cmd
-		m.palette, cmd = m.palette.Update(msg)
-		m.paletteIndex = 0
-		return cmd
-	case overlayMutation:
-		if key == "esc" || (m.mutation == mutationDelete && key == "n") {
-			m.mutationInput.Blur()
-			m.overlay = overlayNone
-			m.mutationErr = nil
-			return nil
-		}
-		if m.mutation == mutationDelete {
-			if key == "y" || key == "enter" {
-				return m.submitMutation()
-			}
-			return nil
-		}
-		if key == "ctrl+s" {
-			return m.submitMutation()
-		}
-		var cmd tea.Cmd
-		m.mutationInput, cmd = m.mutationInput.Update(msg)
-		return cmd
-	}
-	return nil
-}
-
-func (m *Model) runQuery(readOnly bool) tea.Cmd {
-	query := strings.TrimSpace(m.query.Value())
-	if query == "" {
-		m.queryErr = errors.New("query is empty")
 		return nil
 	}
-	params := make(map[string]any)
-	if err := decodeObject(m.params.Value(), &params); err != nil {
-		m.queryErr = fmt.Errorf("parameters: %w", err)
-		return nil
-	}
-	if !m.snapshot.IsCurrent() && !readOnly {
-		m.queryErr = errors.New("historical mode is read-only; return to Live before executing mutations")
-		return nil
-	}
-	m.queryErr = nil
-	return m.executeCmd(app.ExecuteRequest{
-		Query: query, Params: params, Snapshot: m.snapshot, ReadOnly: readOnly,
-		Actor: "tui", Message: "query console",
-	}, 0)
-}
-
-func (m *Model) cycleQueryFocus(delta int) {
-	m.query.Blur()
-	m.params.Blur()
-	m.queryFocus = focusArea((int(m.queryFocus) + delta + 3) % 3)
-	switch m.queryFocus {
-	case focusQuery:
-		_ = m.query.Focus()
-	case focusParams:
-		_ = m.params.Focus()
-	}
-}
-
-func (m *Model) openSelectedRevision() tea.Cmd {
-	if len(m.history) == 0 {
-		m.status = "No revisions yet"
-		return nil
-	}
-	m.clampHistory()
-	revision := m.history[m.historyIndex].Revision
-	m.status = fmt.Sprintf("Opening revision %d…", revision)
-	return m.loadGraphCmd(domain.Snapshot{Revision: &revision})
-}
-
-func (m *Model) returnLive() tea.Cmd {
-	if m.snapshot.IsCurrent() {
-		m.status = "Already viewing Live"
-		return nil
-	}
-	m.status = "Returning to Live…"
-	return m.loadGraphCmd(domain.Snapshot{})
-}
-
-func (m *Model) handleMouse(mouse tea.Mouse) tea.Cmd {
-	if mouse.Button != tea.MouseLeft {
-		return nil
-	}
-	for _, hit := range m.hits {
-		if mouse.X < hit.X0 || mouse.X > hit.X1 || mouse.Y < hit.Y0 || mouse.Y > hit.Y1 {
-			continue
+	if m.focus == focusInspector {
+		if key.Matches(msg, m.keys.Back) {
+			m.focus = focusPrimary
+			return nil
 		}
-		switch hit.Kind {
-		case hitTab:
-			m.setTab(hit.Tab)
-		case hitNode:
-			m.selectNode(hit.Node)
-		case hitHistory:
-			for index, info := range m.history {
-				if info.Revision == hit.Revision {
-					m.historyIndex = index
-					break
+		return m.inspector.update(msg)
+	}
+	switch {
+	case key.Matches(msg, m.keys.Open):
+		m.focus = focusInspector
+		return nil
+	case key.Matches(msg, m.keys.Edit):
+		return m.openEditRelationshipForm()
+	case key.Matches(msg, m.keys.Connect):
+		return m.openConnectionForm()
+	case key.Matches(msg, m.keys.Delete):
+		return m.openDeleteRelationshipForm()
+	}
+	before := m.relationships.selectedID()
+	cmd := m.relationships.update(msg)
+	if before != m.relationships.selectedID() {
+		return tea.Batch(cmd, m.refreshInspector())
+	}
+	return cmd
+}
+
+func (m *Model) updateQuery(msg tea.KeyPressMsg) tea.Cmd {
+	switch {
+	case key.Matches(msg, m.keys.TogglePane):
+		return m.query.cycleFocus(msg.String() == "shift+tab")
+	case key.Matches(msg, m.keys.RunQuery):
+		return m.runQuery(true)
+	case key.Matches(msg, m.keys.ExecQuery):
+		return m.runQuery(false)
+	case key.Matches(msg, m.keys.PreviousSet) && m.query.focus == queryFocusResults:
+		m.query.moveResult(-1)
+		return nil
+	case key.Matches(msg, m.keys.NextSet) && m.query.focus == queryFocusResults:
+		m.query.moveResult(1)
+		return nil
+	}
+	return m.query.update(msg)
+}
+
+func (m *Model) updateTimeline(msg tea.KeyPressMsg) tea.Cmd {
+	if key.Matches(msg, m.keys.TogglePane) {
+		if m.focus == focusPrimary {
+			m.focus = focusInspector
+		} else {
+			m.focus = focusPrimary
+		}
+		return nil
+	}
+	if m.focus == focusInspector {
+		if key.Matches(msg, m.keys.Back) {
+			m.focus = focusPrimary
+			return nil
+		}
+		return m.inspector.update(msg)
+	}
+	if key.Matches(msg, m.keys.Open) {
+		if revision, ok := m.timeline.selectedRevision(); ok {
+			return m.openRevision(revision)
+		}
+		return nil
+	}
+	before, _ := m.timeline.selectedRevision()
+	cmd := m.timeline.update(msg)
+	after, _ := m.timeline.selectedRevision()
+	if before != after {
+		return tea.Batch(cmd, m.refreshInspector())
+	}
+	return cmd
+}
+
+func (m *Model) applySnapshotLoaded(msg snapshotLoadedMsg) tea.Cmd {
+	if msg.serial != m.loadSeq {
+		return nil
+	}
+	m.loadingGraph = false
+	if msg.err != nil {
+		if errors.Is(msg.err, context.Canceled) {
+			return nil
+		}
+		m.graphErr = msg.err
+		return m.setNotice(noticeError, msg.err.Error())
+	}
+	m.graphErr = nil
+	m.snapshot = msg.snapshot
+	m.graph = msg.loaded.graph
+	m.loadedRevision = msg.loaded.revision
+	if msg.snapshot.IsCurrent() {
+		m.liveRevision = msg.loaded.revision
+	}
+	m.work.setGraph(m.graph)
+	if m.selectAfterLoad != "" {
+		m.work.selectID(m.selectAfterLoad)
+		m.selectAfterLoad = ""
+	}
+	relationshipCmd := m.relationships.setGraph(m.graph)
+	var timelineCmd tea.Cmd
+	if m.historyReady {
+		timelineCmd = m.timeline.setRevisions(m.revisions, m.liveRevision)
+	}
+	if !msg.snapshot.IsCurrent() {
+		m.timeline.selectRevision(msg.loaded.revision)
+	}
+	mode := fmt.Sprintf("Loaded revision %d", msg.loaded.revision)
+	if msg.snapshot.IsCurrent() {
+		mode += " · Live"
+	} else {
+		mode += " · read-only"
+	}
+	return tea.Batch(relationshipCmd, timelineCmd, m.layoutComponents(), m.refreshInspector(), m.setNotice(noticeSuccess, mode))
+}
+
+func (m *Model) applyHistoryLoaded(msg historyLoadedMsg) tea.Cmd {
+	if msg.serial != m.historySeq {
+		return nil
+	}
+	m.loadingHistory = false
+	if msg.err != nil {
+		if errors.Is(msg.err, context.Canceled) {
+			return nil
+		}
+		m.historyErr = msg.err
+		return m.setNotice(noticeError, "load timeline: "+msg.err.Error())
+	}
+	m.historyErr = nil
+	m.historyReady = true
+	m.revisions = append([]domain.RevisionInfo(nil), msg.revisions...)
+	cmd := m.timeline.setRevisions(m.revisions, m.liveRevision)
+	if m.workspace == TimelineWorkspace {
+		return tea.Batch(cmd, m.refreshInspector())
+	}
+	return cmd
+}
+
+func (m *Model) applyRevisionChecked(msg revisionCheckedMsg) tea.Cmd {
+	commands := []tea.Cmd{m.pollDelayCmd()}
+	if msg.err != nil {
+		if !errors.Is(msg.err, context.Canceled) {
+			commands = append(commands, m.setNotice(noticeError, "revision poll: "+msg.err.Error()))
+		}
+		return tea.Batch(commands...)
+	}
+	if msg.revision == m.liveRevision {
+		return tea.Batch(commands...)
+	}
+	m.liveRevision = msg.revision
+	commands = append(commands, m.startHistoryLoad())
+	if m.selectedSnapshot().IsCurrent() {
+		commands = append(commands, m.startSnapshotLoad(domain.Snapshot{}))
+	} else {
+		commands = append(commands, m.setNotice(noticeInfo, fmt.Sprintf("Live advanced to revision %d; historical view unchanged", msg.revision)))
+	}
+	return tea.Batch(commands...)
+}
+
+func (m *Model) applyExecutionFinished(msg executionFinishedMsg) tea.Cmd {
+	if msg.serial != m.execSeq {
+		return nil
+	}
+	m.executing = false
+	if msg.err != nil {
+		if errors.Is(msg.err, context.Canceled) {
+			return nil
+		}
+		m.operationErr = msg.err
+		if msg.operation.kind == executionQuery {
+			m.query.setResult(msg.result, msg.err)
+			m.pending = nil
+			m.overlay.kind = overlayNone
+			return m.setNotice(noticeError, "query failed")
+		}
+		m.pending = &msg.operation
+		m.overlay.kind = overlayOperationError
+		return nil
+	}
+
+	m.pending = nil
+	m.operationErr = nil
+	m.overlay.kind = overlayNone
+	changed := batchChanged(msg.result)
+	if msg.operation.kind == executionMutation && !changed && mutationMustChange(msg.operation.purpose) {
+		m.operationErr = errors.New("the request matched no current graph entity; another process may have changed it")
+		m.pending = &msg.operation
+		m.overlay.kind = overlayOperationError
+		return nil
+	}
+	if msg.operation.kind == executionMutation && !changed && mutationMustReturnEntity(msg.operation.purpose) && !batchHasRows(msg.result) {
+		m.operationErr = errors.New("the request matched no current graph entity; another process may have changed it")
+		m.pending = &msg.operation
+		m.overlay.kind = overlayOperationError
+		return nil
+	}
+	commands := make([]tea.Cmd, 0, 4)
+	if msg.operation.kind == executionQuery || msg.operation.kind == executionConsole {
+		m.query.setResult(msg.result, nil)
+		text := "Query completed"
+		if msg.operation.kind == executionConsole {
+			text = "Write-capable Cypher completed"
+		}
+		if !changed {
+			text += " · no graph changes"
+		}
+		commands = append(commands, m.setNotice(noticeSuccess, text))
+	} else {
+		text := msg.operation.purpose.String() + " completed"
+		if !changed {
+			text += " · no graph changes"
+		}
+		commands = append(commands, m.setNotice(noticeSuccess, text))
+		if msg.operation.purpose == formCreateNode || msg.operation.purpose == formEditNode || msg.operation.purpose == formMoveNode {
+			m.selectAfterLoad = returnedNodeID(msg.result)
+		}
+	}
+	if msg.result.Revision != nil {
+		m.liveRevision = *msg.result.Revision
+	}
+	if changed {
+		commands = append(commands, m.startSnapshotLoad(domain.Snapshot{}), m.startHistoryLoad())
+	}
+	return tea.Batch(commands...)
+}
+
+func mutationMustChange(purpose formPurpose) bool {
+	switch purpose {
+	case formCreateNode, formConnectNodes, formDeleteNode, formDeleteRelationship:
+		return true
+	default:
+		return false
+	}
+}
+
+func mutationMustReturnEntity(purpose formPurpose) bool {
+	return purpose == formEditNode || purpose == formMoveNode || purpose == formEditRelationship
+}
+
+func batchHasRows(batch app.BatchResult) bool {
+	for _, result := range batch.Results {
+		if len(result.Rows) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func returnedNodeID(batch app.BatchResult) domain.EntityID {
+	for _, result := range batch.Results {
+		for _, row := range result.Rows {
+			for _, value := range row {
+				switch node := value.(type) {
+				case domain.Node:
+					return node.ID
+				case *domain.Node:
+					if node != nil {
+						return node.ID
+					}
 				}
 			}
-		case hitOverlay:
-			if m.overlay == overlayPalette {
-				commands := m.filteredCommands()
-				if hit.OverlayRow >= 0 && hit.OverlayRow < len(commands) {
-					m.paletteIndex = hit.OverlayRow
-					return m.runPaletteCommand(commands[hit.OverlayRow])
-				}
-			}
 		}
-		break
 	}
-	return nil
+	return ""
 }
 
-func (m *Model) handleWheel(mouse tea.Mouse) tea.Cmd {
-	delta := 1
-	if mouse.Button == tea.MouseWheelUp {
-		delta = -1
-	}
-	if m.overlay == overlayInspector {
-		m.inspectorScroll = max(0, m.inspectorScroll+delta*3)
+func (m *Model) applyAppearance(dark bool) tea.Cmd {
+	m.dark = dark
+	m.styles = makeStyles(dark, m.noColor)
+	m.work.setStyle(m.styles, dark)
+	m.relationships.setStyle(m.styles, dark)
+	m.query.setStyle(m.styles, dark)
+	m.timeline.setStyle(m.styles, dark)
+	m.help.Styles = m.styles.helpStyles(dark)
+	return m.inspector.setAppearance(dark, m.noColor)
+}
+
+func (m *Model) handleMouseClick(msg tea.MouseClickMsg) tea.Cmd {
+	if m.overlay.kind != overlayNone || msg.Button != tea.MouseLeft {
 		return nil
 	}
-	switch m.tab {
-	case OutlineTab:
-		m.moveOutline(delta * 3)
-	case GraphTab:
-		m.moveGraph(delta * 2)
-	case QueryTab:
-		m.resultY = max(0, m.resultY+delta*3)
-	case HistoryTab:
-		m.moveHistory(delta * 3)
+	if msg.Y == 0 {
+		if workspace, ok := m.workspaceAt(msg.X); ok {
+			return m.setWorkspace(workspace)
+		}
+	}
+	if m.workspace == WorkWorkspace && m.focus == focusPrimary {
+		if row, ok := m.workRowAt(msg.X, msg.Y); ok {
+			before := m.work.selected
+			m.work.clickRow(row)
+			if before != m.work.selected {
+				return m.refreshInspector()
+			}
+		}
 	}
 	return nil
 }
 
-func (m *Model) setTab(tab Tab) {
-	m.tab = tab
-	if tab != QueryTab {
-		m.query.Blur()
-		m.params.Blur()
-	} else if m.queryFocus == focusQuery {
-		_ = m.query.Focus()
-	} else if m.queryFocus == focusParams {
-		_ = m.params.Focus()
+func (m *Model) handleMouseWheel(msg tea.MouseWheelMsg) tea.Cmd {
+	if m.overlay.kind == overlayHelp {
+		updated, cmd := m.helpViewport.Update(msg)
+		m.helpViewport = updated
+		return cmd
 	}
-}
-
-func (m *Model) resize(width, height int) {
-	m.width, m.height = max(30, width), max(10, height)
-	mainWidth := max(20, width-6)
-	if width >= 100 && m.showInspector {
-		mainWidth = max(30, width*2/3-8)
+	if m.overlay.kind != overlayNone {
+		return nil
 	}
-	m.query.SetWidth(mainWidth)
-	m.params.SetWidth(mainWidth)
-	m.query.SetHeight(max(4, min(10, height/3)))
-	m.params.SetHeight(max(3, min(6, height/5)))
-	m.search.SetWidth(min(58, max(20, width-12)))
-	m.palette.SetWidth(min(62, max(22, width-12)))
-	m.mutationInput.SetWidth(min(74, max(24, width-14)))
-	m.mutationInput.SetHeight(min(16, max(7, height-10)))
-	m.ensureVisible()
-}
-
-func isCancellation(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-}
-
-func snapshotRevision(snapshot domain.Snapshot) domain.Revision {
-	if snapshot.Revision != nil {
-		return *snapshot.Revision
+	delta := 3
+	if msg.Button == tea.MouseWheelUp {
+		delta = -3
 	}
-	return 0
+	if m.focus == focusInspector && m.workspace != QueryWorkspace {
+		return m.inspector.update(msg)
+	}
+	switch m.workspace {
+	case WorkWorkspace:
+		for range 3 {
+			if delta < 0 {
+				m.work.tree.Up()
+			} else {
+				m.work.tree.Down()
+			}
+		}
+		before := m.work.selected
+		m.work.syncSelection()
+		if before != m.work.selected {
+			return m.refreshInspector()
+		}
+	case RelationshipsWorkspace:
+		before := m.relationships.selectedID()
+		m.relationships.wheel(delta)
+		if before != m.relationships.selectedID() {
+			return m.refreshInspector()
+		}
+	case TimelineWorkspace:
+		before, _ := m.timeline.selectedRevision()
+		m.timeline.wheel(delta)
+		after, _ := m.timeline.selectedRevision()
+		if before != after {
+			return m.refreshInspector()
+		}
+	case QueryWorkspace:
+		return m.query.update(msg)
+	}
+	return nil
 }

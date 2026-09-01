@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -18,12 +20,23 @@ import (
 )
 
 func main() {
+	ignoreBrokenPipeSignal()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	version, _, _ := buildinfo.Info()
 	command := cli.New(cli.Options{TUI: runTUI})
-	if err := fang.Execute(ctx, command, fang.WithVersion(version)); err != nil {
+	if err := fang.Execute(ctx, command,
+		fang.WithVersion(version),
+		fang.WithErrorHandler(func(w io.Writer, styles fang.Styles, err error) {
+			if !errors.Is(err, syscall.EPIPE) {
+				fang.DefaultErrorHandler(w, styles, err)
+			}
+		}),
+	); err != nil {
+		if errors.Is(err, syscall.EPIPE) {
+			return
+		}
 		os.Exit(1)
 	}
 }
@@ -41,14 +54,6 @@ func (b tuiBackend) Execute(ctx context.Context, request app.ExecuteRequest) (ap
 
 func (b tuiBackend) CurrentRevision(ctx context.Context) (domain.Revision, error) {
 	return b.engine.CurrentRevision(ctx)
-}
-
-func (b tuiBackend) Graph(ctx context.Context, snapshot domain.Snapshot) ([]domain.Node, []domain.Edge, error) {
-	graph, err := b.engine.Snapshot(ctx, snapshot)
-	if err != nil {
-		return nil, nil, err
-	}
-	return graph.Nodes, graph.Edges, nil
 }
 
 func (b tuiBackend) Revisions(ctx context.Context) ([]domain.RevisionInfo, error) {

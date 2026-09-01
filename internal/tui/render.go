@@ -1,652 +1,455 @@
 package tui
 
 import (
-	"encoding/json"
 	"fmt"
 	"path/filepath"
-	"sort"
+	"strconv"
 	"strings"
 
+	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
-	"charm.land/glamour/v2"
-	glamourStyles "charm.land/glamour/v2/styles"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/svlocks/sheets/internal/app"
-	"github.com/svlocks/sheets/internal/domain"
 )
 
-// View renders a responsive alternate-screen application. Wide terminals use
-// navigator/main/inspector columns; compact terminals devote the full body to
-// the active view and expose the inspector with i/Enter.
-func (m *Model) View() tea.View {
-	m.hits = m.hits[:0]
-	header := m.renderHeader()
-	bodyHeight := max(3, m.height-4)
-	var body string
-	if m.overlay != overlayNone {
-		body = m.renderOverlay(m.width, bodyHeight)
-	} else if m.loading && len(m.nodes) == 0 {
-		body = placeText(m.width, bodyHeight, "Loading graph…")
-	} else if m.err != nil {
-		body = placeText(m.width, bodyHeight, m.styles.danger.Render("Could not load graph\n")+m.err.Error()+"\n\nPress r to retry")
-	} else {
-		body = m.renderWorkspace(m.width, bodyHeight)
+const (
+	wideTerminalWidth = 108
+	minimumWidth      = 44
+	minimumHeight     = 12
+)
+
+type layoutGeometry struct {
+	headerHeight  int
+	contentTop    int
+	contentHeight int
+	footerHeight  int
+	wide          bool
+	primaryWidth  int
+	detailWidth   int
+}
+
+func (m *Model) geometry() layoutGeometry {
+	header := 1
+	if m.historical() {
+		header++
 	}
+	footer := 2
+	content := max(1, m.height-header-footer)
+	geometry := layoutGeometry{
+		headerHeight: header, contentTop: header, contentHeight: content,
+		footerHeight: footer, wide: m.width >= wideTerminalWidth && content >= 12,
+		primaryWidth: m.width, detailWidth: 0,
+	}
+	if geometry.wide && m.workspace != QueryWorkspace {
+		geometry.primaryWidth = min(58, max(38, m.width*9/20))
+		geometry.detailWidth = max(1, m.width-geometry.primaryWidth)
+	}
+	return geometry
+}
+
+func (m *Model) layoutComponents() tea.Cmd {
+	geometry := m.geometry()
+	bodyHeight := max(1, geometry.contentHeight-3)
+	primaryWidth := max(1, geometry.primaryWidth-2)
+	detailWidth := max(1, geometry.detailWidth-2)
+	if !geometry.wide {
+		detailWidth = max(1, m.width-2)
+	}
+	m.work.setSize(primaryWidth, bodyHeight)
+	m.relationships.setSize(primaryWidth, bodyHeight)
+	m.timeline.setSize(primaryWidth, bodyHeight)
+	m.query.setSize(max(1, m.width-2), bodyHeight)
+	commands := []tea.Cmd{m.inspector.setSize(detailWidth, bodyHeight)}
+	m.help.SetWidth(max(1, m.width-2))
+	modalWidth, modalHeight := m.modalContentDimensions()
+	m.helpViewport.SetWidth(modalWidth)
+	m.helpViewport.SetHeight(modalHeight)
+	if m.overlay.kind == overlayFinder || m.overlay.kind == overlayCommands {
+		m.overlay.picker.setSize(modalWidth, modalHeight)
+	}
+	if m.form != nil {
+		m.form.setSize(modalWidth, modalHeight)
+	}
+	if m.overlay.kind == overlayHelp {
+		m.refreshHelpContent()
+	}
+	return tea.Batch(commands...)
+}
+
+func (m *Model) modalDimensions() (int, int) {
+	geometry := m.geometry()
+	width := min(96, max(30, m.width-8))
+	if m.width < 64 {
+		width = max(20, m.width-4)
+	}
+	height := min(30, max(8, geometry.contentHeight-4))
+	return width, height
+}
+
+// modalContentDimensions returns the widget area inside the panel border and
+// below its title. Modal children are real Bubbles/Huh components and must be
+// sized to this area rather than relying on final string clipping.
+func (m *Model) modalContentDimensions() (int, int) {
+	width, height := m.modalDimensions()
+	return max(1, width-2), max(1, height-3)
+}
+
+func (m *Model) render() string {
+	if m.width <= 0 || m.height <= 0 {
+		return ""
+	}
+	header := m.renderHeader()
+	content := m.renderContent()
 	status := m.renderStatus()
-	content := strings.Join([]string{header, fitBlock(body, m.width, bodyHeight), status}, "\n")
-	view := tea.NewView(fitBlock(content, m.width, m.height))
-	view.AltScreen = true
-	view.MouseMode = tea.MouseModeCellMotion
-	view.WindowTitle = "sheets — " + filepath.Base(m.backend.ProjectRoot())
-	return view
+	helpLine := m.renderShortHelp()
+	result := lipgloss.JoinVertical(lipgloss.Left, header, content, status, helpLine)
+	result = fitBlock(result, m.width, m.height)
+	if m.noColor {
+		result = stripANSIColors(result)
+	}
+	return result
 }
 
 func (m *Model) renderHeader() string {
-	root := m.backend.ProjectRoot()
-	if root == "" {
-		root = "."
+	prefix := m.headerPrefix()
+	var result strings.Builder
+	result.WriteString(prefix)
+	for workspace := WorkWorkspace; workspace <= TimelineWorkspace; workspace++ {
+		result.WriteString(m.renderTab(workspace))
 	}
-	project := m.styles.title.Render(" sheets ") + " " + m.styles.subtle.Render(root)
-	revision := fmt.Sprintf("Live · r%d", m.liveRev)
-	if !m.snapshot.IsCurrent() {
-		revision = fmt.Sprintf("HISTORICAL · r%d · READ-ONLY", snapshotRevision(m.snapshot))
+	header := fitLine(result.String(), m.width)
+	if !m.historical() {
+		return header
 	}
-	first := joinSides(project, m.styles.banner.Render(revision), m.width)
-
-	var tabs strings.Builder
-	x := 0
-	for index, name := range tabNames {
-		text := fmt.Sprintf("%d %s", index+1, name)
-		if m.width < 46 {
-			text = fmt.Sprintf("%d %c", index+1, name[0])
-		}
-		style := m.styles.tab
-		if Tab(index) == m.tab {
-			style = m.styles.activeTab
-		}
-		rendered := style.Render(text)
-		width := ansi.StringWidth(rendered)
-		m.hits = append(m.hits, hitArea{Kind: hitTab, X0: x, X1: x + width - 1, Y0: 1, Y1: 1, Tab: Tab(index)})
-		tabs.WriteString(rendered)
-		x += width
+	state := fmt.Sprintf("revision %d", m.loadedRevision)
+	if m.loadingGraph && !m.loadTarget.IsCurrent() && m.loadTarget.Revision != nil {
+		state = fmt.Sprintf("loading revision %d", *m.loadTarget.Revision)
+	} else if m.loadingGraph && m.loadTarget.IsCurrent() && !m.snapshot.IsCurrent() {
+		state += " · returning to Live"
 	}
-	context := "ctrl+k commands  ? help"
-	second := joinSides(tabs.String(), m.styles.subtle.Render(context), m.width)
-	banner := ""
-	if !m.snapshot.IsCurrent() {
-		banner = m.styles.banner.Render("◆ Historical snapshot: all mutations are disabled. History → l returns to Live.")
-	} else {
-		banner = m.styles.subtle.Render(fmt.Sprintf("%d nodes  ·  %d edges  ·  daemonless", len(m.nodes), len(m.edges)))
-	}
-	return strings.Join([]string{fitLine(first, m.width), fitLine(second, m.width), fitLine(banner, m.width)}, "\n")
+	banner := fmt.Sprintf("READ-ONLY HISTORY · %s · live revision %d · press F6 to return to Live", state, m.liveRevision)
+	return header + "\n" + fitLine(m.styles.readOnly.Render(banner), m.width)
 }
 
-func (m *Model) renderWorkspace(width, height int) string {
-	if width >= 110 {
-		navigatorWidth := min(32, max(24, width/4))
-		inspectorWidth := min(42, max(30, width/3))
-		mainWidth := width - navigatorWidth - inspectorWidth
-		m.hitOffsetX = 0
-		nav := m.panel("Navigator", m.renderOutline(navigatorWidth-2, height-2, true), navigatorWidth, height, false)
-		m.hitOffsetX = navigatorWidth
-		main := m.panel(m.tab.String(), m.renderMain(mainWidth-2, height-2), mainWidth, height, true)
-		inspector := m.panel("Inspector", m.renderInspector(inspectorWidth-2, height-2), inspectorWidth, height, false)
-		m.hitOffsetX = 0
-		return lipgloss.JoinHorizontal(lipgloss.Top, nav, main, inspector)
-	}
-	m.hitOffsetX = 0
-	return m.panel(m.tab.String(), m.renderMain(width-2, height-2), width, height, true)
-}
-
-func (m *Model) renderMain(width, height int) string {
-	switch m.tab {
-	case OutlineTab:
-		return m.renderOutline(width, height, false)
-	case GraphTab:
-		return m.renderGraph(width, height)
-	case QueryTab:
-		return m.renderQuery(width, height)
-	case HistoryTab:
-		return m.renderHistory(width, height)
-	default:
-		return ""
-	}
-}
-
-func (m *Model) panel(title, content string, width, height int, active bool) string {
-	style := m.styles.panel
-	if active {
-		style = m.styles.activePanel
-	}
-	titleLine := m.styles.accent.Render(" " + title + " ")
-	innerHeight := max(1, height-2)
-	innerWidth := max(1, width-2)
-	content = fitBlock(content, innerWidth, innerHeight)
-	// A panel title lives in the first content row, avoiding border surgery and
-	// keeping exact dimensions predictable across Unicode border sets.
-	contentLines := strings.Split(content, "\n")
-	if len(contentLines) > 0 {
-		contentLines[0] = joinSides(titleLine, contentLines[0], innerWidth)
-	}
-	return style.Width(innerWidth).Height(innerHeight).Render(strings.Join(contentLines, "\n"))
-}
-
-func (m *Model) renderOutline(width, height int, compact bool) string {
-	if len(m.outlineRows) == 0 {
-		if strings.TrimSpace(m.search.Value()) != "" {
-			return "No nodes match " + fmt.Sprintf("%q", m.search.Value()) + "\n\n/ change filter  esc clear"
-		}
-		return "The graph is empty.\n\nc create the first node"
-	}
-	start := m.outlineOffset
-	if compact {
-		start = max(0, m.outlineIndex-height/2)
-	}
-	lines := make([]string, 0, height)
-	if filter := strings.TrimSpace(m.search.Value()); filter != "" {
-		lines = append(lines, m.styles.accent.Render("Filter: "+filter))
-	}
-	for index := start; index < len(m.outlineRows) && len(lines) < height; index++ {
-		row := m.outlineRows[index]
-		if row.Section != "" && len(lines) < height {
-			lines = append(lines, m.styles.subtle.Render("── "+row.Section+" "))
-		}
-		node := m.nodeByID[row.ID]
-		marker := "  "
-		if index == m.outlineIndex {
-			marker = "› "
-		}
-		toggle := "•"
-		if row.HasKids {
-			toggle = "▾"
-			if m.collapsed[row.ID] {
-				toggle = "▸"
-			}
-		}
-		kind := ""
-		if row.Orphan {
-			kind = " ◌"
-		}
-		if row.Cycle {
-			kind = " ⟳"
-		}
-		position := ""
-		if row.Position != nil {
-			position = fmt.Sprintf(" #%d", *row.Position)
-		} else if row.Depth > 0 {
-			position = " ·"
-		}
-		indent := strings.Repeat("  ", row.Depth)
-		text := marker + indent + toggle + " " + nodeTitle(node) + position + kind
-		if !compact && len(node.Labels) > 0 {
-			text += "  [" + strings.Join(node.Labels, ",") + "]"
-		}
-		text = fitLine(text, width)
-		if index == m.outlineIndex {
-			text = m.styles.selected.Width(width).Render(text)
-		}
-		lineY := 4 + len(lines)
-		m.hits = append(m.hits, hitArea{Kind: hitNode, X0: m.hitOffsetX, X1: m.hitOffsetX + width - 1, Y0: lineY, Y1: lineY, Node: row.ID})
-		lines = append(lines, text)
-	}
-	return strings.Join(lines, "\n")
-}
-
-func (m *Model) renderGraph(width, height int) string {
-	if len(m.graphRows) == 0 {
-		return "No topology to display.\n\nc create node  / filter"
-	}
-	lines := []string{m.styles.subtle.Render(fmt.Sprintf("zoom %d/3 · pan x:%d y:%d · +/- zoom · h/l pan · 0 reset", m.graphZoom, m.graphPanX, m.graphPanY))}
-	for index := m.graphPanY; index < len(m.graphRows) && len(lines) < height; index++ {
-		row := m.graphRows[index]
-		for lineIndex, raw := range row.Lines {
-			if len(lines) >= height {
-				break
-			}
-			line := cutFrom(raw, m.graphPanX, width)
-			if index == m.graphIndex && lineIndex == 0 {
-				line = m.styles.selected.Width(width).Render(fitLine("› "+line, width))
-			} else {
-				line = "  " + line
-			}
-			if row.ID != "" {
-				y := 4 + len(lines)
-				m.hits = append(m.hits, hitArea{Kind: hitNode, X0: m.hitOffsetX, X1: m.hitOffsetX + width - 1, Y0: y, Y1: y, Node: row.ID})
-			}
-			lines = append(lines, fitLine(line, width))
-		}
-		if len(lines) < height {
-			lines = append(lines, "")
-		}
-	}
-	return strings.Join(lines, "\n")
-}
-
-func (m *Model) renderQuery(width, height int) string {
-	queryHeight := max(4, min(9, height/3))
-	paramsHeight := max(3, min(5, height/5))
-	m.query.SetWidth(max(10, width-2))
-	m.query.SetHeight(queryHeight - 1)
-	m.params.SetWidth(max(10, width-2))
-	m.params.SetHeight(paramsHeight - 1)
-	queryTitle := "Cypher"
-	if m.queryFocus == focusQuery {
-		queryTitle = "▸ Cypher"
-	}
-	paramsTitle := "JSON parameters"
-	if m.queryFocus == focusParams {
-		paramsTitle = "▸ JSON parameters"
-	}
-	lines := []string{m.styles.accent.Render(queryTitle), m.query.View(), m.styles.accent.Render(paramsTitle), m.params.View()}
-	used := queryHeight + paramsHeight
-	resultHeight := max(2, height-used)
-	resultTitle := "Results"
-	if m.queryFocus == focusResults {
-		resultTitle = "▸ Results"
-	}
-	result := m.renderResults(width, resultHeight-1)
-	lines = append(lines, m.styles.accent.Render(resultTitle+"  ·  ctrl+r read  ctrl+x execute  tab focus"), result)
-	return strings.Join(lines, "\n")
-}
-
-func (m *Model) renderResults(width, height int) string {
-	if m.executing {
-		return "Executing…"
-	}
-	if m.queryErr != nil {
-		return m.styles.danger.Render("Error: ") + fitLine(m.queryErr.Error(), max(1, width-7))
-	}
-	if m.result == nil {
-		return m.styles.subtle.Render("No result yet")
-	}
-	lines := make([]string, 0)
-	for statementIndex, result := range m.result.Results {
-		lines = append(lines, fmt.Sprintf("Statement %d  %s", statementIndex+1, summaryText(result.Summary)))
-		if len(result.Columns) == 0 {
-			continue
-		}
-		widths := make([]int, len(result.Columns))
-		for index, column := range result.Columns {
-			widths[index] = min(28, max(3, ansi.StringWidth(column)))
-		}
-		for _, row := range result.Rows {
-			for index := range widths {
-				if index < len(row) {
-					widths[index] = min(28, max(widths[index], ansi.StringWidth(formatValue(row[index]))))
-				}
-			}
-		}
-		lines = append(lines, tableRow(result.Columns, widths))
-		separator := make([]string, len(widths))
-		for index, columnWidth := range widths {
-			separator[index] = strings.Repeat("─", columnWidth)
-		}
-		lines = append(lines, strings.Join(separator, "─┼─"))
-		for _, row := range result.Rows {
-			values := make([]string, len(widths))
-			for index := range values {
-				if index < len(row) {
-					values[index] = formatValue(row[index])
-				}
-			}
-			lines = append(lines, tableRow(values, widths))
-		}
-	}
-	if len(lines) == 0 {
-		lines = append(lines, "Query completed with no rows")
-	}
-	start := min(max(0, m.resultY), max(0, len(lines)-1))
-	visible := lines[start:min(len(lines), start+max(1, height))]
-	for index := range visible {
-		visible[index] = cutFrom(visible[index], m.resultX, width)
-	}
-	return strings.Join(visible, "\n")
-}
-
-func (m *Model) renderHistory(width, height int) string {
-	if len(m.history) == 0 {
-		return "No revisions yet.\n\nThe first mutation will create revision 1."
-	}
-	lines := []string{m.styles.subtle.Render("enter open snapshot · l return to Live · historical snapshots are read-only")}
-	for index := m.historyOffset; index < len(m.history) && len(lines) < height; index++ {
-		info := m.history[index]
-		marker := "  "
-		if index == m.historyIndex {
-			marker = "› "
-		}
-		viewing := ""
-		if (!m.snapshot.IsCurrent() && snapshotRevision(m.snapshot) == info.Revision) || (m.snapshot.IsCurrent() && info.Revision == m.liveRev) {
-			viewing = "  ◆ viewing"
-		}
-		actor := info.Actor
-		if actor == "" {
-			actor = "unknown actor"
-		}
-		message := info.Message
-		if message == "" {
-			message = "no message"
-		}
-		text := fmt.Sprintf("%sr%-5d  %s  %-14s  %s%s", marker, info.Revision, info.Time.Local().Format("2006-01-02 15:04"), actor, message, viewing)
-		text = fitLine(text, width)
-		if index == m.historyIndex {
-			text = m.styles.selected.Width(width).Render(text)
-		}
-		y := 4 + len(lines)
-		m.hits = append(m.hits, hitArea{Kind: hitHistory, X0: m.hitOffsetX, X1: m.hitOffsetX + width - 1, Y0: y, Y1: y, Revision: info.Revision})
-		lines = append(lines, text)
-	}
-	return strings.Join(lines, "\n")
-}
-
-func (m *Model) renderInspector(width, height int) string {
-	if m.selected == "" {
-		return "No node selected"
-	}
-	node, exists := m.nodeByID[m.selected]
-	if !exists {
-		return "Selected node is not present in this snapshot"
-	}
-	lines := []string{
-		m.styles.title.Render(nodeTitle(node)),
-		"ID  " + string(node.ID),
-		"Labels  " + emptyAs(strings.Join(node.Labels, ", "), "—"),
-		"Validity  " + validity(node.ValidFrom, node.ValidTo),
-		"",
-		m.styles.accent.Render(fmt.Sprintf("Properties · %d", len(node.Properties))),
-	}
-	properties, _ := json.MarshalIndent(node.Properties, "", "  ")
-	lines = append(lines, strings.Split(string(properties), "\n")...)
-	lines = append(lines, "", m.styles.accent.Render("Markdown body"))
-	if strings.TrimSpace(node.Body) == "" {
-		lines = append(lines, m.styles.subtle.Render("(empty)"))
-	} else {
-		lines = append(lines, strings.Split(m.renderMarkdown(node.Body, width), "\n")...)
-	}
-	incoming, outgoing := m.incidentEdges(node.ID)
-	lines = append(lines, "", m.styles.accent.Render(fmt.Sprintf("Incoming · %d", len(incoming))))
-	for _, edge := range incoming {
-		lines = append(lines, m.edgeInspectorLine(edge, true))
-	}
-	if len(incoming) == 0 {
-		lines = append(lines, "—")
-	}
-	lines = append(lines, "", m.styles.accent.Render(fmt.Sprintf("Outgoing · %d", len(outgoing))))
-	for _, edge := range outgoing {
-		lines = append(lines, m.edgeInspectorLine(edge, false))
-		if len(edge.Properties) > 0 {
-			encoded, _ := json.Marshal(edge.Properties)
-			lines = append(lines, "    properties "+string(encoded))
-		}
-	}
-	if len(outgoing) == 0 {
-		lines = append(lines, "—")
-	}
-	start := min(max(0, m.inspectorScroll), max(0, len(lines)-1))
-	return strings.Join(lines[start:min(len(lines), start+max(1, height))], "\n")
-}
-
-func (m *Model) edgeInspectorLine(edge domain.Edge, incoming bool) string {
-	otherID := edge.To
-	arrow := "→"
-	if incoming {
-		otherID = edge.From
-		arrow = "←"
-	}
-	other := shortID(otherID)
-	if node, ok := m.nodeByID[otherID]; ok {
-		other = nodeTitle(node)
-	}
-	position := ""
-	if edge.Position != nil {
-		position = fmt.Sprintf(" #%d", *edge.Position)
-	}
-	return fmt.Sprintf("%s %s %s%s  edge:%s  %s", arrow, edge.Type, other, position, shortID(edge.ID), validity(edge.ValidFrom, edge.ValidTo))
-}
-
-func (m *Model) incidentEdges(id domain.EntityID) (incoming, outgoing []domain.Edge) {
-	for _, edge := range m.edges {
-		if edge.To == id {
-			incoming = append(incoming, edge)
-		}
-		if edge.From == id {
-			outgoing = append(outgoing, edge)
-		}
-	}
-	sort.SliceStable(incoming, func(i, j int) bool { return incoming[i].ID < incoming[j].ID })
-	sort.SliceStable(outgoing, func(i, j int) bool { return outgoing[i].ID < outgoing[j].ID })
-	return incoming, outgoing
-}
-
-func (m *Model) renderMarkdown(source string, width int) string {
-	style := glamourStyles.DarkStyle
-	if !m.dark {
-		style = glamourStyles.LightStyle
+func (m *Model) renderTab(workspace Workspace) string {
+	name := workspace.String()
+	if m.width < 76 {
+		name = [...]string{"Work", "Rel", "Query", "Time"}[workspace]
 	}
 	if m.noColor {
-		style = glamourStyles.NoTTYStyle
+		if workspace == m.workspace {
+			return fmt.Sprintf("[F%d %s]", int(workspace)+1, name)
+		}
+		return fmt.Sprintf(" F%d %s ", int(workspace)+1, name)
 	}
-	renderer, err := glamour.NewTermRenderer(glamour.WithStandardStyle(style), glamour.WithWordWrap(max(10, width-2)))
-	if err != nil {
-		return source
+	label := fmt.Sprintf(" F%d %s ", int(workspace)+1, name)
+	if workspace == m.workspace {
+		return m.styles.activeTab.Render(label)
 	}
-	rendered, err := renderer.Render(source)
-	if err != nil {
-		return source
-	}
-	return strings.TrimSpace(rendered)
+	return m.styles.tab.Render(label)
 }
 
-func (m *Model) renderOverlay(width, height int) string {
-	overlayWidth := min(78, max(28, width-8))
-	overlayHeight := min(22, max(7, height-2))
-	var title, content string
-	switch m.overlay {
-	case overlaySearch:
-		title = "Search nodes"
-		content = m.search.View() + "\n\nLive filter across IDs, labels, properties, titles, and Markdown.\nenter keep · esc clear"
-		overlayHeight = 8
-	case overlayPalette:
-		title = "Command palette"
-		lines := []string{m.palette.View(), ""}
-		commands := m.filteredCommands()
-		maxCommands := max(1, overlayHeight-6)
-		start := 0
-		if m.paletteIndex >= maxCommands {
-			start = m.paletteIndex - maxCommands + 1
+func (m *Model) headerPrefix() string {
+	if m.width < 56 {
+		return ""
+	}
+	if m.width < 90 {
+		if m.noColor {
+			return " sheets  "
 		}
-		for index := start; index < len(commands) && len(lines)-2 < maxCommands; index++ {
-			line := "  " + commands[index].Name
-			if index == m.paletteIndex {
-				line = m.styles.selected.Width(overlayWidth - 4).Render("› " + commands[index].Name)
-			}
-			y := (height-overlayHeight)/2 + 3 + len(lines)
-			m.hits = append(m.hits, hitArea{Kind: hitOverlay, X0: (width - overlayWidth) / 2, X1: (width + overlayWidth) / 2, Y0: y, Y1: y, OverlayRow: index})
-			lines = append(lines, line)
-		}
-		if len(commands) == 0 {
-			lines = append(lines, "No matching commands")
-		}
-		content = strings.Join(lines, "\n")
-	case overlayHelp:
-		title = "Keyboard & mouse"
-		content = helpText(m.tab)
-		overlayWidth = min(84, max(30, width-6))
-	case overlayInspector:
-		title = "Inspector"
-		content = m.renderInspector(overlayWidth-4, overlayHeight-4)
-	case overlayMutation:
-		title = mutationName(m.mutation) + " node"
-		if m.mutation == mutationDelete {
-			node := m.nodeByID[m.selected]
-			content = m.styles.danger.Render("Delete "+nodeTitle(node)+"?") + "\n\nDETACH DELETE removes the node and every incident edge.\nThe previous revision remains available in History.\n\ny / enter confirm · n / esc cancel"
-			overlayHeight = 11
-		} else {
-			content = mutationHint(m.mutation) + "\n\n" + m.mutationInput.View() + "\n\nctrl+s submit · esc cancel"
-			if m.mutationErr != nil {
-				content += "\n" + m.styles.danger.Render("Error: "+m.mutationErr.Error())
-			}
+		return " " + m.styles.appName.Render("sheets") + "  "
+	}
+	root := "project"
+	if m.backend != nil {
+		if value := filepath.Base(m.backend.ProjectRoot()); value != "." && value != "" {
+			root = value
 		}
 	}
-	box := m.styles.activePanel.Width(max(1, overlayWidth-4)).Height(max(1, overlayHeight-2)).Padding(0, 1).Render(m.styles.title.Render(title) + "\n\n" + content)
-	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, box)
+	plain := " sheets · " + ansi.Truncate(root, 20, "…") + "  "
+	if m.noColor {
+		return plain
+	}
+	return " " + m.styles.appName.Render("sheets") + m.styles.project.Render(" · "+ansi.Truncate(root, 20, "…")+"  ")
+}
+
+func (m *Model) renderContent() string {
+	geometry := m.geometry()
+	if m.width < minimumWidth || m.height < minimumHeight {
+		message := fmt.Sprintf("Terminal is %d×%d. Resize to at least %d×%d for the interactive workspace. Ctrl+C still quits.", m.width, m.height, minimumWidth, minimumHeight)
+		return fitBlock(wrapText(message, m.width), m.width, geometry.contentHeight)
+	}
+	if m.overlay.kind != overlayNone {
+		return m.renderOverlay(geometry)
+	}
+	if m.loadingGraph && len(m.graph.nodes) == 0 && !m.work.initialized {
+		return m.renderPane("Loading graph", m.spinner.View()+" Reading an exact graph snapshot…", m.width, geometry.contentHeight, true, false)
+	}
+	if m.graphErr != nil && !m.work.initialized && (m.workspace == WorkWorkspace || m.workspace == RelationshipsWorkspace) {
+		body := "The graph could not be loaded.\n\n" + errorText(m.graphErr) + "\n\nPress F5 to retry."
+		return m.renderPane("Graph unavailable", wrapText(body, max(1, m.width-2)), m.width, geometry.contentHeight, true, false)
+	}
+	if m.workspace == TimelineWorkspace && m.historyErr != nil && !m.historyReady {
+		body := "The revision timeline could not be loaded.\n\n" + errorText(m.historyErr) + "\n\nPress F5 to retry."
+		return m.renderPane("Timeline unavailable", wrapText(body, max(1, m.width-2)), m.width, geometry.contentHeight, true, false)
+	}
+	switch m.workspace {
+	case WorkWorkspace:
+		return m.renderPrimaryAndInspector("Hierarchy", m.work.view(), geometry)
+	case RelationshipsWorkspace:
+		return m.renderPrimaryAndInspector("Relationships · / filters", m.relationships.view(), geometry)
+	case QueryWorkspace:
+		return m.renderPane("Query · Tab moves focus · Ctrl+R reads · Ctrl+X executes", m.query.view(), m.width, geometry.contentHeight, true, false)
+	case TimelineWorkspace:
+		return m.renderPrimaryAndInspector("Timeline · Enter opens revision", m.timeline.view(), geometry)
+	default:
+		return fitBlock("Unknown workspace", m.width, geometry.contentHeight)
+	}
+}
+
+func (m *Model) renderPrimaryAndInspector(title, primary string, geometry layoutGeometry) string {
+	if geometry.wide {
+		left := m.renderPane(title, primary, geometry.primaryWidth, geometry.contentHeight, m.focus == focusPrimary, false)
+		right := m.renderPane("Details · Markdown · Tab focuses", m.inspector.view(), geometry.detailWidth, geometry.contentHeight, m.focus == focusInspector, false)
+		return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+	}
+	if m.focus == focusInspector {
+		return m.renderPane("Details · Tab returns", m.inspector.view(), m.width, geometry.contentHeight, true, false)
+	}
+	return m.renderPane(title+" · Tab opens details", primary, m.width, geometry.contentHeight, true, false)
+}
+
+func (m *Model) renderOverlay(geometry layoutGeometry) string {
+	width, height := m.modalDimensions()
+	var title, body string
+	switch m.overlay.kind {
+	case overlayFinder, overlayCommands:
+		title = m.overlay.picker.title() + " · Esc closes"
+		body = m.overlay.picker.view()
+	case overlayForm:
+		if m.form == nil {
+			title, body = "Form", "The form is no longer available. Press Esc."
+		} else {
+			title = m.form.title + " · Esc cancels"
+			body = m.form.view()
+		}
+	case overlayHelp:
+		title = "Help · Esc or F10 closes"
+		body = m.helpViewport.View()
+	case overlayOperationError:
+		title = "Operation failed"
+		body = "The graph was not changed.\n\n" + errorText(m.operationErr) + "\n\nPress r to retry the exact request, or Esc to close."
+		body = wrapText(body, max(1, width-2))
+	default:
+		title, body = "Overlay", "Press Esc to close."
+	}
+	panel := m.renderPane(title, body, width, height, true, true)
+	return lipgloss.Place(m.width, geometry.contentHeight, lipgloss.Center, lipgloss.Center, panel)
+}
+
+func (m *Model) renderPane(title, body string, width, height int, focused, modal bool) string {
+	style := m.styles.border
+	if focused {
+		style = m.styles.focusedBorder
+	}
+	if modal {
+		style = m.styles.modalBorder
+	}
+	frameWidth, frameHeight := style.GetFrameSize()
+	innerWidth := max(1, width-frameWidth)
+	innerHeight := max(1, height-frameHeight)
+	titleStyle := m.styles.paneTitle
+	prefix := "  "
+	if focused {
+		titleStyle = m.styles.focusedTitle
+		prefix = "> "
+	}
+	titleLine := fitLine(titleStyle.Render(prefix+title), innerWidth)
+	body = fitBlock(body, innerWidth, max(0, innerHeight-1))
+	content := titleLine
+	if innerHeight > 1 {
+		content += "\n" + body
+	}
+	// Lip Gloss v2 treats Width and Height as the complete block dimensions,
+	// including borders. The content itself is clipped to the frame-adjusted
+	// inner dimensions above.
+	return style.Width(width).Height(height).Render(content)
 }
 
 func (m *Model) renderStatus() string {
-	left := m.status
-	if left == "" {
-		left = "Ready"
+	parts := make([]string, 0, 4)
+	if m.notice.text != "" {
+		parts = append(parts, m.notice.text)
 	}
-	if m.loading {
-		left = "Loading…"
+	if m.busy() {
+		activity := "working"
+		switch {
+		case m.executing:
+			activity = "executing Cypher"
+		case m.loadingGraph:
+			activity = "loading graph"
+		case m.loadingHistory:
+			activity = "loading timeline"
+		case m.inspector.loading:
+			activity = "rendering Markdown"
+		}
+		parts = append(parts, m.spinner.View()+" "+activity)
 	}
-	if m.executing {
-		left = "Executing Cypher…"
+	mode := fmt.Sprintf("revision %d", m.loadedRevision)
+	if m.historical() {
+		mode += " · READ-ONLY"
+	} else {
+		mode += " · Live"
 	}
-	right := statusKeys(m.tab, m.snapshot.IsCurrent())
-	return fitLine(m.styles.status.Render(joinSides(left, right, m.width)), m.width)
+	parts = append(parts, mode)
+	parts = append(parts, fmt.Sprintf("%d nodes · %d relationships", len(m.graph.nodes), len(m.graph.edges)))
+	if m.graphErr != nil {
+		parts = append(parts, "graph refresh failed")
+	}
+	if m.historyErr != nil {
+		parts = append(parts, "timeline refresh failed")
+	}
+	line := strings.Join(parts, "  |  ")
+	style := m.styles.status
+	switch m.notice.level {
+	case noticeError:
+		style = m.styles.error
+	case noticeSuccess:
+		style = m.styles.success
+	}
+	return fitLine(style.Render(line), m.width)
 }
 
-func helpText(tab Tab) string {
-	common := "GLOBAL\n  1–4 switch view*  ctrl+←/→ switch view   ctrl+k commands\n  ? help             r refresh              q quit\n  mouse click select tabs/items · wheel scroll\n  *outside the Query editors\n\n"
-	switch tab {
-	case OutlineTab:
-		return common + "OUTLINE\n  j/k or ↑/↓ select  h/l collapse/expand   / filter\n  c create  e edit  p reparent  d delete  i inspect"
-	case GraphTab:
-		return common + "GRAPH\n  j/k select  h/l horizontal pan  pgup/pgdown vertical pan\n  +/- zoom detail  0 reset  / filter  enter/i inspect\n  c create  e edit  p reparent  d delete"
-	case QueryTab:
-		return common + "QUERY\n  tab/shift+tab focus editor, params, results\n  ctrl+r read-only query  ctrl+x execute  ctrl+enter read\n  result focus: j/k/h/l scroll"
-	case HistoryTab:
-		return common + "HISTORY\n  j/k select revision  enter open snapshot  l return to Live"
+func (m *Model) renderShortHelp() string {
+	m.help.SetWidth(m.width)
+	return fitLine(m.help.ShortHelpView(m.contextShortHelp()), m.width)
+}
+
+func (m *Model) contextShortHelp() []key.Binding {
+	if m.overlay.kind != overlayNone {
+		switch m.overlay.kind {
+		case overlayFinder, overlayCommands:
+			return []key.Binding{m.keys.Open, m.keys.Back}
+		case overlayForm:
+			return []key.Binding{
+				binding("enter / tab", "next or submit", "enter", "tab"),
+				binding("shift+tab", "previous field", "shift+tab"),
+				binding("esc", "cancel form", "esc"),
+			}
+		case overlayHelp:
+			return []key.Binding{m.keys.Back}
+		case overlayOperationError:
+			return []key.Binding{binding("r", "retry", "r"), m.keys.Back}
+		}
+	}
+	global := []key.Binding{m.keys.Palette, m.keys.Help}
+	if m.historical() {
+		global = append([]key.Binding{m.keys.ReturnLive}, global...)
+	}
+	switch m.workspace {
+	case WorkWorkspace:
+		if m.focus == focusInspector {
+			return append(global, m.keys.TogglePane, m.keys.Back)
+		}
+		local := []key.Binding{m.work.tree.KeyMap.Up, m.work.tree.KeyMap.Down, m.keys.Open, enabledBinding(m.keys.NewNode, !m.historical()), m.keys.Find}
+		return append(global, local...)
+	case RelationshipsWorkspace:
+		local := []key.Binding{m.relationships.list.KeyMap.CursorUp, m.relationships.list.KeyMap.CursorDown, m.relationships.list.KeyMap.Filter, enabledBinding(m.keys.Edit, !m.historical()), enabledBinding(m.keys.Connect, !m.historical())}
+		return append(global, local...)
+	case QueryWorkspace:
+		return append(global, m.keys.TogglePane, m.keys.RunQuery, enabledBinding(m.keys.ExecQuery, !m.historical()), m.keys.PreviousTab, m.keys.NextTab)
+	case TimelineWorkspace:
+		return append(global, m.timeline.list.KeyMap.CursorUp, m.timeline.list.KeyMap.CursorDown, m.keys.Open, m.timeline.list.KeyMap.Filter)
 	default:
-		return common
+		return global
 	}
 }
 
-func mutationHint(kind mutationKind) string {
-	switch kind {
-	case mutationCreate:
-		return "Edit JSON. parent_id may be empty for a root; null position means unordered."
-	case mutationEdit:
-		return "Edit labels, the complete property map, and Markdown body."
-	case mutationReparent:
-		return "Set parent_id to a node ID, or empty to make this node a root."
-	default:
-		return ""
+func (m *Model) contextFullHelp() [][]key.Binding {
+	global := []key.Binding{m.keys.Palette, m.keys.Help, m.keys.Refresh, m.keys.PreviousTab, m.keys.NextTab, m.keys.Quit}
+	workspaces := []key.Binding{m.keys.Work, m.keys.Relationships, m.keys.Query, m.keys.Timeline}
+	if m.historical() {
+		global = append([]key.Binding{m.keys.ReturnLive}, global...)
 	}
-}
-
-func statusKeys(tab Tab, live bool) string {
-	switch tab {
-	case OutlineTab:
-		if live {
-			return "j/k select · / search · c/e/p/d mutate"
+	effectiveOverlay := m.overlay.kind
+	if effectiveOverlay == overlayHelp {
+		effectiveOverlay = m.overlayReturn
+	}
+	if effectiveOverlay != overlayNone {
+		global = []key.Binding{m.keys.Help, m.keys.Refresh, m.keys.PreviousTab, m.keys.NextTab, m.keys.Quit}
+		if m.historical() {
+			global = append([]key.Binding{m.keys.ReturnLive}, global...)
 		}
-		return "j/k select · / search · read-only"
-	case GraphTab:
-		return "j/k select · h/l pan · +/- zoom"
-	case QueryTab:
-		if live {
-			return "ctrl+r read · ctrl+x execute"
+		var local []key.Binding
+		switch effectiveOverlay {
+		case overlayFinder, overlayCommands:
+			local = []key.Binding{m.keys.Open, m.keys.Back}
+		case overlayForm:
+			local = []key.Binding{
+				binding("enter / tab", "next or submit", "enter", "tab"),
+				binding("shift+tab", "previous field", "shift+tab"),
+				binding("alt+enter", "newline in text", "alt+enter", "ctrl+j"),
+				binding("esc", "cancel form", "esc"),
+			}
+		case overlayOperationError:
+			local = []key.Binding{binding("r", "retry exact request", "r"), m.keys.Back}
 		}
-		return "ctrl+r read · historical read-only"
-	case HistoryTab:
-		return "enter open · l Live"
-	default:
-		return ""
+		return [][]key.Binding{local, workspaces, global}
 	}
+	var local []key.Binding
+	switch m.workspace {
+	case WorkWorkspace:
+		local = []key.Binding{m.work.tree.KeyMap.Up, m.work.tree.KeyMap.Down, m.work.tree.KeyMap.Open, m.work.tree.KeyMap.Close, m.work.tree.KeyMap.Toggle, m.keys.TogglePane, m.keys.Find, enabledBinding(m.keys.NewNode, !m.historical()), enabledBinding(m.keys.Edit, !m.historical()), enabledBinding(m.keys.Move, !m.historical()), enabledBinding(m.keys.Connect, !m.historical()), enabledBinding(m.keys.Delete, !m.historical())}
+	case RelationshipsWorkspace:
+		local = []key.Binding{m.relationships.list.KeyMap.CursorUp, m.relationships.list.KeyMap.CursorDown, m.relationships.list.KeyMap.Filter, m.keys.TogglePane, enabledBinding(m.keys.Edit, !m.historical()), enabledBinding(m.keys.Connect, !m.historical()), enabledBinding(m.keys.Delete, !m.historical())}
+	case QueryWorkspace:
+		local = []key.Binding{m.keys.TogglePane, m.keys.RunQuery, enabledBinding(m.keys.ExecQuery, !m.historical()), m.keys.PreviousSet, m.keys.NextSet}
+	case TimelineWorkspace:
+		local = []key.Binding{m.timeline.list.KeyMap.CursorUp, m.timeline.list.KeyMap.CursorDown, m.timeline.list.KeyMap.Filter, m.keys.Open, m.keys.TogglePane}
+	}
+	return [][]key.Binding{local, workspaces, global}
 }
 
-func summaryText(summary app.Summary) string {
-	changes := []string{}
-	appendChange := func(count uint64, name string) {
-		if count > 0 {
-			changes = append(changes, fmt.Sprintf("%d %s", count, name))
+func (m *Model) refreshHelpContent() {
+	workflow := "\n\nWorkflow notes\n" +
+		"• Work is the structural CHILD hierarchy. Ordered children show a number; ◇ means unordered.\n" +
+		"• Relationships contains every edge, including CHILD, and / filters the real list.\n" +
+		"• Query read mode rejects writes. Write-capable execution always asks for confirmation.\n" +
+		"• Opening a Timeline revision makes every workspace read-only until Return to Live.\n" +
+		"• F1–F4 switch workspaces from any focus; Ctrl+K exposes every primary action when no modal is open."
+	m.helpViewport.SetContent(m.help.FullHelpView(m.contextFullHelp()) + workflow)
+}
+
+func (m *Model) workspaceAt(x int) (Workspace, bool) {
+	position := ansi.StringWidth(m.headerPrefix())
+	for workspace := WorkWorkspace; workspace <= TimelineWorkspace; workspace++ {
+		width := ansi.StringWidth(m.renderTab(workspace))
+		if x >= position && x < position+width {
+			return workspace, true
 		}
+		position += width
 	}
-	appendChange(summary.NodesCreated, "nodes created")
-	appendChange(summary.NodesUpdated, "nodes updated")
-	appendChange(summary.NodesDeleted, "nodes deleted")
-	appendChange(summary.RelationshipsCreated, "edges created")
-	appendChange(summary.RelationshipsUpdated, "edges updated")
-	appendChange(summary.RelationshipsDeleted, "edges deleted")
-	if len(changes) == 0 {
-		return "read-only"
-	}
-	return strings.Join(changes, ", ")
+	return 0, false
 }
 
-func tableRow(values []string, widths []int) string {
-	cells := make([]string, len(widths))
-	for index, width := range widths {
-		value := ""
-		if index < len(values) {
-			value = values[index]
-		}
-		value = ansi.Truncate(value, width, "…")
-		cells[index] = value + strings.Repeat(" ", max(0, width-ansi.StringWidth(value)))
+func (m *Model) workRowAt(x, y int) (int, bool) {
+	geometry := m.geometry()
+	if y < geometry.contentTop+2 || y >= geometry.contentTop+geometry.contentHeight-1 {
+		return 0, false
 	}
-	return strings.Join(cells, " │ ")
+	if x < 1 || x >= geometry.primaryWidth-1 {
+		return 0, false
+	}
+	if !geometry.wide && m.focus != focusPrimary {
+		return 0, false
+	}
+	return y - geometry.contentTop - 2, true
 }
 
-func formatValue(value any) string {
-	if value == nil {
-		return "null"
-	}
-	if text, ok := value.(string); ok {
-		return strings.ReplaceAll(text, "\n", "↵")
-	}
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Sprint(value)
-	}
-	return string(encoded)
-}
-
-func validity(from domain.Revision, to *domain.Revision) string {
-	end := "∞"
-	if to != nil {
-		end = fmt.Sprintf("r%d", *to)
-	}
-	return fmt.Sprintf("[r%d, %s)", from, end)
-}
-
-func emptyAs(value, fallback string) string {
-	if value == "" {
-		return fallback
-	}
-	return value
-}
-
-func joinSides(left, right string, width int) string {
-	space := width - ansi.StringWidth(left) - ansi.StringWidth(right)
-	if space < 1 {
-		return fitLine(left+" "+right, width)
-	}
-	return left + strings.Repeat(" ", space) + right
-}
-
-func fitLine(line string, width int) string {
-	if width <= 0 {
+func fitBlock(value string, width, height int) string {
+	if width <= 0 || height <= 0 {
 		return ""
 	}
-	line = ansi.Truncate(strings.ReplaceAll(line, "\n", " "), width, "…")
-	return line + strings.Repeat(" ", max(0, width-ansi.StringWidth(line)))
-}
-
-func cutFrom(line string, offset, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	lineWidth := ansi.StringWidth(line)
-	if offset >= lineWidth {
-		return ""
-	}
-	return ansi.Cut(line, max(0, offset), min(lineWidth, max(0, offset)+width))
-}
-
-func fitBlock(content string, width, height int) string {
-	lines := strings.Split(content, "\n")
+	lines := strings.Split(strings.ReplaceAll(value, "\r\n", "\n"), "\n")
 	if len(lines) > height {
 		lines = lines[:height]
 	}
@@ -659,6 +462,73 @@ func fitBlock(content string, width, height int) string {
 	return strings.Join(lines, "\n")
 }
 
-func placeText(width, height int, content string) string {
-	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, content)
+func wrapText(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	value = ansi.Wordwrap(value, width, "")
+	return ansi.Hardwrap(value, width, true)
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return "Unknown error"
+	}
+	return err.Error()
+}
+
+// stripANSIColors removes SGR foreground/background parameters while leaving
+// non-color terminal affordances such as the input cursor's reverse-video cell
+// intact. Some composed third-party fields retain their own default colors even
+// after a colorless theme is supplied, so the accessibility boundary is the
+// final deterministic render.
+func stripANSIColors(value string) string {
+	var result strings.Builder
+	for index := 0; index < len(value); {
+		start := strings.Index(value[index:], "\x1b[")
+		if start < 0 {
+			result.WriteString(value[index:])
+			break
+		}
+		start += index
+		result.WriteString(value[index:start])
+		end := strings.IndexByte(value[start+2:], 'm')
+		if end < 0 {
+			result.WriteString(value[start:])
+			break
+		}
+		end += start + 2
+		parameters := strings.Split(value[start+2:end], ";")
+		kept := make([]string, 0, len(parameters))
+		for parameterIndex := 0; parameterIndex < len(parameters); parameterIndex++ {
+			parameter, err := strconv.Atoi(parameters[parameterIndex])
+			if err != nil {
+				kept = append(kept, parameters[parameterIndex])
+				continue
+			}
+			if parameter == 38 || parameter == 48 {
+				if parameterIndex+1 < len(parameters) {
+					mode, _ := strconv.Atoi(parameters[parameterIndex+1])
+					switch mode {
+					case 5:
+						parameterIndex += min(2, len(parameters)-parameterIndex-1)
+					case 2:
+						parameterIndex += min(4, len(parameters)-parameterIndex-1)
+					}
+				}
+				continue
+			}
+			if (parameter >= 30 && parameter <= 37) || (parameter >= 40 && parameter <= 47) || parameter == 39 || parameter == 49 || (parameter >= 90 && parameter <= 107) {
+				continue
+			}
+			kept = append(kept, parameters[parameterIndex])
+		}
+		if len(kept) > 0 {
+			result.WriteString("\x1b[")
+			result.WriteString(strings.Join(kept, ";"))
+			result.WriteByte('m')
+		}
+		index = end + 1
+	}
+	return result.String()
 }

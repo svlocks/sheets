@@ -2,261 +2,214 @@ package tui
 
 import (
 	"context"
+	"os"
 	"time"
 
-	"charm.land/bubbles/v2/textarea"
-	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/domain"
 )
 
-// Tab identifies one of the four primary workspaces.
-type Tab uint8
+const defaultPollInterval = 2 * time.Second
 
-const (
-	OutlineTab Tab = iota
-	GraphTab
-	QueryTab
-	HistoryTab
-)
-
-var tabNames = [...]string{"Outline", "Graph", "Query", "History"}
-
-func (t Tab) String() string {
-	if int(t) < len(tabNames) {
-		return tabNames[t]
-	}
-	return "Unknown"
-}
-
-type overlayKind uint8
-
-const (
-	overlayNone overlayKind = iota
-	overlaySearch
-	overlayPalette
-	overlayHelp
-	overlayInspector
-	overlayMutation
-)
-
-type mutationKind uint8
-
-const (
-	mutationCreate mutationKind = iota + 1
-	mutationEdit
-	mutationReparent
-	mutationDelete
-)
-
-type focusArea uint8
-
-const (
-	focusQuery focusArea = iota
-	focusParams
-	focusResults
-)
-
-type outlineRow struct {
-	ID       domain.EntityID
-	Depth    int
-	Orphan   bool
-	Cycle    bool
-	HasKids  bool
-	Section  string
-	Position *int64
-}
-
-type graphRow struct {
-	ID    domain.EntityID
-	Lines []string
-}
-
-type hitKind uint8
-
-const (
-	hitTab hitKind = iota + 1
-	hitNode
-	hitHistory
-	hitOverlay
-)
-
-type hitArea struct {
-	Kind       hitKind
-	X0, X1     int
-	Y0, Y1     int
-	Tab        Tab
-	Node       domain.EntityID
-	Revision   domain.Revision
-	OverlayRow int
-}
-
-// Option configures a model. The defaults are appropriate for an interactive
-// program; tests can turn polling off for deterministic command behavior.
 type Option func(*Model)
 
-// WithPollInterval controls revision-token polling. A non-positive duration
-// disables polling.
+// WithPollInterval changes revision-token polling. A non-positive duration
+// disables polling, which is useful for deterministic tests.
 func WithPollInterval(interval time.Duration) Option {
-	return func(m *Model) { m.pollInterval = interval }
+	return func(model *Model) { model.pollInterval = interval }
 }
 
-// WithNoColor disables all semantic colors while preserving spacing, borders,
-// selection markers, and emphasis.
+// WithNoColor removes semantic color while preserving ASCII borders, cursor
+// visibility, labels, and focus prefixes.
 func WithNoColor(noColor bool) Option {
-	return func(m *Model) {
-		m.noColor = noColor
-		m.styles = makeStyles(m.dark, noColor)
-	}
+	return func(model *Model) { model.noColor = noColor }
 }
 
-// WithDarkBackground chooses the initial adaptive palette. Interactive runs
-// refine this after Bubble Tea reports the terminal background.
+// WithDarkBackground supplies an initial palette before Bubble Tea reports the
+// terminal background.
 func WithDarkBackground(dark bool) Option {
-	return func(m *Model) {
-		m.dark = dark
-		m.styles = makeStyles(dark, m.noColor)
-	}
+	return func(model *Model) { model.dark = dark }
 }
 
-// Model is a Bubble Tea model and is intentionally usable directly in tests.
-// Update and View do not require a real terminal.
+type paneFocus uint8
+
+const (
+	focusPrimary paneFocus = iota
+	focusInspector
+)
+
+type noticeLevel uint8
+
+const (
+	noticeInfo noticeLevel = iota
+	noticeSuccess
+	noticeError
+)
+
+type noticeState struct {
+	text   string
+	level  noticeLevel
+	serial uint64
+}
+
+type executionKind uint8
+
+const (
+	executionQuery executionKind = iota + 1
+	executionMutation
+	executionConsole
+)
+
+type pendingOperation struct {
+	request app.ExecuteRequest
+	kind    executionKind
+	purpose formPurpose
+}
+
+// Model is the root coordinator. Stateful widgets live in dedicated submodels;
+// this type owns routing, async command generations, snapshot mode, and layout.
 type Model struct {
-	backend Backend
 	ctx     context.Context
+	backend Backend
 
-	width, height int
-	tab           Tab
-	styles        styles
-	dark          bool
-	noColor       bool
+	width     int
+	height    int
+	workspace Workspace
+	focus     paneFocus
+	dark      bool
+	noColor   bool
+	styles    styleSet
+	keys      keyMap
 
-	nodes      []domain.Node
-	edges      []domain.Edge
-	nodeByID   map[domain.EntityID]domain.Node
-	history    []domain.RevisionInfo
-	liveRev    domain.Revision
-	snapshot   domain.Snapshot
-	loading    bool
-	loadSerial uint64
-	err        error
-	status     string
+	work          workModel
+	relationships relationshipsModel
+	query         queryModel
+	timeline      timelineModel
+	inspector     inspectorModel
+	help          help.Model
+	helpViewport  viewport.Model
+	spinner       spinner.Model
 
-	selected        domain.EntityID
-	outlineRows     []outlineRow
-	outlineIndex    int
-	outlineOffset   int
-	collapsed       map[domain.EntityID]bool
-	graphRows       []graphRow
-	graphIndex      int
-	graphPanX       int
-	graphPanY       int
-	graphZoom       int
-	inspectorScroll int
+	graph          graphState
+	revisions      []domain.RevisionInfo
+	snapshot       domain.Snapshot
+	loadTarget     domain.Snapshot
+	loadedRevision domain.Revision
+	liveRevision   domain.Revision
 
-	query      textarea.Model
-	params     textarea.Model
-	queryFocus focusArea
-	result     *app.BatchResult
-	queryErr   error
-	resultY    int
-	resultX    int
-	executing  bool
-	execSerial uint64
+	overlay       pickerOverlay
+	overlayReturn overlayKind
+	form          *formController
+	formSeq       uint64
+	pickerSeq     uint64
 
-	historyIndex  int
-	historyOffset int
-
-	overlay       overlayKind
-	search        textinput.Model
-	palette       textinput.Model
-	paletteIndex  int
-	mutation      mutationKind
-	mutationInput textarea.Model
-	mutationErr   error
-
-	showInspector bool
 	pollInterval  time.Duration
-	hits          []hitArea
-	hitOffsetX    int
+	loadSeq       uint64
+	historySeq    uint64
+	execSeq       uint64
+	loadCancel    context.CancelFunc
+	historyCancel context.CancelFunc
+	execCancel    context.CancelFunc
+
+	loadingGraph    bool
+	loadingHistory  bool
+	historyReady    bool
+	executing       bool
+	pending         *pendingOperation
+	operationErr    error
+	graphErr        error
+	historyErr      error
+	notice          noticeState
+	selectAfterLoad domain.EntityID
 }
 
-// NewModel constructs a testable TUI model without starting terminal I/O.
+type pickerOverlay struct {
+	kind   overlayKind
+	picker pickerModel
+}
+
 func NewModel(ctx context.Context, backend Backend, options ...Option) *Model {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	query := textarea.New()
-	query.Placeholder = "MATCH (n) RETURN n"
-	query.ShowLineNumbers = true
-	query.SetHeight(7)
-	query.SetWidth(72)
-	query.SetValue("MATCH (n) RETURN n")
-	_ = query.Focus()
-
-	params := textarea.New()
-	params.Placeholder = "{}"
-	params.ShowLineNumbers = false
-	params.SetHeight(4)
-	params.SetWidth(72)
-	params.SetValue("{}")
-
-	search := textinput.New()
-	search.Prompt = "/ "
-	search.Placeholder = "title, label, property, ID…"
-	search.SetWidth(48)
-
-	palette := textinput.New()
-	palette.Prompt = "> "
-	palette.Placeholder = "Type a command…"
-	palette.SetWidth(52)
-
-	mutation := textarea.New()
-	mutation.ShowLineNumbers = false
-	mutation.SetHeight(14)
-	mutation.SetWidth(70)
-
-	m := &Model{
-		backend:       backend,
-		ctx:           ctx,
-		width:         100,
-		height:        30,
-		dark:          true,
-		styles:        makeStyles(true, false),
-		nodeByID:      make(map[domain.EntityID]domain.Node),
-		collapsed:     make(map[domain.EntityID]bool),
-		graphZoom:     2,
-		query:         query,
-		params:        params,
-		queryFocus:    focusQuery,
-		search:        search,
-		palette:       palette,
-		mutationInput: mutation,
-		showInspector: true,
-		pollInterval:  2 * time.Second,
+	_, environmentNoColor := os.LookupEnv("NO_COLOR")
+	model := &Model{
+		ctx: ctx, backend: backend, width: 100, height: 30,
+		workspace: WorkWorkspace, focus: focusPrimary, dark: true,
+		noColor: environmentNoColor, keys: defaultKeyMap(), pollInterval: defaultPollInterval,
 	}
 	for _, option := range options {
 		if option != nil {
-			option(m)
+			option(model)
 		}
 	}
-	return m
+	model.styles = makeStyles(model.dark, model.noColor)
+	model.work = newWorkModel(model.styles, model.dark)
+	model.relationships = newRelationshipsModel(model.styles, model.dark)
+	model.query = newQueryModel(model.styles, model.dark)
+	model.timeline = newTimelineModel(model.styles, model.dark)
+	model.inspector = newInspectorModel(model.dark, model.noColor)
+	model.help = help.New()
+	model.help.Styles = model.styles.helpStyles(model.dark)
+	model.helpViewport = viewport.New(viewport.WithWidth(80), viewport.WithHeight(20))
+	model.helpViewport.SoftWrap = true
+	model.helpViewport.FillHeight = true
+	model.spinner = spinner.New(spinner.WithSpinner(spinner.Dot))
+	_ = model.layoutComponents()
+	return model
 }
 
-// Run starts the full-screen terminal program and honors caller cancellation.
 func Run(ctx context.Context, backend Backend, options ...Option) error {
-	m := NewModel(ctx, backend, options...)
-	_, err := tea.NewProgram(m, tea.WithContext(m.ctx)).Run()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	runContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	model := NewModel(runContext, backend, options...)
+	_, err := tea.NewProgram(model, tea.WithContext(runContext)).Run()
 	return err
 }
 
-// Init starts the initial snapshot/history loads and requests terminal color
-// information. Polling uses only CurrentRevision as an invalidation token.
 func (m *Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{m.loadGraphCmd(domain.Snapshot{}), m.loadHistoryCmd(), tea.RequestBackgroundColor}
-	if m.pollInterval > 0 {
-		cmds = append(cmds, m.pollCmd())
+	commands := []tea.Cmd{
+		m.startSnapshotLoad(domain.Snapshot{}),
+		m.startHistoryLoad(),
+		tea.RequestBackgroundColor,
 	}
-	return tea.Batch(cmds...)
+	if m.pollInterval > 0 {
+		commands = append(commands, m.pollDelayCmd())
+	}
+	return tea.Batch(commands...)
+}
+
+func (m *Model) View() tea.View {
+	view := tea.NewView(m.render())
+	view.AltScreen = true
+	view.MouseMode = tea.MouseModeCellMotion
+	view.ReportFocus = true
+	view.WindowTitle = "sheets"
+	return view
+}
+
+func (m *Model) historical() bool {
+	return !m.snapshot.IsCurrent() || m.loadingGraph && !m.loadTarget.IsCurrent()
+}
+
+// selectedSnapshot is the user's latest requested state, which can differ
+// briefly from the last rendered snapshot while an asynchronous load runs.
+// Polling, refresh, and read-only queries must honor that intent instead of
+// canceling or bypassing a pending historical selection.
+func (m *Model) selectedSnapshot() domain.Snapshot {
+	if m.loadingGraph {
+		return m.loadTarget
+	}
+	return m.snapshot
+}
+
+func (m *Model) busy() bool {
+	return m.loadingGraph || m.loadingHistory || m.executing || m.inspector.loading
 }
