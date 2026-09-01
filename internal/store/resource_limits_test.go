@@ -96,6 +96,25 @@ func TestMakeDSNAnchorsRelativeFileURIButPreservesMemoryURI(t *testing.T) {
 	}
 }
 
+func TestMakeDSNAnchorsWindowsDriveWithoutAuthority(t *testing.T) {
+	// Drive-letter paths would otherwise serialize as file://C:/x, which
+	// SQLite's URI parser reads as an "invalid uri authority: C:".
+	dsn, err := makeDSN("C:/work/sheets.db", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uri, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uri.Host != "" {
+		t.Fatalf("drive path produced an authority %q: %s", uri.Host, dsn)
+	}
+	if uri.Path == "" || uri.Path[0] != '/' {
+		t.Fatalf("drive path not anchored with a leading slash: %s", dsn)
+	}
+}
+
 func TestStoreMutationLimitsAreTypedAndDoNotAllocateRevisions(t *testing.T) {
 	ctx := context.Background()
 	database := openTestStore(t, filepath.Join(t.TempDir(), "limits.db"))

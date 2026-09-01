@@ -188,7 +188,14 @@ func makeDSN(path string, busy time.Duration) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("resolve database path: %w", err)
 		}
-		path = (&url.URL{Scheme: "file", Path: filepath.ToSlash(absolute)}).String()
+		slash := filepath.ToSlash(absolute)
+		// A Windows drive path ("C:/x") serializes as file://C:/x, which
+		// SQLite reads as a URI authority and rejects. Anchor it so Go emits
+		// file:///C:/x.
+		if len(slash) >= 3 && slash[0] != '/' && slash[1] == ':' && slash[2] == '/' {
+			slash = "/" + slash
+		}
+		path = (&url.URL{Scheme: "file", Path: slash}).String()
 	}
 	uri, err := url.Parse(path)
 	if err != nil {
