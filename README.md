@@ -2,9 +2,6 @@
 
 Graph storage for agents. One binary, one SQLite file, no server.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/svlocks/sheets/ci.yml?branch=main)](https://github.com/svlocks/sheets/actions/workflows/ci.yml)
-[![Go version](https://img.shields.io/github/go-mod/go-version/svlocks/sheets)](go.mod)
-
 sheets is a temporal property graph. You write Cypher against it, everything
 lands in a single SQLite file, and every write creates a new revision instead
 of clobbering the last one. So you can read the graph as it looked five
