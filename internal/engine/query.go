@@ -605,6 +605,16 @@ func containsAggregate(expression cypher.Expression) bool {
 				return true
 			}
 		}
+	case *cypher.ListComprehension:
+		return containsAggregate(expression.List) ||
+			containsAggregate(expression.Where) ||
+			containsAggregate(expression.Projection)
+	case *cypher.ListPredicate:
+		return containsAggregate(expression.List) || containsAggregate(expression.Where)
+	case *cypher.ReduceExpression:
+		return containsAggregate(expression.Initial) ||
+			containsAggregate(expression.List) ||
+			containsAggregate(expression.Expression)
 	}
 	return false
 }

@@ -106,3 +106,13 @@ func TestErrorEvidenceRedactsGeneratedEntityIDs(t *testing.T) {
 		t.Fatalf("stableError = %q, want %q", got, want)
 	}
 }
+
+func TestExpectedErrorCategoryDoesNotAcceptGenericContextMessage(t *testing.T) {
+	expectation := "a SyntaxError should be raised at compile time: UnexpectedSyntax"
+	if matched, supported := matchExpectedError(expectation, errors.New("aggregate functions are not allowed in this context")); matched || !supported {
+		t.Fatalf("unrelated context error matched: matched=%v supported=%v", matched, supported)
+	}
+	if matched, supported := matchExpectedError(expectation, errors.New("pattern expression is not allowed in this context")); !matched || !supported {
+		t.Fatalf("pattern placement error did not match: matched=%v supported=%v", matched, supported)
+	}
+}

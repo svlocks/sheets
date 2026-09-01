@@ -226,6 +226,7 @@ func validateMutationPatterns(patterns []cypher.PatternPart, create bool) error 
 
 func validateProjection(source string, clause *cypher.ProjectionClause, input variableScope) (variableScope, []string, error) {
 	aggregates := projectionAggregates(clause.Items)
+	aggregateScope := aggregateScopeForProjection(source, clause.Items, false)
 	hasStar := false
 	for _, item := range clause.Items {
 		if item.Star {
@@ -244,8 +245,10 @@ func validateProjection(source string, clause *cypher.ProjectionClause, input va
 		if err := validateAggregateShape(item.Expression, false); err != nil {
 			return nil, nil, err
 		}
-		if containsAggregate(item.Expression) && hasVariableOutsideAggregate(item.Expression, false) {
-			return nil, nil, semanticError(item.Expression, "variables outside an aggregate in the same projection expression are not supported; project the grouping key separately")
+		if containsAggregate(item.Expression) {
+			if err := validateAggregateExpressionPart(source, item.Expression, aggregateScope, false, true, nil); err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 	output := variableScope{}
@@ -319,6 +322,11 @@ type aggregateOrderScope struct {
 }
 
 func validateAggregateOrderExpression(source string, expression cypher.Expression, items []cypher.ProjectionItem) error {
+	scope := aggregateScopeForProjection(source, items, true)
+	return validateAggregateExpressionPart(source, expression, scope, false, false, nil)
+}
+
+func aggregateScopeForProjection(source string, items []cypher.ProjectionItem, includeAliases bool) aggregateOrderScope {
 	scope := aggregateOrderScope{
 		aliases:          make(map[string]struct{}),
 		groupingAtoms:    make(map[string]struct{}),
@@ -330,7 +338,7 @@ func validateAggregateOrderExpression(source string, expression cypher.Expressio
 			scope.star = true
 			continue
 		}
-		if item.Alias.Name != "" {
+		if includeAliases && item.Alias.Name != "" {
 			scope.aliases[item.Alias.Name] = struct{}{}
 		}
 		collectAggregateExpressionKeys(source, item.Expression, scope.aggregates)
@@ -344,14 +352,24 @@ func validateAggregateOrderExpression(source string, expression cypher.Expressio
 			collectExpressionVariables(item.Expression, scope.complexVariables)
 		}
 	}
-	return validateAggregateOrderPart(source, expression, scope, false)
+	return scope
 }
 
-func validateAggregateOrderPart(source string, expression cypher.Expression, scope aggregateOrderScope, insideAggregate bool) error { //nolint:gocyclo
+func validateAggregateExpressionPart( //nolint:gocyclo
+	source string,
+	expression cypher.Expression,
+	scope aggregateOrderScope,
+	insideAggregate bool,
+	projection bool,
+	locals map[string]struct{},
+) error {
 	switch expression := expression.(type) {
 	case nil, *cypher.Literal, *cypher.Parameter:
 		return nil
 	case *cypher.Variable:
+		if _, local := locals[expression.Name.Name]; local {
+			return nil
+		}
 		if scope.star {
 			return nil
 		}
@@ -364,6 +382,9 @@ func validateAggregateOrderPart(source string, expression cypher.Expression, sco
 		if _, complex := scope.complexVariables[expression.Name.Name]; complex && !insideAggregate {
 			return semanticError(expression, "variables outside an aggregate must be projected as simple grouping keys")
 		}
+		if projection && !insideAggregate {
+			return semanticError(expression, "variables outside an aggregate must be projected as simple grouping keys")
+		}
 		return semanticError(expression, "variable %q is not defined in the aggregate projection", expression.Name.Name)
 	case *cypher.PropertyExpression:
 		if scope.star {
@@ -373,12 +394,18 @@ func validateAggregateOrderPart(source string, expression cypher.Expression, sco
 			return nil
 		}
 		if variable, ok := expression.Expression.(*cypher.Variable); ok {
+			if _, local := locals[variable.Name.Name]; local {
+				return nil
+			}
 			if _, complex := scope.complexVariables[variable.Name.Name]; complex && !insideAggregate {
+				return semanticError(expression, "variables outside an aggregate must be projected as simple grouping keys")
+			}
+			if projection && !insideAggregate {
 				return semanticError(expression, "variables outside an aggregate must be projected as simple grouping keys")
 			}
 			return semanticError(expression, "variable %q is not defined in the aggregate projection", variable.Name.Name)
 		}
-		return validateAggregateOrderPart(source, expression.Expression, scope, insideAggregate)
+		return validateAggregateExpressionPart(source, expression.Expression, scope, insideAggregate, projection, locals)
 	case *cypher.FunctionInvocation:
 		aggregate := isAggregate(strings.ToLower(expression.Name.String()))
 		if aggregate {
@@ -387,57 +414,89 @@ func validateAggregateOrderPart(source string, expression cypher.Expression, sco
 			}
 		}
 		for _, argument := range expression.Arguments {
-			if err := validateAggregateOrderPart(source, argument, scope, insideAggregate || aggregate); err != nil {
+			if err := validateAggregateExpressionPart(source, argument, scope, insideAggregate || aggregate, projection, locals); err != nil {
 				return err
 			}
 		}
 	case *cypher.UnaryExpression:
-		return validateAggregateOrderPart(source, expression.Expression, scope, insideAggregate)
+		return validateAggregateExpressionPart(source, expression.Expression, scope, insideAggregate, projection, locals)
 	case *cypher.BinaryExpression:
-		if err := validateAggregateOrderPart(source, expression.Left, scope, insideAggregate); err != nil {
+		if err := validateAggregateExpressionPart(source, expression.Left, scope, insideAggregate, projection, locals); err != nil {
 			return err
 		}
-		return validateAggregateOrderPart(source, expression.Right, scope, insideAggregate)
+		return validateAggregateExpressionPart(source, expression.Right, scope, insideAggregate, projection, locals)
 	case *cypher.IsNullExpression:
-		return validateAggregateOrderPart(source, expression.Expression, scope, insideAggregate)
+		return validateAggregateExpressionPart(source, expression.Expression, scope, insideAggregate, projection, locals)
 	case *cypher.LabelExpression:
-		return validateAggregateOrderPart(source, expression.Expression, scope, insideAggregate)
+		return validateAggregateExpressionPart(source, expression.Expression, scope, insideAggregate, projection, locals)
 	case *cypher.IndexExpression:
-		if err := validateAggregateOrderPart(source, expression.Expression, scope, insideAggregate); err != nil {
+		if err := validateAggregateExpressionPart(source, expression.Expression, scope, insideAggregate, projection, locals); err != nil {
 			return err
 		}
-		return validateAggregateOrderPart(source, expression.Index, scope, insideAggregate)
+		return validateAggregateExpressionPart(source, expression.Index, scope, insideAggregate, projection, locals)
 	case *cypher.SliceExpression:
 		for _, child := range []cypher.Expression{expression.Expression, expression.Start, expression.End} {
-			if err := validateAggregateOrderPart(source, child, scope, insideAggregate); err != nil {
+			if err := validateAggregateExpressionPart(source, child, scope, insideAggregate, projection, locals); err != nil {
 				return err
 			}
 		}
 	case *cypher.ListLiteral:
 		for _, child := range expression.Elements {
-			if err := validateAggregateOrderPart(source, child, scope, insideAggregate); err != nil {
+			if err := validateAggregateExpressionPart(source, child, scope, insideAggregate, projection, locals); err != nil {
 				return err
 			}
 		}
 	case *cypher.MapLiteral:
 		for _, entry := range expression.Entries {
-			if err := validateAggregateOrderPart(source, entry.Value, scope, insideAggregate); err != nil {
+			if err := validateAggregateExpressionPart(source, entry.Value, scope, insideAggregate, projection, locals); err != nil {
 				return err
 			}
 		}
 	case *cypher.CaseExpression:
 		for _, child := range []cypher.Expression{expression.Operand, expression.Else} {
-			if err := validateAggregateOrderPart(source, child, scope, insideAggregate); err != nil {
+			if err := validateAggregateExpressionPart(source, child, scope, insideAggregate, projection, locals); err != nil {
 				return err
 			}
 		}
 		for _, alternative := range expression.Alternatives {
-			if err := validateAggregateOrderPart(source, alternative.When, scope, insideAggregate); err != nil {
+			if err := validateAggregateExpressionPart(source, alternative.When, scope, insideAggregate, projection, locals); err != nil {
 				return err
 			}
-			if err := validateAggregateOrderPart(source, alternative.Then, scope, insideAggregate); err != nil {
+			if err := validateAggregateExpressionPart(source, alternative.Then, scope, insideAggregate, projection, locals); err != nil {
 				return err
 			}
+		}
+	case *cypher.ListComprehension:
+		if err := validateAggregateExpressionPart(source, expression.List, scope, insideAggregate, projection, locals); err != nil {
+			return err
+		}
+		inner := cloneNames(locals)
+		inner[expression.Variable.Name] = struct{}{}
+		if err := validateAggregateExpressionPart(source, expression.Where, scope, insideAggregate, projection, inner); err != nil {
+			return err
+		}
+		return validateAggregateExpressionPart(source, expression.Projection, scope, insideAggregate, projection, inner)
+	case *cypher.ListPredicate:
+		if err := validateAggregateExpressionPart(source, expression.List, scope, insideAggregate, projection, locals); err != nil {
+			return err
+		}
+		inner := cloneNames(locals)
+		inner[expression.Variable.Name] = struct{}{}
+		return validateAggregateExpressionPart(source, expression.Where, scope, insideAggregate, projection, inner)
+	case *cypher.ReduceExpression:
+		if err := validateAggregateExpressionPart(source, expression.Initial, scope, insideAggregate, projection, locals); err != nil {
+			return err
+		}
+		if err := validateAggregateExpressionPart(source, expression.List, scope, insideAggregate, projection, locals); err != nil {
+			return err
+		}
+		inner := cloneNames(locals)
+		inner[expression.Accumulator.Name] = struct{}{}
+		inner[expression.Variable.Name] = struct{}{}
+		return validateAggregateExpressionPart(source, expression.Expression, scope, insideAggregate, projection, inner)
+	case *cypher.ExistsSubquery, *cypher.PatternExpression:
+		if projection && !insideAggregate {
+			return semanticError(expression, "expressions outside an aggregate must be projected as simple grouping keys")
 		}
 	}
 	return nil
@@ -1122,58 +1181,33 @@ func validateAggregateShape(expression cypher.Expression, insideAggregate bool) 
 				return err
 			}
 		}
+	case *cypher.ListComprehension:
+		if err := validateAggregateShape(expression.List, insideAggregate); err != nil {
+			return err
+		}
+		for _, inner := range []cypher.Expression{expression.Where, expression.Projection} {
+			if containsAggregate(inner) {
+				return semanticError(inner, "aggregate functions are not allowed inside a list comprehension")
+			}
+		}
+	case *cypher.ListPredicate:
+		if err := validateAggregateShape(expression.List, insideAggregate); err != nil {
+			return err
+		}
+		if containsAggregate(expression.Where) {
+			return semanticError(expression.Where, "aggregate functions are not allowed inside a list predicate")
+		}
+	case *cypher.ReduceExpression:
+		for _, outer := range []cypher.Expression{expression.Initial, expression.List} {
+			if err := validateAggregateShape(outer, insideAggregate); err != nil {
+				return err
+			}
+		}
+		if containsAggregate(expression.Expression) {
+			return semanticError(expression.Expression, "aggregate functions are not allowed inside reduce")
+		}
 	}
 	return nil
-}
-
-func hasVariableOutsideAggregate(expression cypher.Expression, insideAggregate bool) bool { //nolint:gocyclo
-	switch expression := expression.(type) {
-	case *cypher.Variable:
-		return !insideAggregate
-	case *cypher.FunctionInvocation:
-		nested := insideAggregate || isAggregate(strings.ToLower(expression.Name.String()))
-		for _, argument := range expression.Arguments {
-			if hasVariableOutsideAggregate(argument, nested) {
-				return true
-			}
-		}
-	case *cypher.UnaryExpression:
-		return hasVariableOutsideAggregate(expression.Expression, insideAggregate)
-	case *cypher.BinaryExpression:
-		return hasVariableOutsideAggregate(expression.Left, insideAggregate) || hasVariableOutsideAggregate(expression.Right, insideAggregate)
-	case *cypher.IsNullExpression:
-		return hasVariableOutsideAggregate(expression.Expression, insideAggregate)
-	case *cypher.PropertyExpression:
-		return hasVariableOutsideAggregate(expression.Expression, insideAggregate)
-	case *cypher.LabelExpression:
-		return hasVariableOutsideAggregate(expression.Expression, insideAggregate)
-	case *cypher.IndexExpression:
-		return hasVariableOutsideAggregate(expression.Expression, insideAggregate) || hasVariableOutsideAggregate(expression.Index, insideAggregate)
-	case *cypher.SliceExpression:
-		return hasVariableOutsideAggregate(expression.Expression, insideAggregate) || hasVariableOutsideAggregate(expression.Start, insideAggregate) || hasVariableOutsideAggregate(expression.End, insideAggregate)
-	case *cypher.ListLiteral:
-		for _, item := range expression.Elements {
-			if hasVariableOutsideAggregate(item, insideAggregate) {
-				return true
-			}
-		}
-	case *cypher.MapLiteral:
-		for _, entry := range expression.Entries {
-			if hasVariableOutsideAggregate(entry.Value, insideAggregate) {
-				return true
-			}
-		}
-	case *cypher.CaseExpression:
-		if hasVariableOutsideAggregate(expression.Operand, insideAggregate) || hasVariableOutsideAggregate(expression.Else, insideAggregate) {
-			return true
-		}
-		for _, alternative := range expression.Alternatives {
-			if hasVariableOutsideAggregate(alternative.When, insideAggregate) || hasVariableOutsideAggregate(alternative.Then, insideAggregate) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func bindPatternVariables(scope variableScope, patterns []cypher.PatternPart) error {
@@ -1298,16 +1332,18 @@ func expressionKind(expression cypher.Expression, scope variableScope) variableK
 	case *cypher.ListPredicate:
 		return variableBoolean
 	case *cypher.ReduceExpression:
-		return expressionKind(expression.Initial, scope)
+		initial := expressionKind(expression.Initial, scope)
+		inner := cloneScope(scope)
+		inner[expression.Accumulator.Name] = initial
+		inner[expression.Variable.Name] = listElementKind(expression.List, scope)
+		return mergeExpressionKinds(initial, expressionKind(expression.Expression, inner))
 	case *cypher.CaseExpression:
-		kind := expressionKind(expression.Else, scope)
+		kind := variableNull
+		if expression.Else != nil {
+			kind = expressionKind(expression.Else, scope)
+		}
 		for _, alternative := range expression.Alternatives {
-			candidate := expressionKind(alternative.Then, scope)
-			if kind == variableUnknown || kind == variableNull {
-				kind = candidate
-			} else if candidate != variableNull && candidate != kind {
-				return variableUnknown
-			}
+			kind = mergeExpressionKinds(kind, expressionKind(alternative.Then, scope))
 		}
 		return kind
 	case *cypher.FunctionInvocation:
@@ -1338,13 +1374,18 @@ func listElementKind(expression cypher.Expression, scope variableScope) variable
 	switch expression := expression.(type) {
 	case *cypher.ListLiteral:
 		kind := variableUnknown
+		set := false
 		for _, element := range expression.Elements {
 			candidate := expressionKind(element, scope)
 			if candidate == variableNull {
 				continue
 			}
-			if kind == variableUnknown {
+			if candidate == variableUnknown {
+				return variableUnknown
+			}
+			if !set {
 				kind = candidate
+				set = true
 			} else if candidate != kind {
 				return variableUnknown
 			}
@@ -1357,6 +1398,19 @@ func listElementKind(expression cypher.Expression, scope variableScope) variable
 			return expressionKind(expression.Projection, inner)
 		}
 		return listElementKind(expression.List, scope)
+	}
+	return variableUnknown
+}
+
+func mergeExpressionKinds(left, right variableKind) variableKind {
+	if left == variableUnknown || right == variableUnknown {
+		return variableUnknown
+	}
+	if left == variableNull {
+		return right
+	}
+	if right == variableNull || left == right {
+		return left
 	}
 	return variableUnknown
 }
@@ -1419,6 +1473,14 @@ func cloneScope(scope variableScope) variableScope {
 	result := make(variableScope, len(scope))
 	for name, kind := range scope {
 		result[name] = kind
+	}
+	return result
+}
+
+func cloneNames(names map[string]struct{}) map[string]struct{} {
+	result := make(map[string]struct{}, len(names)+1)
+	for name := range names {
+		result[name] = struct{}{}
 	}
 	return result
 }

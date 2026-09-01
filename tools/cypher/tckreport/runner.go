@@ -659,7 +659,7 @@ func matchExpectedError(expectation string, actual error) (matched, supported bo
 		"InvalidAggregation":             {"aggregate", "aggregation"},
 		"InvalidDelete":                  {"delete expects"},
 		"InvalidParameterUse":            {"parameter", "was not supplied"},
-		"UnexpectedSyntax":               {"not allowed in this context"},
+		"UnexpectedSyntax":               {"pattern expression is not allowed in this context"},
 		"InvalidClauseComposition":       {"cannot mix union"},
 		"NoVariablesInScope":             {"requires at least one variable"},
 		"NestedAggregation":              {"cannot be nested"},

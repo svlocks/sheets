@@ -389,3 +389,118 @@ func TestCreateAndMergeRebindingFailsDuringValidation(t *testing.T) {
 		t.Fatalf("bare bound endpoint should remain valid: %v", err)
 	}
 }
+
+func TestAggregateExpressionsCanUseProjectedGroupingAtoms(t *testing.T) {
+	engine, _ := testEngine(t)
+	tests := []struct {
+		query string
+		want  [][]any
+	}{
+		{
+			query: "UNWIND [1, 1, 2] AS age RETURN age, age + count(*) AS total ORDER BY age",
+			want:  [][]any{{int64(1), int64(3)}, {int64(2), int64(3)}},
+		},
+		{
+			query: "UNWIND [{age: 1}, {age: 1}, {age: 2}] AS person RETURN person.age, person.age + count(*) AS total ORDER BY person.age",
+			want:  [][]any{{int64(1), int64(3)}, {int64(2), int64(3)}},
+		},
+	}
+	for _, test := range tests {
+		result := execute(t, engine, test.query, nil)
+		if got := result.Results[0].Rows; !reflect.DeepEqual(got, test.want) {
+			t.Errorf("%s rows = %#v, want %#v", test.query, got, test.want)
+		}
+	}
+
+	_, err := engine.Execute(context.Background(), app.ExecuteRequest{
+		Query: "EXPLAIN UNWIND [1, 2] AS age RETURN age + 1 AS grouping, age + 1 + count(*) AS total",
+	})
+	if err == nil || !strings.Contains(err.Error(), "variables outside an aggregate") {
+		t.Fatalf("complex implicit grouping error = %v", err)
+	}
+}
+
+func TestAggregatesInCollectionSourcesRespectInnerScopes(t *testing.T) {
+	engine, _ := testEngine(t)
+	tests := []struct {
+		query string
+		want  any
+	}{
+		{
+			query: "UNWIND [1, 2, 3] AS x RETURN [v IN collect(x) | v * 2] AS values",
+			want:  []any{int64(2), int64(4), int64(6)},
+		},
+		{
+			query: "UNWIND [1, 2, 3] AS x RETURN all(v IN collect(x) WHERE v > 0) AS value",
+			want:  true,
+		},
+		{
+			query: "UNWIND [1, 2, 3] AS x RETURN reduce(total = 0, v IN collect(x) | total + v) AS value",
+			want:  int64(6),
+		},
+	}
+	for _, test := range tests {
+		result := execute(t, engine, test.query, nil)
+		if got := result.Results[0].Rows[0][0]; !reflect.DeepEqual(got, test.want) {
+			t.Errorf("%s = %#v, want %#v", test.query, got, test.want)
+		}
+	}
+
+	for _, query := range []string{
+		"MATCH (n) RETURN [x IN [1, 2] | count(*)]",
+		"MATCH (n) RETURN all(x IN [1, 2] WHERE count(*) > 0)",
+		"MATCH (n) RETURN reduce(total = 0, x IN [1, 2] | total + count(*))",
+	} {
+		_, err := engine.Execute(context.Background(), app.ExecuteRequest{Query: "EXPLAIN " + query})
+		if err == nil || !strings.Contains(err.Error(), "aggregate") {
+			t.Errorf("inner aggregate for %q = %v", query, err)
+		}
+	}
+}
+
+func TestDynamicCaseAndReduceKindsAreNotOverconstrained(t *testing.T) {
+	engine, _ := testEngine(t)
+	for _, query := range []string{
+		"EXPLAIN UNWIND [$dynamic, {answer: 1}] AS value RETURN labels(value)",
+		"EXPLAIN UNWIND [{answer: 1}, $dynamic] AS value RETURN labels(value)",
+	} {
+		if _, err := engine.Execute(context.Background(), app.ExecuteRequest{Query: query}); err != nil {
+			t.Errorf("mixed dynamic list inference for %q: %v", query, err)
+		}
+	}
+
+	result := execute(t, engine, `
+WITH CASE WHEN $choose THEN 1 ELSE $dynamic END AS value
+RETURN value.answer AS answer`, map[string]any{
+		"choose":  false,
+		"dynamic": map[string]any{"answer": int64(42)},
+	})
+	if got := result.Results[0].Rows; !reflect.DeepEqual(got, [][]any{{int64(42)}}) {
+		t.Fatalf("dynamic CASE rows = %#v", got)
+	}
+
+	result = execute(t, engine, "RETURN reduce(acc = 0, item IN [{answer: 42}] | item).answer AS answer", nil)
+	if got := result.Results[0].Rows; !reflect.DeepEqual(got, [][]any{{int64(42)}}) {
+		t.Fatalf("dynamic reduce rows = %#v", got)
+	}
+}
+
+func TestMutationErrorsRollBackOverflowAndDivisionByZero(t *testing.T) {
+	engine, _ := testEngine(t)
+	for _, query := range []string{
+		"CREATE (:Transient) WITH 1 AS value RETURN value / 0",
+		"CREATE (:Transient) WITH 9223372036854775807 AS value RETURN value + 1",
+		"CREATE (:Transient) WITH true AS n MATCH (n) RETURN n",
+	} {
+		if _, err := engine.Execute(context.Background(), app.ExecuteRequest{Query: query}); err == nil {
+			t.Errorf("%q unexpectedly succeeded", query)
+		}
+		snapshot, err := engine.Snapshot(context.Background(), domain.Snapshot{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(snapshot.Nodes) != 0 || len(snapshot.Edges) != 0 {
+			t.Fatalf("%q left side effects: %#v", query, snapshot)
+		}
+	}
+}
