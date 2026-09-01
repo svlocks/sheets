@@ -307,7 +307,7 @@ func TestTemporalIndexedEqualityAcrossProcess(t *testing.T) {
 	defer func() { _ = database.Close() }()
 	date, _ := temporal.ParseDate("2026-08-31")
 	historical, err := temporal.ParseDateTime("1818-07-21T21:40:32.142[Europe/Stockholm]")
-	if err != nil || historical.OffsetSeconds() != 72*60+12 {
+	if err != nil || historical.OffsetSeconds() != 53*60+28 {
 		t.Fatalf("historical temporal = %s, %v", historical, err)
 	}
 	view, err := database.View(context.Background(), domain.Snapshot{})
@@ -333,7 +333,7 @@ func TestTemporalIndexedEqualityAcrossProcess(t *testing.T) {
 	if err := raw.QueryRow("SELECT kind, value FROM node_property_index WHERE key='historical'").Scan(&kind, &key); err != nil {
 		t.Fatal(err)
 	}
-	const historicalIndexKey = `{"k":"zoned_datetime","s":"Af////7jIsHkCHa/gAEAABDsABBFdXJvcGUvU3RvY2tob2xt"}`
+	const historicalIndexKey = `{"k":"zoned_datetime","s":"Af////7jIsZICHa/gAEAAAyIABBFdXJvcGUvU3RvY2tob2xt"}`
 	if kind != "zoned_datetime" || string(key) != historicalIndexKey {
 		t.Fatalf("cross-process historical index key = %q/%s", kind, key)
 	}

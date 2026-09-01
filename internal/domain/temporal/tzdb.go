@@ -13,20 +13,29 @@ import (
 )
 
 const (
-	// PinnedTZDBVersion identifies the upstream Go distribution whose complete
-	// IANA archive is embedded below. Updating timezone rules is an explicit
-	// repository change, never an implicit consequence of the host OS.
-	PinnedTZDBVersion = "go1.25.14"
-	// PinnedTZDBSHA256 authenticates the exact upstream zoneinfo.zip asset.
-	PinnedTZDBSHA256 = "33bd7c3c9bc812f1b4dacf7b9516aa7a129acd658b90f239cb8a286d73cedd0f"
+	// PinnedTZDBVersion identifies the IANA release compiled into the archive.
+	// Updating timezone rules is an explicit repository change, never an
+	// implicit consequence of the host OS or Go toolchain.
+	PinnedTZDBVersion = "2023c"
+	// PinnedTZDBProfile records the IANA build policy used by the openCypher M23
+	// fixtures. The empty PACKRAT settings use the main-profile links for zones
+	// that IANA considers equivalent since 1970; historical backzone data is
+	// deliberately not overlaid.
+	PinnedTZDBProfile = "main (PACKRATDATA=, PACKRATLIST=)"
+	// PinnedTZDBSHA256 authenticates the exact generated zoneinfo.zip asset.
+	PinnedTZDBSHA256 = "3fe2fe0c5897093e4965480de18722eabc224a1b7ac4dcb1ceb6943d62c01efe"
 
 	maximumPinnedZoneBytes = 1 << 20
 )
 
 // Regenerate only as part of a deliberate timezone database update. The
-// generator refuses any toolchain or archive other than the constants above.
+// generator authenticates both IANA source archives and compiles them inside a
+// digest-pinned container. From the repository root, run
+// `go run ./internal/domain/temporal/gen_zoneinfo.go -check` for a non-mutating
+// reproducibility check; add `-platform=linux/amd64` or `linux/arm64` to verify
+// a particular image architecture.
 //
-//go:generate env GOTOOLCHAIN=go1.25.14 go run gen_zoneinfo.go
+//go:generate go run gen_zoneinfo.go
 
 //go:embed zoneinfo.zip
 var pinnedTZDBArchive []byte

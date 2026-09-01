@@ -51,7 +51,7 @@ func assertPinnedZoneGoldens(t *testing.T) {
 	}
 
 	for input, expected := range map[string]string{
-		"1818-07-21T21:40:32.142[Europe/Stockholm]":   "1818-07-21T21:40:32.142+01:12:12[Europe/Stockholm]",
+		"1818-07-21T21:40:32.142[Europe/Stockholm]":   "1818-07-21T21:40:32.142+00:53:28[Europe/Stockholm]",
 		"2017-10-29T02:30[Europe/Stockholm]":          "2017-10-29T02:30+02:00[Europe/Stockholm]",
 		"2017-10-29T02:30+01:00[Europe/Stockholm]":    "2017-10-29T02:30+01:00[Europe/Stockholm]",
 		"2017-03-26T02:30[Europe/Stockholm]":          "2017-03-26T03:30+02:00[Europe/Stockholm]",
@@ -73,7 +73,7 @@ func assertPinnedZoneGoldens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const historicalBinary = "01fffffffee322c1e40876bf8001000010ec00104575726f70652f53746f636b686f6c6d"
+	const historicalBinary = "01fffffffee322c6480876bf800100000c8800104575726f70652f53746f636b686f6c6d"
 	if encoded := hex.EncodeToString(binary); encoded != historicalBinary {
 		t.Fatalf("historical Stockholm binary = %s, want %s", encoded, historicalBinary)
 	}
@@ -94,8 +94,11 @@ func assertPinnedZoneGoldens(t *testing.T) {
 }
 
 func TestPinnedZoneDatabaseProvenanceCompatibilityAndErrors(t *testing.T) {
-	if PinnedTZDBVersion != "go1.25.14" || PinnedTZDBSHA256 != "33bd7c3c9bc812f1b4dacf7b9516aa7a129acd658b90f239cb8a286d73cedd0f" {
-		t.Fatalf("unexpected pinned timezone provenance %q %q", PinnedTZDBVersion, PinnedTZDBSHA256)
+	if PinnedTZDBVersion != "2023c" ||
+		PinnedTZDBProfile != "main (PACKRATDATA=, PACKRATLIST=)" ||
+		PinnedTZDBSHA256 != "3fe2fe0c5897093e4965480de18722eabc224a1b7ac4dcb1ceb6943d62c01efe" {
+		t.Fatalf("unexpected pinned timezone provenance %q %q %q",
+			PinnedTZDBVersion, PinnedTZDBProfile, PinnedTZDBSHA256)
 	}
 	pinned, err := (PinnedZoneDatabase{}).LoadLocation("Europe/Stockholm")
 	if err != nil {
@@ -113,22 +116,96 @@ func TestPinnedZoneDatabaseProvenanceCompatibilityAndErrors(t *testing.T) {
 	}
 }
 
-func TestPreviouslyResolvedHostOffsetRemainsBinaryStable(t *testing.T) {
-	// This is the exact value produced for the Stockholm input by the old
-	// macOS-host loader. Persisted DateTimes are resolved snapshots: pinning
-	// rules for new construction must neither reject nor reinterpret it.
-	const macOSBinary = "01fffffffee322c6480876bf800100000c8800104575726f70652f53746f636b686f6c6d"
-	payload, err := hex.DecodeString(macOSBinary)
-	if err != nil {
-		t.Fatal(err)
+func TestPinnedZoneDatabaseUsesM23MainProfileAcrossBackzoneAliases(t *testing.T) {
+	// IANA 2022b moved these zones to backzone because their timestamps have
+	// agreed with the target since 1970. M23 follows IANA 2023c's default main
+	// profile, so every alias must retain the target's complete TZif payload.
+	// Testing the full move set prevents a Stockholm-specific compatibility
+	// patch from masquerading as the selected database policy.
+	aliases := map[string]string{
+		"Antarctica/Vostok":  "Asia/Urumqi",
+		"Asia/Brunei":        "Asia/Kuching",
+		"Asia/Kuala_Lumpur":  "Asia/Singapore",
+		"Atlantic/Reykjavik": "Africa/Abidjan",
+		"Europe/Amsterdam":   "Europe/Brussels",
+		"Europe/Copenhagen":  "Europe/Berlin",
+		"Europe/Luxembourg":  "Europe/Brussels",
+		"Europe/Monaco":      "Europe/Paris",
+		"Europe/Oslo":        "Europe/Berlin",
+		"Europe/Stockholm":   "Europe/Berlin",
+		"Indian/Christmas":   "Asia/Bangkok",
+		"Indian/Cocos":       "Asia/Yangon",
+		"Indian/Kerguelen":   "Indian/Maldives",
+		"Indian/Mahe":        "Asia/Dubai",
+		"Indian/Reunion":     "Asia/Dubai",
+		"Pacific/Chuuk":      "Pacific/Port_Moresby",
+		"Pacific/Funafuti":   "Pacific/Tarawa",
+		"Pacific/Majuro":     "Pacific/Tarawa",
+		"Pacific/Pohnpei":    "Pacific/Guadalcanal",
+		"Pacific/Wake":       "Pacific/Tarawa",
+		"Pacific/Wallis":     "Pacific/Tarawa",
 	}
-	value, err := DateTimeFromBinary(payload)
-	if err != nil || value.String() != "1818-07-21T21:40:32.142+00:53:28[Europe/Stockholm]" {
-		t.Fatalf("legacy resolved value = %s, %v", value, err)
+	for alias, target := range aliases {
+		aliasData := pinnedZoneDataForTest(t, alias)
+		targetData := pinnedZoneDataForTest(t, target)
+		if !bytes.Equal(aliasData, targetData) {
+			t.Errorf("%s payload differs from main-profile target %s", alias, target)
+		}
 	}
-	reencoded, err := value.MarshalBinary()
-	if err != nil || !bytes.Equal(reencoded, payload) {
-		t.Fatalf("legacy resolved binary changed to %x, %v", reencoded, err)
+}
+
+func TestPinnedZoneDatabaseLoadsCompleteProfile(t *testing.T) {
+	pinnedTZDBOnce.Do(initializePinnedTZDB)
+	if pinnedTZDBInitError != nil {
+		t.Fatal(pinnedTZDBInitError)
+	}
+	if len(pinnedTZDBFiles) != 597 {
+		t.Fatalf("pinned timezone count = %d, want 597", len(pinnedTZDBFiles))
+	}
+	database := PinnedZoneDatabase{}
+	for name := range pinnedTZDBFiles {
+		location, err := database.LoadLocation(name)
+		if err != nil {
+			t.Errorf("load pinned timezone %q: %v", name, err)
+			continue
+		}
+		if location.String() != name {
+			t.Errorf("pinned timezone %q loaded as %q", name, location)
+		}
+	}
+}
+
+func TestPreviouslyResolvedOffsetsRemainBinaryStable(t *testing.T) {
+	// Persisted DateTimes are resolved snapshots: changing the rules used for
+	// new construction must neither reject nor reinterpret values created by
+	// the old macOS host loader or Sheets's previous Go backzone archive.
+	for name, test := range map[string]struct {
+		binary string
+		value  string
+	}{
+		"macOS main profile": {
+			binary: "01fffffffee322c6480876bf800100000c8800104575726f70652f53746f636b686f6c6d",
+			value:  "1818-07-21T21:40:32.142+00:53:28[Europe/Stockholm]",
+		},
+		"previous Go backzone profile": {
+			binary: "01fffffffee322c1e40876bf8001000010ec00104575726f70652f53746f636b686f6c6d",
+			value:  "1818-07-21T21:40:32.142+01:12:12[Europe/Stockholm]",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			payload, err := hex.DecodeString(test.binary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			value, err := DateTimeFromBinary(payload)
+			if err != nil || value.String() != test.value {
+				t.Fatalf("legacy resolved value = %s, %v; want %s", value, err, test.value)
+			}
+			reencoded, err := value.MarshalBinary()
+			if err != nil || !bytes.Equal(reencoded, payload) {
+				t.Fatalf("legacy resolved binary changed to %x, %v", reencoded, err)
+			}
+		})
 	}
 }
 
