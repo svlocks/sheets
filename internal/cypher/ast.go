@@ -1,7 +1,7 @@
-// Package cypher parses the OpenCypher query language into a lossless-enough,
-// execution-neutral abstract syntax tree.  It deliberately does not know
-// about sheets storage: callers can inspect the tree, validate it further,
-// or translate it to a plan.
+// Package cypher parses sheets's documented Cypher subset into a
+// lossless-enough, execution-neutral abstract syntax tree. It deliberately
+// does not know about sheets storage: callers can inspect the tree, validate
+// it further, or translate it to a plan.
 package cypher
 
 // Position identifies a byte position in the input. Lines and columns are

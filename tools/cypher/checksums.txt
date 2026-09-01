@@ -1,0 +1,12 @@
+# openCypher 9 M23 inputs
+044d58feaccb263f2ec75f181f0f3153e8715b5013fc691d21da22592a58d62a  Cypher.g4
+6deb4acffb301c926cb0811e11b2422704cad2e48fc0a42e40c401a7ee1fba49  tck-M23.zip
+fbcada6966edb9e2d66b1a11a4f8a4c906a9da6afd622640ab08c686962d42da  binary-tree-1.cypher (openCypher tag 1.0.0-M23, commit 007895aff5f33097d67b2e48a0a2babd6bd18590)
+923bcaf5686ea9051f46ad5c440a286381fd111daad5dbd6377aa3edd7dbfc4c  binary-tree-2.cypher (openCypher tag 1.0.0-M23, commit 007895aff5f33097d67b2e48a0a2babd6bd18590)
+
+# Reproducible generator inputs
+bc13a9c57a8dd7d5196888211e5ede657cb64a3ce968608697e4f668251a8487  antlr4-4.13.1-complete.jar
+110c3dc3b70718166caf1042f92844527e889e9c80de92fa9fc3d79c2e74a1cf  Cypher.derived.g4
+
+# Container toolchain
+eclipse-temurin:17.0.16_8-jre-noble@sha256:88665729998a41823f35092c95d574581719371a0f21f62d31a9ccf506b199c6

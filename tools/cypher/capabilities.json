@@ -1,0 +1,51 @@
+{
+  "release": "M23",
+  "archive_sha256": "6deb4acffb301c926cb0811e11b2422704cad2e48fc0a42e40c401a7ee1fba49",
+  "cases": [
+    {
+      "id": "clauses/match/Match1.feature::[1] Match non-existent nodes returns empty",
+      "expected": "bound",
+      "test": "internal/cypher:TestTCKCapabilityCases/match"
+    },
+    {
+      "id": "clauses/return/Return1.feature::[1] Returning a list property",
+      "expected": "bound",
+      "test": "internal/cypher:TestTCKCapabilityCases/return"
+    },
+    {
+      "id": "expressions/comparison/Comparison1.feature::[15] It is unknown - i.e. null - if a null is equal to a null",
+      "expected": "bound",
+      "test": "internal/cypher:TestTCKCapabilityCases/comparison"
+    },
+    {
+      "id": "expressions/pattern/Pattern2.feature::[1] Return a pattern comprehension",
+      "expected": "typed_unsupported",
+      "test": "internal/cypher:TestTCKCapabilityCases/pattern_comprehension"
+    },
+    {
+      "id": "clauses/create/Create2.feature::[20] Fail when creating a relationship with two directions",
+      "expected": "typed_unsupported",
+      "test": "internal/cypher:TestTCKCapabilityCases/bidirectional_relationship"
+    },
+    {
+      "id": "expressions/mathematical/Mathematical11.feature::[1] Absolute function",
+      "expected": "typed_unsupported",
+      "test": "internal/cypher:TestTCKCapabilityCases/unsupported_function"
+    },
+    {
+      "id": "clauses/call/Call2.feature::[1] In-query call to procedure with explicit arguments",
+      "expected": "typed_unsupported",
+      "test": "internal/cypher:TestTCKCapabilityCases/unsupported_procedure"
+    },
+    {
+      "id": "expressions/literals/Literals2.feature::[9] Fail on a too large integer",
+      "expected": "parse_rejected",
+      "test": "internal/cypher:TestTCKCapabilityCases/integer_overflow"
+    },
+    {
+      "id": "expressions/comparison/Comparison1.feature::[6] Comparing lists to lists::example[001]",
+      "expected": "bound",
+      "test": "internal/engine:TestOpenCypherComparisonFixtures"
+    }
+  ]
+}

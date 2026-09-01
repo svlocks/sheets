@@ -1,0 +1,139 @@
+--- a/Cypher.g4
++++ b/Cypher.g4
+@@ -28,14 +28,19 @@
+ grammar Cypher;
+ 
+ oC_Cypher
+-      :  SP? oC_Statement ( SP? ';' )? SP? EOF ;
++      :  SP? ( ( EXPLAIN | PROFILE ) SP )? oC_Statement ( SP? ';' )? SP? EOF ;
+ 
++EXPLAIN : ( 'E' | 'e' ) ( 'X' | 'x' ) ( 'P' | 'p' ) ( 'L' | 'l' ) ( 'A' | 'a' ) ( 'I' | 'i' ) ( 'N' | 'n' ) ;
++
++PROFILE : ( 'P' | 'p' ) ( 'R' | 'r' ) ( 'O' | 'o' ) ( 'F' | 'f' ) ( 'I' | 'i' ) ( 'L' | 'l' ) ( 'E' | 'e' ) ;
++
+ oC_Statement
+          :  oC_Query ;
+ 
+ oC_Query
+      :  oC_RegularQuery
+          | oC_StandaloneCall
++         | oC_SubqueryCall
+          ;
+ 
+ oC_RegularQuery
+@@ -75,8 +80,12 @@
+              :  oC_Match
+                  | oC_Unwind
+                  | oC_InQueryCall
++                 | oC_SubqueryCall
+                  ;
+ 
++oC_SubqueryCall
++              :  CALL SP? '{' SP? oC_RegularQuery SP? '}' ;
++
+ oC_Match
+      :  ( OPTIONAL SP )? MATCH SP? oC_Pattern ( SP? oC_Where )? ;
+ 
+@@ -138,7 +147,7 @@
+               ;
+ 
+ oC_InQueryCall
+-           :  CALL SP oC_ExplicitProcedureInvocation ( SP? YIELD SP oC_YieldItems )? ;
++           :  CALL SP oC_ExplicitProcedureInvocation ( SP? YIELD SP ( '*' | oC_YieldItems ) )? ;
+ 
+ CALL : ( 'C' | 'c' ) ( 'A' | 'a' ) ( 'L' | 'l' ) ( 'L' | 'l' ) ;
+ 
+@@ -186,10 +195,12 @@
+ BY : ( 'B' | 'b' ) ( 'Y' | 'y' ) ;
+ 
+ oC_Skip
+-    :  L_SKIP SP oC_Expression ;
++    :  ( L_SKIP | OFFSET ) SP oC_Expression ;
+ 
+ L_SKIP : ( 'S' | 's' ) ( 'K' | 'k' ) ( 'I' | 'i' ) ( 'P' | 'p' ) ;
+ 
++OFFSET : ( 'O' | 'o' ) ( 'F' | 'f' ) ( 'F' | 'f' ) ( 'S' | 's' ) ( 'E' | 'e' ) ( 'T' | 't' ) ;
++
+ oC_Limit
+      :  LIMIT SP oC_Expression ;
+ 
+@@ -301,6 +312,8 @@
+ oC_PartialComparisonExpression
+                            :  ( '=' SP? oC_StringListNullPredicateExpression )
+                                | ( '<>' SP? oC_StringListNullPredicateExpression )
++                              | ( '!=' SP? oC_StringListNullPredicateExpression )
++                              | ( '=~' SP? oC_StringListNullPredicateExpression )
+                                | ( '<' SP? oC_StringListNullPredicateExpression )
+                                | ( '>' SP? oC_StringListNullPredicateExpression )
+                                | ( '<=' SP? oC_StringListNullPredicateExpression )
+@@ -320,7 +333,9 @@
+ CONTAINS : ( 'C' | 'c' ) ( 'O' | 'o' ) ( 'N' | 'n' ) ( 'T' | 't' ) ( 'A' | 'a' ) ( 'I' | 'i' ) ( 'N' | 'n' ) ( 'S' | 's' ) ;
+ 
+ oC_ListPredicateExpression
+-                       :  SP IN SP? oC_AddOrSubtractExpression ;
++                       :  ( SP IN SP? oC_AddOrSubtractExpression )
++                           | ( SP NOT SP IN SP? oC_AddOrSubtractExpression )
++                           ;
+ 
+ IN : ( 'I' | 'i' ) ( 'N' | 'n' ) ;
+ 
+@@ -366,6 +381,7 @@
+         | oC_ListComprehension
+         | oC_PatternComprehension
+         | oC_Quantifier
++        | oC_Reduce
+         | oC_PatternPredicate
+         | oC_ParenthesizedExpression
+         | oC_FunctionInvocation
+@@ -373,6 +389,11 @@
+         | oC_Variable
+         ;
+ 
++oC_Reduce
++     :  REDUCE SP? '(' SP? oC_Variable SP? '=' SP? oC_Expression SP? ',' SP? oC_IdInColl SP? '|' SP? oC_Expression SP? ')' ;
++
++REDUCE : ( 'R' | 'r' ) ( 'E' | 'e' ) ( 'D' | 'd' ) ( 'U' | 'u' ) ( 'C' | 'c' ) ( 'E' | 'e' ) ;
++
+ COUNT : ( 'C' | 'c' ) ( 'O' | 'o' ) ( 'U' | 'u' ) ( 'N' | 'n' ) ( 'T' | 't' ) ;
+ 
+ oC_CaseExpression
+@@ -429,7 +450,10 @@
+             :  oC_Namespace oC_SymbolicName ;
+ 
+ oC_ExistentialSubquery
+-                   :  EXISTS SP? '{' SP? ( oC_RegularQuery | ( oC_Pattern ( SP? oC_Where )? ) ) SP? '}' ;
++                   :  EXISTS SP? '{' SP? ( oC_RegularQuery | oC_ExistentialMatchQuery | ( oC_Pattern ( SP? oC_Where )? ) ) SP? '}' ;
++
++oC_ExistentialMatchQuery
++                      :  oC_Match ( SP? oC_Match )* ;
+ 
+ EXISTS : ( 'E' | 'e' ) ( 'X' | 'x' ) ( 'I' | 'i' ) ( 'S' | 's' ) ( 'T' | 't' ) ( 'S' | 's' ) ;
+ 
+@@ -563,7 +587,7 @@
+                :  oC_SchemaName ;
+ 
+ oC_Parameter
+-         :  '$' ( oC_SymbolicName | DecimalInteger ) ;
++         :  '$' ( oC_SymbolicName | oC_ReservedWord | DecimalInteger ) ;
+ 
+ oC_SchemaName
+           :  oC_SymbolicName
+@@ -624,6 +648,9 @@
+                 | OF
+                 | ADD
+                 | DROP
++                | OFFSET
++                | EXPLAIN
++                | PROFILE
+                 ;
+ 
+ CONSTRAINT : ( 'C' | 'c' ) ( 'O' | 'o' ) ( 'N' | 'n' ) ( 'S' | 's' ) ( 'T' | 't' ) ( 'R' | 'r' ) ( 'A' | 'a' ) ( 'I' | 'i' ) ( 'N' | 'n' ) ( 'T' | 't' ) ;
+@@ -656,6 +683,8 @@
+                 | ANY
++                | ALL
+                 | NONE
+                 | SINGLE
++                | REDUCE
+                 ;
+ 
+ FILTER : ( 'F' | 'f' ) ( 'I' | 'i' ) ( 'L' | 'l' ) ( 'T' | 't' ) ( 'E' | 'e' ) ( 'R' | 'r' ) ;

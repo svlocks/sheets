@@ -1,9 +1,9 @@
 .DS_Store
 /.sheets/
+/.cache/
 /bin/
 /dist/
 /coverage/
 *.coverprofile
 *.prof
 *.test
-

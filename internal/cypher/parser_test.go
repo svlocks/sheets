@@ -2,6 +2,7 @@ package cypher
 
 import (
 	"errors"
+	"math"
 	"strings"
 	"testing"
 )
@@ -235,5 +236,96 @@ func TestNotBindsAroundComparison(t *testing.T) {
 	}
 	if _, ok := not.Expression.(*BinaryExpression); !ok {
 		t.Fatalf("NOT operand = %T, want *BinaryExpression", not.Expression)
+	}
+}
+
+func TestOfficialNumericAndParameterForms(t *testing.T) {
+	document, err := Parse("RETURN 0x2a AS hex, 0o52 AS octal, -9223372036854775808 AS minimum, $123 AS positional, $`sp ace` AS escaped")
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := document.Statements[0].(*QueryStatement).Clauses[0].(*ProjectionClause).Items
+	wants := []any{int64(42), int64(42), int64(math.MinInt64)}
+	for index, want := range wants {
+		literal, ok := items[index].Expression.(*Literal)
+		if !ok || literal.Value != want {
+			t.Fatalf("item %d = %#v, want literal %v", index, items[index].Expression, want)
+		}
+	}
+	if parameter := items[3].Expression.(*Parameter); parameter.Name.Name != "123" {
+		t.Fatalf("numeric parameter = %#v", parameter)
+	}
+	if parameter := items[4].Expression.(*Parameter); parameter.Name.Name != "sp ace" {
+		t.Fatalf("escaped parameter = %#v", parameter)
+	}
+}
+
+func TestRejectsMalformedAndOverflowingNumbers(t *testing.T) {
+	for _, source := range []string{
+		"RETURN 0x",
+		"RETURN 0o8",
+		"RETURN 9223372036854775808",
+		"RETURN -9223372036854775809",
+		"RETURN 1.",
+	} {
+		if _, err := Parse(source); err == nil {
+			t.Errorf("Parse(%q) succeeded", source)
+		}
+	}
+}
+
+func TestWithOfficialModifierOrderAndLongDirections(t *testing.T) {
+	document, err := Parse("UNWIND [1, 2] AS x WITH x ORDER BY x DESCENDING OFFSET 1 LIMIT 2 WHERE x > 0 RETURN x ORDER BY x ASCENDING")
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := document.Statements[0].(*QueryStatement)
+	with := query.Clauses[1].(*ProjectionClause)
+	if with.Where == nil || with.Skip == nil || with.Limit == nil || len(with.OrderBy) != 1 || !with.OrderBy[0].Descending {
+		t.Fatalf("WITH modifiers = %#v", with)
+	}
+	ret := query.Clauses[2].(*ProjectionClause)
+	if len(ret.OrderBy) != 1 || ret.OrderBy[0].Descending {
+		t.Fatalf("RETURN modifiers = %#v", ret)
+	}
+}
+
+func TestUnionBranchesAreFlat(t *testing.T) {
+	document, err := Parse("RETURN 1 AS x UNION ALL RETURN 2 AS x UNION RETURN 3 AS x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := document.Statements[0].(*QueryStatement)
+	if len(query.UnionBranches) != 2 || !query.UnionBranches[0].All || query.UnionBranches[1].All {
+		t.Fatalf("UNION branches = %#v", query.UnionBranches)
+	}
+	for index, branch := range query.UnionBranches {
+		if len(branch.Query.UnionBranches) != 0 {
+			t.Fatalf("branch %d contains nested UNIONs", index)
+		}
+	}
+}
+
+func TestRejectsInvalidClauseComposition(t *testing.T) {
+	for _, source := range []string{
+		"MATCH (n)",
+		"UNWIND [1] AS x",
+		"MATCH (n) SET n.x = 1 MATCH (m) RETURN m",
+		"CREATE (:Task) MATCH (n) RETURN n",
+		"MATCH (n) WITH n",
+		"CREATE (:Task) UNION RETURN 1",
+	} {
+		if _, err := Parse(source); err == nil {
+			t.Errorf("Parse(%q) succeeded", source)
+		}
+	}
+	for _, source := range []string{
+		"MATCH (n) SET n.x = 1 WITH n MATCH (m) RETURN m",
+		"MATCH (n) SET n.x = 1",
+		"CALL db.labels()",
+	} {
+		if _, err := Parse(source); err != nil {
+			t.Errorf("Parse(%q) error = %v", source, err)
+		}
 	}
 }
