@@ -1,7 +1,7 @@
 # Development
 
-Sheets requires Go 1.25.8 or newer. It has no code-generation or external
-service prerequisite.
+Sheets requires Go 1.25.14 or newer. Normal builds and tests need no external
+service and use the committed generated Cypher frontend and timezone archive.
 
 ```sh
 make test       # unit and integration tests
@@ -10,6 +10,14 @@ make lint       # go vet, gofmt, and whitespace checks
 make bench      # storage and Cypher benchmarks
 make build      # bin/sheets, without installing it
 ```
+
+Refreshing pinned language or timezone artifacts is deliberately separate from
+normal development. `make cypher-fetch`, `make cypher-generate`, and
+`make cypher-generate-check` use the digest-pinned ANTLR container and verified
+M23 inputs. `make cypher-tck-check` produces the semantic report twice and
+requires byte-for-byte equality. The timezone generator likewise downloads
+checksum-pinned IANA sources inside the pinned Go container; see
+`go run ./internal/domain/temporal/gen_zoneinfo.go -check`.
 
 CI also runs the repository's pinned GolangCI-Lint standard suite from its
 container image. To reproduce that gate locally without installing another
@@ -32,7 +40,8 @@ static, distroless image; it is an optional distribution format, not a daemon.
   the same application boundary.
 - Treat one `Store.Write` callback as the revision boundary. Never allocate a
   revision before an effective change.
-- Preserve current and historical behavior in every schema migration.
+- Preserve valid graph history and migration atomicity; reject newly invalid
+  legacy data without partial mutation.
 - Prefer measured query-plan/index improvements over speculative caching.
 - Add a parser test, engine test, and historical assertion for new Cypher
   mutation semantics.

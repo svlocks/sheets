@@ -1,9 +1,11 @@
 # Cypher language
 
-Sheets uses one Cypher-inspired graph language for reads and writes. It is a
-deliberately documented subset aligned with selected openCypher 9 behavior; it
-is not a complete or certified openCypher implementation. Unsupported syntax
-is rejected rather than accepted with an invented meaning. See
+Sheets uses one graph language for reads and writes. Its syntax frontend is
+generated from the official openCypher 9 M23 grammar plus documented local
+extensions. Every frontend-bound scenario executed by the pinned M23 runner
+passes. This is reproducible evidence, not certification or a claim about
+later Cypher revisions. Unsupported syntax is rejected rather than
+accepted with an invented meaning. See
 [the conformance evidence](cypher-conformance.md) for the pinned upstream
 sources, generated-frontend architecture, and exact TCK inventory limits.
 
@@ -46,8 +48,8 @@ The supported read surface includes:
   `LIMIT`, including the openCypher `WITH ... ORDER BY ... WHERE ...` order;
 - `UNION` / `UNION ALL` with exactly matching column names;
 - list comprehensions, `all`/`any`/`none`/`single`, and `reduce`;
-- `EXISTS` subqueries, pattern expressions, `shortestPath`, and
-  `allShortestPaths`;
+- pattern comprehensions, `EXISTS` subqueries, pattern expressions,
+  `shortestPath`, and `allShortestPaths`;
 - `count`, `collect`, `sum`, `avg`, `min`, `max`, standard deviations, and
   continuous/discrete percentiles; and
 - the scalar, string, collection, conversion, temporal, duration, and UUID
@@ -71,15 +73,18 @@ db.relationshipTypes()
 db.propertyKeys()
 sheets.nodes()
 sheets.edges()
-sheets.revisions([limit [, afterCursor]])
+sheets.revisions([limit [, afterCursor [, order]]])
 ```
 
 `sheets.revisions` yields `revision`, `time`, `actor`, `message`, and `next`.
 The default limit is 100, the maximum is 1,000, and `next` is the opaque cursor
-to pass as the second argument.
+to pass as the second argument. `order` accepts `ascending`/`asc` or
+`descending`/`desc`; a cursor is bound to its order and cannot be reused in the
+other direction.
 
-`EXPLAIN` returns the clause list without executing it. `PROFILE` executes the
-query but does not yet emit per-operator timing.
+`EXPLAIN` validates without executing and reports planner operators, predicate
+pushdowns, and any explicit fallback. `PROFILE` executes the query but does not
+yet emit per-operator timing.
 
 ## Mutations
 
@@ -108,19 +113,45 @@ application check.
 
 ## Resource limits and deliberate boundaries
 
-A query shares a budget of 1,000,000 traversed relationship expansions and
-checks context cancellation inside scans and walks. Relationship trails cannot
-reuse an edge, including across adjacent pattern segments. This makes path
-explosion an explicit error; it is not a guarantee that every broad path query
-will finish. Add type/property predicates and finite upper bounds.
+A query shares a 100,000-row evaluator budget and a budget of 1,000,000
+traversed relationship expansions. Indexed pull plans additionally cap their
+working set at 200,000 entities and 64 MiB. All limits and context cancellation
+are checked inside scans and walks. Relationship trails cannot reuse an edge,
+including across adjacent pattern segments. Exceeding a budget is an explicit
+error, never a silently partial result. Broad path queries can still be
+expensive; add type/property predicates and finite upper bounds.
 
-Temporal constructors return Go `time.Time` values and duration uses bounded
-nanoseconds. This does not preserve every distinct openCypher temporal type,
-calendar-month duration, or timezone identifier. Paths, nodes, and
-relationships cannot be stored as property values.
+Sheets preserves six distinct Cypher temporal types (`date`, `localtime`,
+offset `time`, `localdatetime`, zoned `datetime`, and calendar-aware
+`duration`) as exact durable values. Named-zone construction uses the embedded,
+checksum-pinned IANA 2023c main profile and never consults host `TZ` or
+`ZONEINFO`; each zoned value also retains its resolved offset so historical
+formatting and equality stay stable if rules are deliberately upgraded later.
+Paths, nodes, and relationships cannot be stored as property values.
+
+Sheets's mutation APIs preflight durable values before opening a write
+transaction and before encoding large structures. SQLite triggers independently
+recheck source and derived size/cardinality limits:
+
+| Value | Limit |
+| --- | ---: |
+| Canonical property map, encoded labels, or Markdown body | 64 MiB each |
+| One property string or byte string | 16 MiB |
+| Revision message | 1 MiB |
+| Actor, label, relationship type, property key, or timezone name | 64 KiB |
+| Property nesting / total values | 128 levels / 1,000,000 |
+| Labels or indexed scalar properties per entity version | 4,096 each |
+| Derived label / property-index payload per entity version | 16 MiB / 32 MiB |
+
+The 64 MiB property source remains useful for large nested, non-indexed data;
+the separate derived limits prevent a valid source value from amplifying into
+an unbounded SQLite B-tree. The Go mutation boundary rejects invalid UTF-8;
+invalid text injected through raw SQLite is reported by migration and store
+integrity validation because SQLite itself does not enforce UTF-8 text encoding.
 
 Sheets explicitly does not implement administration/schema syntax, `USE`,
-`LOAD CSV`, `FOREACH`, planner hints, pattern comprehensions, map projections,
-new quantified-path/boolean-label syntax, user-defined procedures, or
-procedure transactions. Historical selection remains a host option
-(`--at-revision` / `--at-time`) rather than a custom language clause.
+`LOAD CSV`, `FOREACH`, planner hints, map projections, newer
+quantified-path/boolean-label syntax, user-defined procedures, or procedure
+transactions. The 51 typed-unsupported M23 scenarios all depend on external
+TCK procedures. Historical selection remains a host option (`--at-revision` /
+`--at-time`) rather than a custom language clause.

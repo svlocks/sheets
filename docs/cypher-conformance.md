@@ -1,6 +1,6 @@
 # Cypher frontend and conformance evidence
 
-Evidence date: 2026-08-31.
+Evidence date: 2026-09-01.
 
 Sheets is not certified as openCypher-compatible. Its production syntax
 frontend is generated from the official openCypher 9 M23 grammar, followed by
@@ -77,15 +77,15 @@ Selected exact IDs and frontend classifications are pinned in
 | Scenario definitions | 1,615 |
 | Scenario Outline definitions | 276 |
 | Concrete scenario instances | 3,897 |
-| Bound by the frontend | 3,252 |
-| Typed unsupported | 617 |
+| Bound by the frontend | 3,818 |
+| Typed unsupported | 51 |
 | Parse rejected | 28 |
 
-The 617 explicit capability rejections are 544 functions outside sheets's
-finite catalog, 51 external procedures, 16 pattern comprehensions, five
-relationships with arrowheads at both ends, and one mutating `EXISTS`
-subquery. The 28 parse rejections are negative grammar/numeric scenarios; they
-are reported, never silently dropped.
+All 51 explicit capability rejections require external procedures from the TCK
+adapter catalog; sheets deliberately has no user-procedure plugin runtime. The
+28 parse rejections are negative grammar/numeric scenarios whose expected
+outcome is rejection. Every instance remains present in the report; none is
+silently dropped.
 
 ## Semantic runner evidence
 
@@ -100,32 +100,47 @@ non-executing `EXPLAIN` validation pass to distinguish compile-time from
 runtime errors and verifies the TCK rule that expected errors leave no
 observable side effects.
 
-The 2026-08-31 reproducible run reports:
+The 2026-09-01 reproducible run reports:
 
 | Semantic status | Count |
 | --- | ---: |
-| Pass | 2,082 |
-| Semantic failure | 1,169 |
+| Pass | 3,817 |
+| Semantic failure | 0 |
 | Harness unsupported | 1 |
-| Typed unsupported (frontend) | 617 |
+| Typed unsupported (frontend) | 51 |
 | Parse rejected (frontend) | 28 |
 | Silent skips | 0 |
 
-The single harness-unsupported case is explicitly tagged `@ignore` by M23.
-Scenarios requiring custom procedures are classified earlier as typed
-unsupported because sheets has no such procedure catalog. A pass here is
-evidence for this pinned runner and sheets revision, not certification or a
-claim about syntax outside the scenarios. `make cypher-tck-check` runs the
-semantic report twice and requires byte-for-byte identical JSON.
+The single harness-unsupported case is
+`expressions/graph/Graph5.feature::[2] Single-labels expression on relationships`,
+explicitly tagged `@ignore` by M23. Scenarios requiring custom procedures are
+classified earlier as typed unsupported because sheets has no such procedure
+catalog.
+All 1,004 selected temporal scenarios pass. The complete report is
+byte-identical on the host, Debian/linux-amd64, and Alpine/linux-arm64 even when
+host timezone inputs are poisoned; its SHA-256 is
+`586b61b41813729d622afc2bb726256e7411af06987f4dc948bcf43fa65055cb`.
+`make cypher-tck-check` independently runs the report twice and requires exact
+JSON equality.
 
-## Remaining semantic boundaries
+Named-zone semantics come from IANA 2023c's default main profile
+(`PACKRATDATA=` and `PACKRATLIST=`), the profile matched by M23's historical
+fixtures. Both IANA source tarballs, the digest-pinned build image, and the
+resulting archive are authenticated; amd64 and arm64 generation reproduce
+zoneinfo SHA-256
+`3fe2fe0c5897093e4965480de18722eabc224a1b7ac4dcb1ceb6943d62c01efe`.
 
-The semantic failures remain concentrated in executor behavior: temporal and
-duration construction/format coverage, missing compile-time scope/type
-validation, integer-division behavior, pattern-variable scope, and smaller
-conversion/collection semantics. Pattern comprehensions, map projections,
-administration commands, arbitrary user procedures, and newer quantified-path
-syntax remain outside the supported capability set. Query results are
-materialized rather than delivered through a fully conformance-tested
-streaming runtime. Broad compatibility therefore requires executor-level
-evidence in addition to this frontend inventory.
+## Interpretation and remaining boundaries
+
+Zero semantic failures means every frontend-bound scenario executed by this
+pinned runner produced the expected rows, side effects, or error category. It
+does not certify sheets, cover syntax absent from M23, or provide arbitrary
+external procedures. Administration commands, map projections, `LOAD CSV`,
+`FOREACH`, procedure transactions, and newer quantified-path syntax remain
+outside the documented surface.
+
+The runner compares stable error categories rather than vendor-specific error
+text. Read-only JSONL can stream an eligible terminal projection, but blocking
+operators and intermediate graph matching retain explicitly bounded working
+sets. Conformance and runtime architecture are therefore stated separately;
+neither is used to imply unbounded execution.

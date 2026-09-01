@@ -16,24 +16,29 @@ This makes the interface usable without first learning a shortcut map.
   position; `◇` marks an unordered child. Every root remains visible, and an
   explicit invalid section keeps cyclic or otherwise unreachable imported data
   from silently disappearing. The details pane shows the selected node's
-  stable ID, labels, every property, validity range, parent, ordered/unordered
-  children, all non-hierarchy relationships, and rendered Markdown body.
+  stable ID, validity range, hierarchy context, and explicitly bounded previews
+  of labels, properties, relationships, and rendered Markdown body.
 - **Relationships** is the complete edge inventory, including `CHILD` and every
   schema-free relationship type. Each row shows both endpoints, type, hierarchy
-  order where relevant, and property count. The details pane includes the full
-  identity, endpoints, validity range, and property object. `/` uses Bubbles'
-  fuzzy filtering over IDs, endpoint titles, type, and properties.
+  order where relevant, and property count. The details pane includes identity,
+  endpoints, validity range, and a bounded property preview. `/` uses Bubbles'
+  fuzzy filtering over bounded searchable representations of IDs, endpoint
+  titles, type, and properties.
 - **Query** is an interactive Cypher console with multiline Cypher and JSON
   parameter editors. Read-only and write-capable execution are distinct.
   Results preserve statement order, column order, duplicate column names, and
-  full selected-row values. The table can scroll horizontally, and `[` / `]`
-  move between results from a multi-statement request. When terminal height is
+  value types, while the table and selected-row inspector enforce explicit
+  presentation budgets. The table can scroll horizontally, and `[` / `]` move
+  between results from a multi-statement request. When terminal height is
   constrained, Query shows the focused section at full usable height; `Tab`
   still cycles through Cypher, parameters, results, and the selected row.
 - **Timeline** lists committed revisions newest first and includes revision 0,
   the initial empty graph. Entries show time, actor, and message and can be
   filtered with `/`. Opening one reloads every graph workspace at that exact
-  revision.
+  revision. The first 100 revisions load immediately; `o`, or moving near the
+  bottom, fetches the next bounded older page. Failed pages remain retryable,
+  duplicate refresh results are merged, and revision 0 appears only after the
+  committed history is exhausted.
 
 At 108 columns and above, Work, Relationships, and Timeline show their
 navigator and inspector side by side. Compact terminals show one focused pane;
@@ -41,6 +46,13 @@ navigator and inspector side by side. Compact terminals show one focused pane;
 show a wrapped resize message that retains both required dimensions and the
 quit key instead of a corrupted layout. All rendered lines are clipped and
 padded deterministically to the current terminal size.
+
+Presentation is deliberately bounded: detail JSON is capped at 256 KiB,
+Markdown body previews at 262,144 runes, and inspector collections at 1,000
+items. Query tables show at most 10,000 rows, 256 columns, 100,000 cells, and 80
+display columns per cell; selected-row detail is capped at 1 MiB. Explicit
+omission markers distinguish presentation limits from stored values. Engine
+resource-limit errors fail the operation rather than returning a partial graph.
 
 ## Live and historical state
 
@@ -68,7 +80,8 @@ Work provides guided forms for:
 
 - creating a root or child node with labels, properties, Markdown body, and an
   optional sibling position;
-- editing all labels, schema-free properties, and Markdown body;
+- editing labels, schema-free properties, and Markdown body; oversized
+  unchanged previews are preserved until explicitly replaced;
 - moving a node to another parent, detaching it to a root, or changing between
   ordered and unordered sibling placement;
 - connecting any two nodes with an arbitrary non-`CHILD` relationship and
@@ -86,10 +99,10 @@ searchable node selectors, validation, and explicit confirmations. JSON must
 be an object and is normalized before execution; overflowing integer literals
 are rejected rather than rounded. Existing finite floats, byte slices,
 temporals, durations, lists, and nested maps retain their durable types when an
-edit form is submitted. IEEE non-finite floats use the same explicit JSON tags
-as CLI output: `{"$float":"NaN"}`, `{"$float":"+Infinity"}`, and
-`{"$float":"-Infinity"}`. Node `body` and relationship `position` are
-reserved because their dedicated controls carry those graph semantics;
+edit form is submitted. IEEE non-finite floats, bytes, and all six exact Cypher
+temporal types use the same tagged JSON envelopes as CLI output. Node `body`
+and relationship `position` are reserved because their dedicated controls
+carry those graph semantics;
 dynamic labels, relationship types, and positions are validated. Values are
 passed as Cypher parameters, while dynamic labels and relationship types are
 escaped as identifiers. Deletes and write-capable console requests require
@@ -153,6 +166,7 @@ Timeline
   arrows or j/k  select
   /              filter revision metadata
   Enter          open the exact revision
+  o              load or retry the next older page
   Tab            focus details
 ```
 

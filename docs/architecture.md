@@ -4,9 +4,10 @@
 
 Sheets is a local-first, daemonless temporal property graph. SQLite is the
 single source of truth. Markdown bodies are values in the graph rather than
-mutable filesystem mirrors. Every successful write batch creates exactly one
-monotonically increasing revision; every statement in the batch either commits
-at that revision or none of it commits.
+mutable filesystem mirrors. Every successful batch with an effective mutation
+creates exactly one monotonically increasing revision; a successful no-op
+creates none. Every mutation in the batch either commits at that revision or
+none of it commits.
 
 The same application services power the CLI and TUI. The TUI has no privileged
 operations, and every mutation it performs can also be expressed in Cypher or
@@ -44,22 +45,45 @@ changes against one consistent current state, allocates one revision, writes
 new versions, and commits atomically. SQLite serializes writers while allowing
 independent processes to read concurrently.
 
+The embedded schema is currently version 5, with fingerprint
+`3be39b39c67594a6142d3167c7952c2c799d93c3b4d449de833695fb7e52c110`.
+Before upgrading an existing v1–v4 schema, migrations validate that version's
+exact fingerprint and source values;
+v2 and later also validate derived-index provenance. Migration DDL and
+`user_version` commit in one transaction. Go admission and decode
+paths enforce size, depth, cardinality, canonical form, and UTF-8. SQLite
+triggers independently enforce source and derived-index byte/cardinality limits
+for direct SQL; migrations and `CheckIntegrity` detect representation or UTF-8
+corruption which raw SQL can still introduce. Exact ceilings are listed in
+[the Cypher guide](cypher.md).
+
+Sheets assumes that the project database path is not maliciously replaced by
+another process running as the same OS user while a connection pool is open.
+SQLite and `database/sql` cannot portably bind every lazily opened connection
+and its WAL/SHM sidecars to one file identity. Closing that adversarial
+same-user pathname race requires a pinned, fd-relative custom VFS. A permanently
+single connection would mitigate the pool's split-identity case but sacrifice
+read concurrency and would not by itself bind validation, open, and sidecars
+against every replacement race. Neither guarantee is implied by normal
+multi-process concurrency.
+
 ## Packages
 
 - `cmd/sheets`: process entry point.
 - `internal/domain`: graph and revision value types shared across layers.
 - `internal/project`: initialization and nearest-project discovery.
 - `internal/store`: SQLite schema, temporal persistence, and transactions.
-- `internal/cypher`: lexer, parser, and syntax tree.
+- `internal/cypher`: generated M23 grammar frontend, CST binder, and syntax
+  tree.
 - `internal/engine`: semantic evaluation, graph execution, and snapshot
   indexes.
 - `internal/app`: use cases shared by all frontends.
 - `internal/cli`: command-line frontend and stable JSON contracts.
 - `internal/tui`: Charm-based interactive frontend.
 
-Dependencies point inward: frontends depend on `app`; `app` composes the query
-engine and store; neither the domain package nor project discovery depends on a
-frontend.
+Dependencies point inward: frontends depend on `app` boundaries, and the
+process entry point wires the store and engine implementations to them. Neither
+the domain package nor project discovery depends on a frontend.
 
 ## Cypher and JSON
 
@@ -71,6 +95,11 @@ revision.
 JSON is deliberately limited to machine-readable output and parameter values.
 It is not a second mutation language. This keeps one semantic surface while
 allowing agents to pass structured values without quoting them into queries.
+The engine delivers eligible read-only terminal projections through an
+internal synchronous Start/Row/End event boundary with backpressure; the JSONL
+renderer emits only its documented public records. Operators whose semantics
+require a complete bounded set, and every mutation, remain materialized;
+mutation output is published only after commit.
 
 ## Performance principles
 
@@ -78,7 +107,12 @@ allowing agents to pass structured values without quoting them into queries.
 - Current-state indexes are partial where that materially reduces index size.
 - Exact revision snapshots are immutable, revision-checked, and indexed in
   memory for repeated graph matching and traversal.
-- Listing and traversal APIs are paginated and streamable.
+- Revision history uses opaque keyset cursors bound to the schema, order,
+  predicate, and page boundary, and supports ascending or descending pages.
+  CLI JSONL streams eligible terminal
+  projections without retaining a second result table.
+- Query row, relationship-expansion, working-entity, and working-byte budgets
+  fail explicitly instead of silently truncating a result.
 - Startup performs no network access and opens no background service.
 - TUI refresh uses the maximum revision as a cheap invalidation token.
 - Benchmarks cover point lookup, hierarchy traversal, historical reads, bulk
