@@ -23,7 +23,7 @@ builds:
     flags:
       - -trimpath
       - -buildvcs=false
-    mod_timestamp: 2000-01-01T00:00:00Z
+    mod_timestamp: "946684800"
     ldflags:
       - >-
         -s -w
