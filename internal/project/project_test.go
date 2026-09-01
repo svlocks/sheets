@@ -1,11 +1,15 @@
 package project
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
+
+	graphstore "github.com/svlocks/sheets/internal/store"
 )
 
 func TestInitAndDiscover(t *testing.T) {
@@ -25,8 +29,12 @@ func TestInitAndDiscover(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(p.MetadataDir, MarkerFileName)); err != nil {
 		t.Fatalf("marker was not created: %v", err)
 	}
-	if _, err := os.Stat(p.DBPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("Init should not create DB, got %v", err)
+	databaseInfo, err := os.Stat(p.DBPath)
+	if err != nil || !databaseInfo.Mode().IsRegular() || databaseInfo.Size() == 0 {
+		t.Fatalf("Init did not create an initialized database: %v, %#v", err, databaseInfo)
+	}
+	if runtime.GOOS != "windows" && databaseInfo.Mode().Perm()&0022 != 0 {
+		t.Fatalf("database permissions are unsafe: %o", databaseInfo.Mode().Perm())
 	}
 
 	child := filepath.Join(root, "a", "b")
@@ -123,11 +131,8 @@ func TestDiscoverDatabaseOnlyLayout(t *testing.T) {
 	if err := os.Mkdir(metadata, 0700); err != nil {
 		t.Fatal(err)
 	}
-	db, err := os.OpenFile(filepath.Join(metadata, DatabaseFileName), os.O_CREATE|os.O_WRONLY, 0600)
+	db, err := graphstore.Open(context.Background(), filepath.Join(metadata, DatabaseFileName))
 	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Write([]byte("SQLite format 3\x00")); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -141,6 +146,100 @@ func TestDiscoverDatabaseOnlyLayout(t *testing.T) {
 	want := projectAt(canonicalRoot)
 	if discoverErr != nil || found != want {
 		t.Fatalf("Discover DB-only = %#v, %v; want %#v", found, discoverErr, want)
+	}
+}
+
+func TestConcurrentInitPublishesOnlyCompleteProject(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "project")
+	if err := os.Mkdir(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	const workers = 24
+	start := make(chan struct{})
+	results := make(chan Project, workers)
+	errorsCh := make(chan error, workers)
+	var wait sync.WaitGroup
+	for range workers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			project, err := Init(root)
+			if err != nil {
+				errorsCh <- err
+				return
+			}
+			results <- project
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	close(errorsCh)
+	for err := range errorsCh {
+		t.Errorf("concurrent Init: %v", err)
+	}
+	var expected Project
+	for result := range results {
+		if expected == (Project{}) {
+			expected = result
+		}
+		if result != expected {
+			t.Errorf("Init results differ: %#v != %#v", result, expected)
+		}
+	}
+	if expected == (Project{}) {
+		t.Fatal("no initializer succeeded")
+	}
+	if _, err := Discover(root); err != nil {
+		t.Fatalf("published project is not discoverable: %v", err)
+	}
+	if database, err := graphstore.Open(context.Background(), expected.DBPath); err != nil {
+		t.Fatalf("published database is not openable: %v", err)
+	} else if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name() != MetadataDirName {
+			t.Fatalf("initializer leaked staging entry %q", entry.Name())
+		}
+	}
+}
+
+func TestInitContextCancellationDoesNotPublishPartialMetadata(t *testing.T) {
+	root := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := InitContext(ctx, root); !errors.Is(err, context.Canceled) {
+		t.Fatalf("InitContext error = %v, want context.Canceled", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, MetadataDirName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled initialization published metadata: %v", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("canceled initialization leaked entries: %#v", entries)
+	}
+}
+
+func TestDiscoverIgnoresUnpublishedStagingDirectory(t *testing.T) {
+	root := t.TempDir()
+	staging := filepath.Join(root, ".sheets-init-interrupted")
+	if err := os.Mkdir(staging, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, MarkerFileName), []byte(markerContents), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Discover(root); !errors.Is(err, ErrProjectNotFound) {
+		t.Fatalf("Discover staging-only layout error = %v", err)
 	}
 }
 

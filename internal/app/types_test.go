@@ -17,6 +17,7 @@ func TestExecuteRequestValidate(t *testing.T) {
 	}{
 		{name: "valid", request: ExecuteRequest{Query: "RETURN 1"}},
 		{name: "empty", request: ExecuteRequest{}, wantErr: true},
+		{name: "whitespace", request: ExecuteRequest{Query: " \n\t"}, wantErr: true},
 		{
 			name: "two snapshots",
 			request: ExecuteRequest{
@@ -41,5 +42,8 @@ func TestSummaryChanged(t *testing.T) {
 	}
 	if !(Summary{NodesCreated: 1}).Changed() {
 		t.Fatal("created node should report a change")
+	}
+	if !(Summary{NodesCreated: ^uint64(0), NodesUpdated: 1}).Changed() {
+		t.Fatal("counter overflow must not hide a change")
 	}
 }

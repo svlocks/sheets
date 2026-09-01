@@ -9,8 +9,11 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/svlocks/sheets/internal/domain"
 )
@@ -69,6 +72,7 @@ type WriteTx struct {
 	base     domain.Revision
 	revision domain.Revision
 	info     *domain.RevisionInfo
+	failure  error
 	done     bool
 }
 
@@ -76,6 +80,9 @@ type WriteTx struct {
 // serializes all writers, including writers in other OS processes. A revision
 // is allocated lazily on the first effective mutation and at most once.
 func (s *Store) Write(ctx context.Context, meta RevisionMeta, fn func(*WriteTx) error) (result WriteResult, err error) {
+	if ctx == nil {
+		return result, fmt.Errorf("%w: nil context", ErrInvalidArgument)
+	}
 	if err := s.checkOpen(); err != nil {
 		return result, err
 	}
@@ -84,11 +91,20 @@ func (s *Store) Write(ctx context.Context, meta RevisionMeta, fn func(*WriteTx) 
 	}
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
-		return result, fmt.Errorf("acquire write connection: %w", err)
+		return result, databaseError(ctx, "acquire write connection", err)
 	}
 	defer func() { err = errors.Join(err, conn.Close()) }()
-	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return result, fmt.Errorf("begin write: %w", err)
+	if err := setBusyTimeout(ctx, conn, 0); err != nil {
+		return result, databaseError(ctx, "disable SQLite busy handler for cancellable write", err)
+	}
+	defer func() {
+		restoreErr := setBusyTimeout(context.Background(), conn, s.busyTimeout)
+		if restoreErr != nil {
+			err = errors.Join(err, fmt.Errorf("restore SQLite busy timeout: %w", restoreErr))
+		}
+	}()
+	if err := beginImmediate(ctx, conn, s.busyTimeout, "begin write"); err != nil {
+		return result, err
 	}
 	committed := false
 	defer func() {
@@ -102,21 +118,65 @@ func (s *Store) Write(ctx context.Context, meta RevisionMeta, fn func(*WriteTx) 
 	}()
 
 	var base int64
-	if err := conn.QueryRowContext(ctx, "SELECT COALESCE(MAX(revision), 0) FROM revisions").Scan(&base); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT COALESCE(MAX(revision), 0) FROM revisions WHERE sealed = 1").Scan(&base); err != nil {
 		return result, fmt.Errorf("read current revision: %w", err)
+	}
+	var unsealed int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM revisions WHERE sealed = 0").Scan(&unsealed); err != nil {
+		return result, fmt.Errorf("inspect active revisions: %w", err)
+	}
+	if unsealed != 0 {
+		return result, errors.New("database contains an unsealed revision")
+	}
+	if _, err := conn.ExecContext(ctx, "SAVEPOINT sheets_write_batch"); err != nil {
+		return result, fmt.Errorf("create write savepoint: %w", err)
 	}
 	tx := &WriteTx{conn: conn, ctx: ctx, store: s, meta: meta, base: domain.Revision(base)}
 	if err := fn(tx); err != nil {
 		tx.done = true
 		return result, err
 	}
+	if tx.failure != nil {
+		tx.done = true
+		return result, tx.failure
+	}
 	if err := ctx.Err(); err != nil {
 		tx.done = true
 		return result, err
 	}
+	if tx.revision != 0 {
+		changed, changeErr := tx.graphChanged()
+		if changeErr != nil {
+			tx.done = true
+			return result, changeErr
+		}
+		if !changed {
+			if _, err := conn.ExecContext(ctx, "ROLLBACK TO sheets_write_batch"); err != nil {
+				tx.done = true
+				return result, fmt.Errorf("roll back no-op write: %w", err)
+			}
+			tx.revision = 0
+			tx.info = nil
+		} else {
+			updated, err := conn.ExecContext(ctx,
+				"UPDATE revisions SET sealed = 1 WHERE revision = ? AND sealed = 0", int64(tx.revision))
+			if err != nil {
+				tx.done = true
+				return result, fmt.Errorf("seal revision: %w", err)
+			}
+			if err := expectOneRow(updated, "seal revision"); err != nil {
+				tx.done = true
+				return result, err
+			}
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "RELEASE sheets_write_batch"); err != nil {
+		tx.done = true
+		return result, fmt.Errorf("release write savepoint: %w", err)
+	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		tx.done = true
-		return result, fmt.Errorf("commit write: %w", err)
+		return result, databaseError(ctx, "commit write", err)
 	}
 	committed = true
 	tx.done = true
@@ -128,6 +188,65 @@ func (s *Store) Write(ctx context.Context, meta RevisionMeta, fn func(*WriteTx) 
 		result.Info = &info
 	}
 	return result, nil
+}
+
+// graphChanged compares only identities touched by the active revision. It is
+// used to collapse create/delete and update/revert sequences into a true no-op
+// without scanning the rest of the graph.
+func (tx *WriteTx) graphChanged() (bool, error) {
+	queries := []string{
+		`WITH touched(id) AS (
+			SELECT id FROM node_versions WHERE valid_from = ? OR valid_to = ? GROUP BY id
+		)
+		SELECT EXISTS (
+			SELECT 1 FROM touched
+			LEFT JOIN node_versions AS before
+			  ON before.id = touched.id
+			 AND before.valid_from <= ?
+			 AND (before.valid_to IS NULL OR before.valid_to > ?)
+			LEFT JOIN node_versions AS after
+			  ON after.id = touched.id
+			 AND after.valid_from <= ?
+			 AND (after.valid_to IS NULL OR after.valid_to > ?)
+			WHERE (before.id IS NULL) <> (after.id IS NULL)
+			   OR before.labels IS NOT after.labels
+			   OR before.properties IS NOT after.properties
+			   OR before.body IS NOT after.body
+		)`,
+		`WITH touched(id) AS (
+			SELECT id FROM edge_versions WHERE valid_from = ? OR valid_to = ? GROUP BY id
+		)
+		SELECT EXISTS (
+			SELECT 1 FROM touched
+			LEFT JOIN edge_versions AS before
+			  ON before.id = touched.id
+			 AND before.valid_from <= ?
+			 AND (before.valid_to IS NULL OR before.valid_to > ?)
+			LEFT JOIN edge_versions AS after
+			  ON after.id = touched.id
+			 AND after.valid_from <= ?
+			 AND (after.valid_to IS NULL OR after.valid_to > ?)
+			WHERE (before.id IS NULL) <> (after.id IS NULL)
+			   OR before.from_id IS NOT after.from_id
+			   OR before.type IS NOT after.type
+			   OR before.to_id IS NOT after.to_id
+			   OR before.position IS NOT after.position
+			   OR before.properties IS NOT after.properties
+		)`,
+	}
+	for _, query := range queries {
+		var changed int
+		if err := tx.conn.QueryRowContext(tx.ctx, query,
+			int64(tx.revision), int64(tx.revision),
+			int64(tx.base), int64(tx.base),
+			int64(tx.revision), int64(tx.revision)).Scan(&changed); err != nil {
+			return false, fmt.Errorf("compare write batch with base revision: %w", err)
+		}
+		if changed != 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // CurrentRevision is the revision visible to operations in this transaction.
@@ -155,22 +274,33 @@ func (tx *WriteTx) ensureRevision() (domain.Revision, error) {
 	if tx.base >= domain.Revision(math.MaxInt64) {
 		return 0, errors.New("revision space exhausted")
 	}
+	if !utf8.ValidString(tx.meta.Actor) || !utf8.ValidString(tx.meta.Message) {
+		return 0, fmt.Errorf("%w: revision actor and message must be valid UTF-8", ErrInvalidArgument)
+	}
 	when := tx.meta.Time
 	if when.IsZero() {
 		when = tx.store.clock()
 	}
 	when = when.UTC()
+	whenNS, err := unixNano(when)
+	if err != nil {
+		return 0, fmt.Errorf("create revision: %w", err)
+	}
 	var previous sql.NullInt64
 	if err := tx.conn.QueryRowContext(tx.ctx, "SELECT committed_ns FROM revisions ORDER BY revision DESC LIMIT 1").Scan(&previous); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf("read previous revision time: %w", err)
 	}
-	if previous.Valid && when.UnixNano() <= previous.Int64 {
+	if previous.Valid && whenNS <= previous.Int64 {
+		if previous.Int64 == math.MaxInt64 {
+			return 0, errors.New("revision timestamp space exhausted")
+		}
 		when = time.Unix(0, previous.Int64+1).UTC()
+		whenNS = previous.Int64 + 1
 	}
 	revision := tx.base + 1
 	if _, err := tx.conn.ExecContext(tx.ctx,
-		"INSERT INTO revisions(revision, committed_ns, actor, message) VALUES (?, ?, ?, ?)",
-		int64(revision), when.UnixNano(), tx.meta.Actor, tx.meta.Message,
+		"INSERT INTO revisions(revision, committed_ns, actor, message, sealed) VALUES (?, ?, ?, ?, 0)",
+		int64(revision), whenNS, tx.meta.Actor, tx.meta.Message,
 	); err != nil {
 		return 0, fmt.Errorf("create revision: %w", err)
 	}
@@ -200,7 +330,8 @@ func (tx *WriteTx) GetEdge(id domain.EntityID) (domain.Edge, error) {
 }
 
 // CreateNode creates a stable identity and its first version.
-func (tx *WriteTx) CreateNode(input NodeInput) (domain.Node, error) {
+func (tx *WriteTx) CreateNode(input NodeInput) (result domain.Node, retErr error) {
+	defer func() { tx.recordMutationFailure(retErr) }()
 	if err := tx.checkActive(); err != nil {
 		return domain.Node{}, err
 	}
@@ -223,6 +354,13 @@ func (tx *WriteTx) CreateNode(input NodeInput) (domain.Node, error) {
 	if err != nil {
 		return domain.Node{}, fmt.Errorf("encode node properties: %w", err)
 	}
+	if !utf8.ValidString(input.Body) {
+		return domain.Node{}, fmt.Errorf("%w: node body is not valid UTF-8", ErrInvalidArgument)
+	}
+	clonedProperties, err := decodeProperties(properties)
+	if err != nil {
+		return domain.Node{}, fmt.Errorf("clone node properties: %w", err)
+	}
 	var exists int
 	err = tx.conn.QueryRowContext(tx.ctx, "SELECT 1 FROM nodes WHERE id = ?", string(id)).Scan(&exists)
 	if err == nil {
@@ -243,11 +381,15 @@ func (tx *WriteTx) CreateNode(input NodeInput) (domain.Node, error) {
 		VALUES (?, ?, ?, ?, ?)`, string(id), int64(revision), labelsData, properties, input.Body); err != nil {
 		return domain.Node{}, mapConflict("create node version", err)
 	}
-	return domain.Node{ID: id, Labels: labels, Properties: cloneProperties(input.Properties), Body: input.Body, ValidFrom: revision}, nil
+	if err := replacePropertyIndex(tx.ctx, tx.conn, "node_property_index", id, revision, nil, clonedProperties); err != nil {
+		return domain.Node{}, fmt.Errorf("index node properties: %w", err)
+	}
+	return domain.Node{ID: id, Labels: labels, Properties: clonedProperties, Body: input.Body, ValidFrom: revision}, nil
 }
 
 // UpdateNode creates a new version when at least one value actually changes.
-func (tx *WriteTx) UpdateNode(id domain.EntityID, update NodeUpdate) (domain.Node, error) {
+func (tx *WriteTx) UpdateNode(id domain.EntityID, update NodeUpdate) (result domain.Node, retErr error) {
+	defer func() { tx.recordMutationFailure(retErr) }()
 	current, err := tx.GetNode(id)
 	if err != nil {
 		return domain.Node{}, err
@@ -257,7 +399,7 @@ func (tx *WriteTx) UpdateNode(id domain.EntityID, update NodeUpdate) (domain.Nod
 		next.Labels = normalizeLabels(*update.Labels)
 	}
 	if update.Properties != nil {
-		next.Properties = cloneProperties(*update.Properties)
+		next.Properties = *update.Properties
 	}
 	if update.Body != nil {
 		next.Body = *update.Body
@@ -271,6 +413,9 @@ func (tx *WriteTx) UpdateNode(id domain.EntityID, update NodeUpdate) (domain.Nod
 	if err != nil {
 		return domain.Node{}, fmt.Errorf("encode node properties: %w", err)
 	}
+	if !utf8.ValidString(next.Body) {
+		return domain.Node{}, fmt.Errorf("%w: node body is not valid UTF-8", ErrInvalidArgument)
+	}
 	currentLabels, _, _ := encodeLabels(current.Labels)
 	currentProperties, err := encodeProperties(current.Properties)
 	if err != nil {
@@ -279,12 +424,19 @@ func (tx *WriteTx) UpdateNode(id domain.EntityID, update NodeUpdate) (domain.Nod
 	if slices.Equal(labelsData, currentLabels) && slices.Equal(properties, currentProperties) && next.Body == current.Body {
 		return current, nil
 	}
+	next.Properties, err = decodeProperties(properties)
+	if err != nil {
+		return domain.Node{}, fmt.Errorf("clone node properties: %w", err)
+	}
 	revision, err := tx.ensureRevision()
 	if err != nil {
 		return domain.Node{}, err
 	}
 	if err := tx.replaceNodeVersion(current, next, labelsData, properties, revision); err != nil {
 		return domain.Node{}, err
+	}
+	if err := replacePropertyIndex(tx.ctx, tx.conn, "node_property_index", id, revision, nil, next.Properties); err != nil {
+		return domain.Node{}, fmt.Errorf("index node properties: %w", err)
 	}
 	next.ValidFrom, next.ValidTo = revision, nil
 	return next, nil
@@ -297,10 +449,14 @@ func (tx *WriteTx) replaceNodeVersion(current, next domain.Node, labels, propert
 			labels, properties, next.Body, string(current.ID), int64(revision))
 		return err
 	}
-	if _, err := tx.conn.ExecContext(tx.ctx,
+	result, err := tx.conn.ExecContext(tx.ctx,
 		"UPDATE node_versions SET valid_to = ? WHERE id = ? AND valid_to IS NULL",
-		int64(revision), string(current.ID)); err != nil {
+		int64(revision), string(current.ID))
+	if err != nil {
 		return fmt.Errorf("close node version: %w", err)
+	}
+	if err := expectOneRow(result, "close node version"); err != nil {
+		return err
 	}
 	if _, err := tx.conn.ExecContext(tx.ctx, `
 		INSERT INTO node_versions(id, valid_from, labels, properties, body)
@@ -311,7 +467,8 @@ func (tx *WriteTx) replaceNodeVersion(current, next domain.Node, labels, propert
 }
 
 // DeleteNode closes the current node version and all incident current edges.
-func (tx *WriteTx) DeleteNode(id domain.EntityID) error {
+func (tx *WriteTx) DeleteNode(id domain.EntityID) (retErr error) {
+	defer func() { tx.recordMutationFailure(retErr) }()
 	current, err := tx.GetNode(id)
 	if err != nil {
 		return err
@@ -371,7 +528,8 @@ func (tx *WriteTx) DeleteNode(id domain.EntityID) error {
 }
 
 // CreateEdge creates a stable edge identity and its first version.
-func (tx *WriteTx) CreateEdge(input EdgeInput) (domain.Edge, error) {
+func (tx *WriteTx) CreateEdge(input EdgeInput) (result domain.Edge, retErr error) {
+	defer func() { tx.recordMutationFailure(retErr) }()
 	if err := tx.checkActive(); err != nil {
 		return domain.Edge{}, err
 	}
@@ -390,7 +548,11 @@ func (tx *WriteTx) CreateEdge(input EdgeInput) (domain.Edge, error) {
 	if err != nil {
 		return domain.Edge{}, fmt.Errorf("encode edge properties: %w", err)
 	}
-	edge := domain.Edge{ID: id, From: input.From, Type: input.Type, To: input.To, Position: cloneInt64(input.Position), Properties: cloneProperties(input.Properties)}
+	clonedProperties, err := decodeProperties(properties)
+	if err != nil {
+		return domain.Edge{}, fmt.Errorf("clone edge properties: %w", err)
+	}
+	edge := domain.Edge{ID: id, From: input.From, Type: input.Type, To: input.To, Position: cloneInt64(input.Position), Properties: clonedProperties}
 	if err := tx.validateEdge(edge, ""); err != nil {
 		return domain.Edge{}, err
 	}
@@ -414,12 +576,16 @@ func (tx *WriteTx) CreateEdge(input EdgeInput) (domain.Edge, error) {
 		VALUES (?, ?, ?, ?, ?, ?, ?)`, string(id), int64(revision), string(input.From), input.Type, string(input.To), input.Position, properties); err != nil {
 		return domain.Edge{}, mapConstraintError("create edge version", err)
 	}
+	if err := replacePropertyIndex(tx.ctx, tx.conn, "edge_property_index", id, revision, nil, clonedProperties); err != nil {
+		return domain.Edge{}, fmt.Errorf("index edge properties: %w", err)
+	}
 	edge.ValidFrom = revision
 	return edge, nil
 }
 
 // UpdateEdge creates a new version when at least one value actually changes.
-func (tx *WriteTx) UpdateEdge(id domain.EntityID, update EdgeUpdate) (domain.Edge, error) {
+func (tx *WriteTx) UpdateEdge(id domain.EntityID, update EdgeUpdate) (result domain.Edge, retErr error) {
+	defer func() { tx.recordMutationFailure(retErr) }()
 	current, err := tx.GetEdge(id)
 	if err != nil {
 		return domain.Edge{}, err
@@ -438,7 +604,7 @@ func (tx *WriteTx) UpdateEdge(id domain.EntityID, update EdgeUpdate) (domain.Edg
 		next.Position = cloneInt64(update.Position)
 	}
 	if update.Properties != nil {
-		next.Properties = cloneProperties(*update.Properties)
+		next.Properties = *update.Properties
 	}
 	if err := tx.validateEdge(next, id); err != nil {
 		return domain.Edge{}, err
@@ -453,6 +619,10 @@ func (tx *WriteTx) UpdateEdge(id domain.EntityID, update EdgeUpdate) (domain.Edg
 	}
 	if current.From == next.From && current.Type == next.Type && current.To == next.To && equalInt64(current.Position, next.Position) && slices.Equal(currentProperties, properties) {
 		return current, nil
+	}
+	next.Properties, err = decodeProperties(properties)
+	if err != nil {
+		return domain.Edge{}, fmt.Errorf("clone edge properties: %w", err)
 	}
 	revision, err := tx.ensureRevision()
 	if err != nil {
@@ -474,12 +644,16 @@ func (tx *WriteTx) UpdateEdge(id domain.EntityID, update EdgeUpdate) (domain.Edg
 	if err != nil {
 		return domain.Edge{}, mapConstraintError("update edge", err)
 	}
+	if err := replacePropertyIndex(tx.ctx, tx.conn, "edge_property_index", id, revision, nil, next.Properties); err != nil {
+		return domain.Edge{}, fmt.Errorf("index edge properties: %w", err)
+	}
 	next.ValidFrom, next.ValidTo = revision, nil
 	return next, nil
 }
 
 // DeleteEdge closes the current edge version.
-func (tx *WriteTx) DeleteEdge(id domain.EntityID) error {
+func (tx *WriteTx) DeleteEdge(id domain.EntityID) (retErr error) {
+	defer func() { tx.recordMutationFailure(retErr) }()
 	current, err := tx.GetEdge(id)
 	if err != nil {
 		return err
@@ -534,18 +708,24 @@ func (tx *WriteTx) validateEdge(edge domain.Edge, exclude domain.EntityID) error
 	if edge.Type == "" {
 		return &domain.ConstraintError{Constraint: "edge_type", Detail: "relationship type is required"}
 	}
+	if !utf8.ValidString(edge.Type) || strings.IndexByte(edge.Type, 0) >= 0 {
+		return &domain.ConstraintError{Constraint: "edge_type", Detail: "relationship type must be valid UTF-8 without NUL bytes"}
+	}
 	if edge.Type != "CHILD" && edge.Position != nil {
 		return &domain.ConstraintError{Constraint: "edge_position", Detail: "position is only valid on CHILD edges"}
 	}
-	for role, id := range map[string]domain.EntityID{"source": edge.From, "target": edge.To} {
+	for _, endpoint := range []struct {
+		role string
+		id   domain.EntityID
+	}{{"source", edge.From}, {"target", edge.To}} {
 		var exists int
 		err := tx.conn.QueryRowContext(tx.ctx,
-			"SELECT 1 FROM node_versions WHERE id = ? AND valid_to IS NULL", string(id)).Scan(&exists)
+			"SELECT 1 FROM node_versions WHERE id = ? AND valid_to IS NULL", string(endpoint.id)).Scan(&exists)
 		if errors.Is(err, sql.ErrNoRows) {
-			return &domain.ConstraintError{Constraint: "edge_endpoint", Detail: role + " node " + string(id) + " is not current"}
+			return &domain.ConstraintError{Constraint: "edge_endpoint", Detail: endpoint.role + " node " + string(endpoint.id) + " is not current"}
 		}
 		if err != nil {
-			return fmt.Errorf("check edge %s: %w", role, err)
+			return fmt.Errorf("check edge %s: %w", endpoint.role, err)
 		}
 	}
 	if edge.Type != "CHILD" {
@@ -625,12 +805,40 @@ func (tx *WriteTx) childPathExists(start, goal, exclude domain.EntityID) (bool, 
 	return false, nil
 }
 
+var uuidV7State struct {
+	sync.Mutex
+	last [16]byte
+	set  bool
+}
+
 func newUUIDv7() (domain.EntityID, error) {
+	uuidV7State.Lock()
+	defer uuidV7State.Unlock()
+
 	var id [16]byte
-	if _, err := rand.Read(id[:]); err != nil {
+	millis := uint64(time.Now().UnixMilli())
+	lastMillis := uint64(0)
+	if uuidV7State.set {
+		lastMillis = uint64(uuidV7State.last[0])<<40 |
+			uint64(uuidV7State.last[1])<<32 |
+			uint64(uuidV7State.last[2])<<24 |
+			uint64(uuidV7State.last[3])<<16 |
+			uint64(uuidV7State.last[4])<<8 |
+			uint64(uuidV7State.last[5])
+	}
+	if uuidV7State.set && millis <= lastMillis {
+		id = uuidV7State.last
+		if !incrementUUIDv7Payload(&id) {
+			millis = lastMillis + 1
+			if _, err := rand.Read(id[6:]); err != nil {
+				return "", fmt.Errorf("generate entity ID: %w", err)
+			}
+		} else {
+			millis = lastMillis
+		}
+	} else if _, err := rand.Read(id[6:]); err != nil {
 		return "", fmt.Errorf("generate entity ID: %w", err)
 	}
-	millis := uint64(time.Now().UnixMilli())
 	id[0] = byte(millis >> 40)
 	id[1] = byte(millis >> 32)
 	id[2] = byte(millis >> 24)
@@ -639,6 +847,8 @@ func newUUIDv7() (domain.EntityID, error) {
 	id[5] = byte(millis)
 	id[6] = (id[6] & 0x0f) | 0x70
 	id[8] = (id[8] & 0x3f) | 0x80
+	uuidV7State.last = id
+	uuidV7State.set = true
 	var text [36]byte
 	hex.Encode(text[0:8], id[0:4])
 	text[8] = '-'
@@ -652,9 +862,49 @@ func newUUIDv7() (domain.EntityID, error) {
 	return domain.EntityID(text[:]), nil
 }
 
+func incrementUUIDv7Payload(id *[16]byte) bool {
+	for index := 15; index >= 9; index-- {
+		id[index]++
+		if id[index] != 0 {
+			return true
+		}
+	}
+	low := (id[8] & 0x3f) + 1
+	id[8] = (id[8] & 0xc0) | (low & 0x3f)
+	if low <= 0x3f {
+		return true
+	}
+	id[8] &= 0xc0
+	for index := 7; index >= 6; index-- {
+		limitMask := byte(0xff)
+		if index == 6 {
+			limitMask = 0x0f
+		}
+		// Keep the carry in a wider type.  Byte arithmetic wraps before the
+		// comparison, which used to turn 0xff + 1 into a false successful
+		// increment instead of carrying into the next UUIDv7 payload byte.
+		value := uint16(id[index]&limitMask) + 1
+		id[index] = (id[index] &^ limitMask) | byte(value&uint16(limitMask))
+		if value <= uint16(limitMask) {
+			return true
+		}
+	}
+	return false
+}
+
 func validateID(id domain.EntityID) error {
-	if id == "" || strings.IndexByte(string(id), 0) >= 0 {
-		return fmt.Errorf("%w: invalid entity ID", ErrInvalidArgument)
+	text := string(id)
+	if len(text) != 36 || text[8] != '-' || text[13] != '-' || text[18] != '-' || text[23] != '-' ||
+		text[14] != '7' || !strings.ContainsRune("89ab", rune(text[19])) {
+		return fmt.Errorf("%w: entity ID must be a lowercase UUIDv7", ErrInvalidArgument)
+	}
+	for index, character := range []byte(text) {
+		if index == 8 || index == 13 || index == 18 || index == 23 {
+			continue
+		}
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return fmt.Errorf("%w: entity ID must be a lowercase UUIDv7", ErrInvalidArgument)
+		}
 	}
 	return nil
 }
@@ -671,23 +921,79 @@ func cloneInt64(value *int64) *int64 {
 	return &copyOf
 }
 
-func cloneProperties(properties domain.Properties) domain.Properties {
-	if properties == nil {
-		return nil
-	}
-	data, err := encodeProperties(properties)
+func expectOneRow(result sql.Result, operation string) error {
+	count, err := result.RowsAffected()
 	if err != nil {
-		return properties
+		return fmt.Errorf("%s: count affected rows: %w", operation, err)
 	}
-	result, err := decodeProperties(data)
-	if err != nil {
-		return properties
+	if count != 1 {
+		return fmt.Errorf("%s: expected one affected row, got %d", operation, count)
 	}
-	return result
+	return nil
+}
+
+func (tx *WriteTx) recordMutationFailure(err error) {
+	if err != nil && tx != nil && tx.failure == nil {
+		tx.failure = err
+	}
+}
+
+var (
+	minimumUnixNanoTime = time.Unix(0, math.MinInt64).UTC()
+	maximumUnixNanoTime = time.Unix(0, math.MaxInt64).UTC()
+)
+
+func unixNano(value time.Time) (int64, error) {
+	value = value.UTC()
+	if value.Before(minimumUnixNanoTime) || value.After(maximumUnixNanoTime) {
+		return 0, fmt.Errorf("timestamp %s is outside SQLite nanosecond range", value.Format(time.RFC3339Nano))
+	}
+	return value.UnixNano(), nil
+}
+
+func setBusyTimeout(ctx context.Context, conn *sql.Conn, timeout time.Duration) error {
+	milliseconds := timeout.Milliseconds()
+	_, err := conn.ExecContext(ctx, "PRAGMA busy_timeout="+strconv.FormatInt(milliseconds, 10))
+	return err
+}
+
+func beginImmediate(ctx context.Context, conn *sql.Conn, timeout time.Duration, operation string) error {
+	deadline := time.Now().Add(timeout)
+	backoff := time.Millisecond
+	for {
+		_, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE")
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return databaseError(ctx, operation, err)
+		}
+		if !isSQLiteBusy(err) {
+			return databaseError(ctx, operation, err)
+		}
+		remaining := time.Until(deadline)
+		if timeout == 0 || remaining <= 0 {
+			return fmt.Errorf("%s: %w: %v", operation, ErrBusy, err)
+		}
+		wait := min(backoff, remaining)
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return fmt.Errorf("%s: %w", operation, ctx.Err())
+		case <-timer.C:
+		}
+		backoff = min(backoff*2, 25*time.Millisecond)
+	}
 }
 
 func mapConflict(operation string, err error) error {
-	if strings.Contains(strings.ToLower(err.Error()), "constraint") {
+	if isSQLiteBusy(err) {
+		return fmt.Errorf("%s: %w: %v", operation, ErrBusy, err)
+	}
+	if isSQLiteConstraint(err) {
 		return fmt.Errorf("%w: %s: %v", domain.ErrConflict, operation, err)
 	}
 	return fmt.Errorf("%s: %w", operation, err)
@@ -695,10 +1001,19 @@ func mapConflict(operation string, err error) error {
 
 func mapConstraintError(operation string, err error) error {
 	message := strings.ToLower(err.Error())
-	if strings.Contains(message, "one_current_child_parent") || strings.Contains(message, "edge_versions.to_id") {
+	if isSQLiteBusy(err) {
+		return fmt.Errorf("%s: %w: %v", operation, ErrBusy, err)
+	}
+	if strings.Contains(message, "one_current_child_parent") || strings.Contains(message, "edge_versions.to_id") || strings.Contains(message, "sheets_child_parent") {
 		return &domain.ConstraintError{Constraint: "child_parent", Detail: "target already has a current parent"}
 	}
-	if strings.Contains(message, "constraint") {
+	if strings.Contains(message, "sheets_child_cycle") {
+		return &domain.ConstraintError{Constraint: "child_cycle", Detail: "relationship would form a cycle"}
+	}
+	if strings.Contains(message, "sheets_edge_endpoint") {
+		return &domain.ConstraintError{Constraint: "edge_endpoint", Detail: "source and target must be current nodes"}
+	}
+	if isSQLiteConstraint(err) {
 		return fmt.Errorf("%w: %s: %v", domain.ErrConflict, operation, err)
 	}
 	return fmt.Errorf("%s: %w", operation, err)

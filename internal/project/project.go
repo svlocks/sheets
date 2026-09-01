@@ -3,11 +3,17 @@ package project
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+
+	"github.com/svlocks/sheets/internal/store"
 )
 
 // Names used by a sheets project on disk.
@@ -65,17 +71,29 @@ func projectAt(root string) Project {
 	}
 }
 
-// Init creates a sheets metadata directory at path. It is idempotent for an
-// existing valid project (including a project represented by an initialized
-// sheets.db). Init does not create the database; the store creates it later.
+// Init atomically creates a durable marker and initialized SQLite database. A
+// staging directory keeps concurrent discovery from observing partial state.
 func Init(path string) (Project, error) {
+	return InitContext(context.Background(), path)
+}
+
+// InitContext is Init with cancellation for database initialization.
+func InitContext(ctx context.Context, path string) (Project, error) {
+	if ctx == nil {
+		return Project{}, fmt.Errorf("sheets init %q: nil context", path)
+	}
 	root, err := canonicalInitDirectory(path)
 	if err != nil {
 		return Project{}, fmt.Errorf("sheets init %q: %w", path, err)
 	}
 	p := projectAt(root)
+	rootHandle, err := os.OpenRoot(root)
+	if err != nil {
+		return Project{}, fmt.Errorf("sheets init %q: secure root: %w", path, err)
+	}
+	defer func() { _ = rootHandle.Close() }()
 
-	info, err := os.Lstat(p.MetadataDir)
+	info, err := rootHandle.Lstat(MetadataDirName)
 	if err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return Project{}, layoutError(p, p.MetadataDir, true, "metadata directory is a symlink")
@@ -83,70 +101,135 @@ func Init(path string) (Project, error) {
 		if !info.IsDir() {
 			return Project{}, layoutError(p, p.MetadataDir, true, "metadata path is not a directory")
 		}
-		if err := validateMetadata(p); err != nil {
-			return Project{}, err
-		}
-		return p, nil
+		return completeExistingProject(ctx, p)
 	}
 	if !os.IsNotExist(err) {
 		return Project{}, fmt.Errorf("sheets init %q: inspect metadata: %w", path, err)
 	}
 
-	// Mkdir can race with another initializer. In that case validate the
-	// resulting directory and return it as an idempotent initialization.
-	if err := os.Mkdir(p.MetadataDir, 0700); err != nil {
-		if !os.IsExist(err) {
-			return Project{}, fmt.Errorf("sheets init %q: create metadata: %w", path, err)
-		}
-		info, statErr := os.Lstat(p.MetadataDir)
-		if statErr != nil {
-			return Project{}, fmt.Errorf("sheets init %q: inspect metadata after race: %w", path, statErr)
-		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-			return Project{}, layoutError(p, p.MetadataDir, true, "metadata path is not a directory")
-		}
-		if err := validateMetadata(p); err != nil {
-			return Project{}, err
-		}
-		return p, nil
-	}
-
-	marker, err := os.OpenFile(filepath.Join(p.MetadataDir, MarkerFileName), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	stageName, stageRoot, err := createStage(rootHandle)
 	if err != nil {
-		if os.IsExist(err) {
-			if validateErr := validateMetadata(p); validateErr == nil {
-				return p, nil
-			}
-			// A concurrent initializer (or caller) owns an existing marker;
-			// never remove its metadata while reporting its invalid layout.
-			return Project{}, fmt.Errorf("sheets init %q: create marker: %w", path, err)
+		return Project{}, fmt.Errorf("sheets init %q: create staging directory: %w", path, err)
+	}
+	stageOpen := true
+	stagePublished := false
+	defer func() {
+		if stageOpen {
+			_ = stageRoot.Close()
 		}
-		// Do not clean up if a marker appeared concurrently or cannot be
-		// inspected due to permissions.
-		if _, statErr := os.Lstat(filepath.Join(p.MetadataDir, MarkerFileName)); os.IsNotExist(statErr) {
-			_ = os.Remove(p.MetadataDir)
+		// Once renamed, stageName is no longer ours.  A same-user concurrent
+		// process could create that randomly named entry before this deferred
+		// cleanup runs; never remove a replacement after publication.
+		if !stagePublished {
+			_ = rootHandle.RemoveAll(stageName)
 		}
+	}()
+
+	if err := writeMarker(stageRoot); err != nil {
 		return Project{}, fmt.Errorf("sheets init %q: create marker: %w", path, err)
+	}
+	stagePath := filepath.Join(root, stageName)
+	database, err := store.Open(ctx, filepath.Join(stagePath, DatabaseFileName))
+	if err != nil {
+		return Project{}, fmt.Errorf("sheets init %q: initialize database: %w", path, err)
+	}
+	if err := database.Close(); err != nil {
+		return Project{}, fmt.Errorf("sheets init %q: close initialized database: %w", path, err)
+	}
+	if err := stageRoot.Chmod(DatabaseFileName, 0600); err != nil {
+		return Project{}, fmt.Errorf("sheets init %q: secure database permissions: %w", path, err)
+	}
+	if dir, openErr := stageRoot.Open("."); openErr == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	if err := stageRoot.Close(); err != nil {
+		return Project{}, fmt.Errorf("sheets init %q: close staging directory: %w", path, err)
+	}
+	stageOpen = false
+	if err := rootHandle.Rename(stageName, MetadataDirName); err != nil {
+		// Another initializer can win the one atomic rename. Its fully staged
+		// project is the idempotent result; no partial .sheets is accepted.
+		if _, statErr := rootHandle.Lstat(MetadataDirName); statErr == nil {
+			return completeExistingProject(ctx, p)
+		}
+		return Project{}, fmt.Errorf("sheets init %q: publish metadata: %w", path, err)
+	}
+	stagePublished = true
+	if dir, openErr := rootHandle.Open("."); openErr == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	if err := validateMetadata(p); err != nil {
+		return Project{}, err
+	}
+	return p, nil
+}
+
+func createStage(root *os.Root) (string, *os.Root, error) {
+	for attempt := 0; attempt < 128; attempt++ {
+		var random [12]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			return "", nil, err
+		}
+		name := ".sheets-init-" + hex.EncodeToString(random[:])
+		if err := root.Mkdir(name, 0700); err != nil {
+			if os.IsExist(err) {
+				continue
+			}
+			return "", nil, err
+		}
+		opened, err := root.OpenRoot(name)
+		if err != nil {
+			_ = root.Remove(name)
+			return "", nil, err
+		}
+		return name, opened, nil
+	}
+	return "", nil, errors.New("could not allocate a unique staging directory")
+}
+
+func writeMarker(metadata *os.Root) error {
+	marker, err := metadata.OpenFile(MarkerFileName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
 	}
 	if _, err = io.WriteString(marker, markerContents); err == nil {
 		err = marker.Sync()
 	}
-	closeErr := marker.Close()
-	if err == nil {
-		err = closeErr
+	return errors.Join(err, marker.Close())
+}
+
+func completeExistingProject(ctx context.Context, p Project) (Project, error) {
+	if err := validateMetadata(p); err != nil {
+		return Project{}, err
 	}
+	database, err := store.Open(ctx, p.DBPath)
 	if err != nil {
-		// Only the marker was created by this invocation, so cleanup cannot
-		// remove user data from a pre-existing project.
-		_ = os.Remove(filepath.Join(p.MetadataDir, MarkerFileName))
-		_ = os.Remove(p.MetadataDir)
-		return Project{}, fmt.Errorf("sheets init %q: write marker: %w", path, err)
+		return Project{}, fmt.Errorf("initialize sheets database %s: %w", p.DBPath, err)
 	}
-	// Sync is not supported for directories on every platform; the marker's
-	// own Sync above still gives durable contents where directory sync exists.
-	if dir, openErr := os.Open(p.MetadataDir); openErr == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
+	checkErr := database.CheckIntegrity(ctx)
+	closeErr := database.Close()
+	if err := errors.Join(checkErr, closeErr); err != nil {
+		return Project{}, fmt.Errorf("validate sheets database %s: %w", p.DBPath, err)
+	}
+	metadata, err := os.OpenRoot(p.MetadataDir)
+	if err != nil {
+		return Project{}, fmt.Errorf("secure sheets metadata %s: %w", p.MetadataDir, err)
+	}
+	defer func() { _ = metadata.Close() }()
+	if err := metadata.Chmod(DatabaseFileName, 0600); err != nil {
+		return Project{}, fmt.Errorf("secure sheets database %s: %w", p.DBPath, err)
+	}
+	if _, err := metadata.Lstat(MarkerFileName); os.IsNotExist(err) {
+		if err := writeMarker(metadata); err != nil && !os.IsExist(err) {
+			return Project{}, fmt.Errorf("create sheets marker: %w", err)
+		}
+	} else if err != nil {
+		return Project{}, fmt.Errorf("inspect sheets marker: %w", err)
+	}
+	if err := validateMetadata(p); err != nil {
+		return Project{}, err
 	}
 	return p, nil
 }
@@ -245,20 +328,42 @@ func canonicalExisting(path string) (string, error) {
 }
 
 func validateMetadata(p Project) error {
-	markerPath := filepath.Join(p.MetadataDir, MarkerFileName)
-	dbPath := filepath.Join(p.MetadataDir, DatabaseFileName)
+	root, err := os.OpenRoot(p.Root)
+	if err != nil {
+		return fmt.Errorf("secure sheets root %s: %w", p.Root, err)
+	}
+	defer func() { _ = root.Close() }()
+	expectedMetadata, err := root.Lstat(MetadataDirName)
+	if err != nil {
+		return fmt.Errorf("inspect sheets metadata %s: %w", p.MetadataDir, err)
+	}
+	if expectedMetadata.Mode()&os.ModeSymlink != 0 || !expectedMetadata.IsDir() {
+		return layoutError(p, p.MetadataDir, true, "metadata path is not a real directory")
+	}
+	if unsafePermissions(expectedMetadata.Mode()) {
+		return layoutError(p, p.MetadataDir, true, "metadata directory is group- or world-writable")
+	}
+	metadata, err := root.OpenRoot(MetadataDirName)
+	if err != nil {
+		return layoutError(p, p.MetadataDir, true, "metadata directory changed during validation")
+	}
+	defer func() { _ = metadata.Close() }()
+	actualMetadata, err := metadata.Stat(".")
+	if err != nil || !os.SameFile(expectedMetadata, actualMetadata) {
+		return layoutError(p, p.MetadataDir, true, "metadata directory changed during validation")
+	}
 
-	marker, markerErr := os.Lstat(markerPath)
+	markerPath := filepath.Join(p.MetadataDir, MarkerFileName)
+	markerInfo, markerErr := metadata.Lstat(MarkerFileName)
 	if markerErr == nil {
-		if marker.Mode()&os.ModeSymlink != 0 {
-			return layoutError(p, markerPath, true, "marker is a symlink")
-		}
-		if !marker.Mode().IsRegular() {
-			return layoutError(p, markerPath, true, "marker is not a regular file")
-		}
-		contents, err := os.ReadFile(markerPath)
+		marker, err := openSecureRegular(metadata, MarkerFileName, markerInfo)
 		if err != nil {
-			return fmt.Errorf("read sheets marker %s: %w", markerPath, err)
+			return layoutError(p, markerPath, true, "marker changed during validation")
+		}
+		contents, readErr := io.ReadAll(io.LimitReader(marker, int64(len(markerContents)+1)))
+		readErr = errors.Join(readErr, marker.Close())
+		if readErr != nil {
+			return fmt.Errorf("read sheets marker %s: %w", markerPath, readErr)
 		}
 		if !bytes.Equal(contents, []byte(markerContents)) {
 			return layoutError(p, markerPath, false, "marker has an unrecognized format")
@@ -267,25 +372,22 @@ func validateMetadata(p Project) error {
 		return fmt.Errorf("inspect sheets marker %s: %w", markerPath, markerErr)
 	}
 
-	db, dbErr := os.Lstat(dbPath)
+	dbPath := filepath.Join(p.MetadataDir, DatabaseFileName)
+	dbInfo, dbErr := metadata.Lstat(DatabaseFileName)
 	if dbErr == nil {
-		if db.Mode()&os.ModeSymlink != 0 {
-			return layoutError(p, dbPath, true, "database is a symlink")
+		file, err := openSecureRegular(metadata, DatabaseFileName, dbInfo)
+		if err != nil {
+			return layoutError(p, dbPath, true, "database changed during validation")
 		}
-		if !db.Mode().IsRegular() {
-			return layoutError(p, dbPath, true, "database is not a regular file")
-		}
-		if db.Size() > 0 {
-			file, err := os.Open(dbPath)
-			if err != nil {
-				return fmt.Errorf("read sheets database %s: %w", dbPath, err)
-			}
+		if dbInfo.Size() > 0 {
 			header := make([]byte, 16)
 			_, readErr := io.ReadFull(file, header)
-			_ = file.Close()
+			readErr = errors.Join(readErr, file.Close())
 			if readErr != nil || !bytes.Equal(header, []byte("SQLite format 3\x00")) {
 				return layoutError(p, dbPath, false, "database is not a SQLite database")
 			}
+		} else if err := file.Close(); err != nil {
+			return fmt.Errorf("close sheets database %s: %w", dbPath, err)
 		}
 	} else if !os.IsNotExist(dbErr) {
 		return fmt.Errorf("inspect sheets database %s: %w", dbPath, dbErr)
@@ -294,10 +396,33 @@ func validateMetadata(p Project) error {
 	if markerErr != nil && dbErr != nil {
 		return layoutError(p, p.MetadataDir, false, "missing project marker and database")
 	}
-	if markerErr != nil && db.Size() == 0 {
+	if markerErr != nil && dbInfo.Size() == 0 {
 		return layoutError(p, dbPath, false, "database is empty")
 	}
 	return nil
+}
+
+func openSecureRegular(root *os.Root, name string, expected os.FileInfo) (*os.File, error) {
+	if expected.Mode()&os.ModeSymlink != 0 || !expected.Mode().IsRegular() || unsafePermissions(expected.Mode()) {
+		return nil, ErrUnsafeLayout
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	actual, err := file.Stat()
+	if err != nil || !actual.Mode().IsRegular() || !os.SameFile(expected, actual) {
+		_ = file.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, ErrUnsafeLayout
+	}
+	return file, nil
+}
+
+func unsafePermissions(mode os.FileMode) bool {
+	return runtime.GOOS != "windows" && mode.Perm()&0022 != 0
 }
 
 func layoutError(p Project, path string, unsafe bool, detail string) error {

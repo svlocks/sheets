@@ -4,6 +4,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/svlocks/sheets/internal/domain"
 )
@@ -22,7 +23,7 @@ type ExecuteRequest struct {
 
 // Validate checks request invariants that do not require parsing Cypher.
 func (r ExecuteRequest) Validate() error {
-	if r.Query == "" {
+	if strings.TrimSpace(r.Query) == "" {
 		return fmt.Errorf("query is empty")
 	}
 	if r.Snapshot.Revision != nil && r.Snapshot.Time != nil {
@@ -66,7 +67,7 @@ type Summary struct {
 
 // Changed reports whether a statement modified graph state.
 func (s Summary) Changed() bool {
-	return s.NodesCreated+s.NodesUpdated+s.NodesDeleted+
-		s.RelationshipsCreated+s.RelationshipsUpdated+s.RelationshipsDeleted+
-		s.PropertiesSet+s.LabelsAdded+s.LabelsRemoved > 0
+	return s.NodesCreated != 0 || s.NodesUpdated != 0 || s.NodesDeleted != 0 ||
+		s.RelationshipsCreated != 0 || s.RelationshipsUpdated != 0 || s.RelationshipsDeleted != 0 ||
+		s.PropertiesSet != 0 || s.LabelsAdded != 0 || s.LabelsRemoved != 0
 }

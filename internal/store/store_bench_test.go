@@ -51,3 +51,39 @@ func BenchmarkHistoricalList(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkIndexedColdScalarLookup(b *testing.B) {
+	ctx := context.Background()
+	store := openTestStore(b, filepath.Join(b.TempDir(), "benchmark.db"))
+	b.Cleanup(func() { _ = store.Close() })
+	_, err := store.Write(ctx, RevisionMeta{}, func(tx *WriteTx) error {
+		for i := 0; i < 10_000; i++ {
+			if _, err := tx.CreateNode(NodeInput{Labels: []string{"Item"}, Properties: domain.Properties{
+				"rank": int64(i), "bucket": int64(i % 100),
+			}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, "ANALYZE"); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		view, err := store.View(ctx, domain.Snapshot{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		nodes, _, err := view.ScanNodes(ctx, NodePredicate{
+			AllLabels: []string{"Item"}, Properties: domain.Properties{"rank": int64(7777)},
+		}, domain.Page{Limit: 1})
+		if err != nil || len(nodes) != 1 {
+			b.Fatalf("nodes = %d: %v", len(nodes), err)
+		}
+	}
+}

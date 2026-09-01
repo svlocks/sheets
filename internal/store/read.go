@@ -6,7 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"slices"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -42,11 +42,14 @@ type queryer interface {
 // CurrentRevision returns the most recently committed revision, or zero for
 // an empty graph.
 func (s *Store) CurrentRevision(ctx context.Context) (domain.Revision, error) {
+	if ctx == nil {
+		return 0, fmt.Errorf("%w: nil context", ErrInvalidArgument)
+	}
 	if err := s.checkOpen(); err != nil {
 		return 0, err
 	}
 	var revision int64
-	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(revision), 0) FROM revisions").Scan(&revision); err != nil {
+	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(revision), 0) FROM revisions WHERE sealed = 1").Scan(&revision); err != nil {
 		return 0, fmt.Errorf("read current revision: %w", err)
 	}
 	return domain.Revision(revision), nil
@@ -56,6 +59,9 @@ func (s *Store) CurrentRevision(ctx context.Context) (domain.Revision, error) {
 // selector to one concrete revision. A timestamp before the first commit
 // resolves to revision zero.
 func (s *Store) ResolveSnapshot(ctx context.Context, snapshot domain.Snapshot) (domain.Revision, error) {
+	if ctx == nil {
+		return 0, fmt.Errorf("%w: nil context", ErrInvalidArgument)
+	}
 	if err := s.checkOpen(); err != nil {
 		return 0, err
 	}
@@ -67,11 +73,11 @@ func (s *Store) ResolveSnapshot(ctx context.Context, snapshot domain.Snapshot) (
 		if revision == 0 {
 			return 0, nil
 		}
-		if revision > domain.Revision(^uint64(0)>>1) {
+		if revision > domain.Revision(math.MaxInt64) {
 			return 0, fmt.Errorf("%w: revision %d", domain.ErrNotFound, revision)
 		}
 		var exists int
-		err := s.db.QueryRowContext(ctx, "SELECT 1 FROM revisions WHERE revision = ?", int64(revision)).Scan(&exists)
+		err := s.db.QueryRowContext(ctx, "SELECT 1 FROM revisions WHERE revision = ? AND sealed = 1", int64(revision)).Scan(&exists)
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, fmt.Errorf("%w: revision %d", domain.ErrNotFound, revision)
 		}
@@ -81,10 +87,18 @@ func (s *Store) ResolveSnapshot(ctx context.Context, snapshot domain.Snapshot) (
 		return revision, nil
 	}
 	if snapshot.Time != nil {
+		nanoseconds, err := unixNano(*snapshot.Time)
+		if err != nil {
+			return 0, fmt.Errorf("%w: snapshot time: %v", ErrInvalidArgument, err)
+		}
 		var revision int64
-		if err := s.db.QueryRowContext(ctx,
-			"SELECT COALESCE(MAX(revision), 0) FROM revisions WHERE committed_ns <= ?",
-			snapshot.Time.UnixNano()).Scan(&revision); err != nil {
+		err = s.db.QueryRowContext(ctx, `SELECT revision FROM revisions
+			WHERE sealed = 1 AND committed_ns <= ?
+			ORDER BY committed_ns DESC, revision DESC LIMIT 1`, nanoseconds).Scan(&revision)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		if err != nil {
 			return 0, fmt.Errorf("resolve timestamp: %w", err)
 		}
 		return domain.Revision(revision), nil
@@ -94,17 +108,23 @@ func (s *Store) ResolveSnapshot(ctx context.Context, snapshot domain.Snapshot) (
 
 // Revision returns metadata for one committed revision.
 func (s *Store) Revision(ctx context.Context, revision domain.Revision) (domain.RevisionInfo, error) {
+	if ctx == nil {
+		return domain.RevisionInfo{}, fmt.Errorf("%w: nil context", ErrInvalidArgument)
+	}
 	if err := s.checkOpen(); err != nil {
 		return domain.RevisionInfo{}, err
 	}
 	if revision == 0 {
 		return domain.RevisionInfo{}, fmt.Errorf("%w: revision 0 is the pre-history state", domain.ErrNotFound)
 	}
+	if revision > domain.Revision(math.MaxInt64) {
+		return domain.RevisionInfo{}, fmt.Errorf("%w: revision %d", domain.ErrNotFound, revision)
+	}
 	var raw int64
 	var ns int64
 	var info domain.RevisionInfo
 	err := s.db.QueryRowContext(ctx,
-		"SELECT revision, committed_ns, actor, message FROM revisions WHERE revision = ?", int64(revision)).
+		"SELECT revision, committed_ns, actor, message FROM revisions WHERE revision = ? AND sealed = 1", int64(revision)).
 		Scan(&raw, &ns, &info.Actor, &info.Message)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.RevisionInfo{}, fmt.Errorf("%w: revision %d", domain.ErrNotFound, revision)
@@ -119,6 +139,9 @@ func (s *Store) Revision(ctx context.Context, revision domain.Revision) (domain.
 
 // ListRevisions returns revision metadata in ascending order.
 func (s *Store) ListRevisions(ctx context.Context, page domain.Page) ([]domain.RevisionInfo, domain.PageInfo, error) {
+	if ctx == nil {
+		return nil, domain.PageInfo{}, fmt.Errorf("%w: nil context", ErrInvalidArgument)
+	}
 	if err := s.checkOpen(); err != nil {
 		return nil, domain.PageInfo{}, err
 	}
@@ -139,7 +162,7 @@ func (s *Store) ListRevisions(ctx context.Context, page domain.Page) ([]domain.R
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT revision, committed_ns, actor, message FROM revisions
-		WHERE revision > ? ORDER BY revision LIMIT ?`, int64(after), limit+1)
+		WHERE sealed = 1 AND revision > ? ORDER BY revision LIMIT ?`, int64(after), limit+1)
 	if err != nil {
 		return nil, domain.PageInfo{}, fmt.Errorf("list revisions: %w", err)
 	}
@@ -197,20 +220,41 @@ func (s *Store) GetEdge(ctx context.Context, id domain.EntityID, snapshot domain
 
 // ListNodes returns ID-ordered nodes at snapshot using an opaque keyset cursor.
 func (s *Store) ListNodes(ctx context.Context, snapshot domain.Snapshot, filter NodeFilter, page domain.Page) ([]domain.Node, domain.PageInfo, error) {
-	revision, err := s.ResolveSnapshot(ctx, snapshot)
+	if snapshot.IsCurrent() && page.After != "" {
+		revision, err := graphCursorRevision(page.After, "nodes")
+		if err != nil {
+			return nil, domain.PageInfo{}, err
+		}
+		snapshot.Revision = &revision
+	}
+	view, err := s.View(ctx, snapshot)
 	if err != nil {
 		return nil, domain.PageInfo{}, err
 	}
-	return listNodes(ctx, s.db, revision, filter, page)
+	return view.ScanNodes(ctx, NodePredicate{AllLabels: filter.Labels}, page)
 }
 
 // ListEdges returns ID-ordered edges at snapshot using an opaque keyset cursor.
 func (s *Store) ListEdges(ctx context.Context, snapshot domain.Snapshot, filter EdgeFilter, page domain.Page) ([]domain.Edge, domain.PageInfo, error) {
-	revision, err := s.ResolveSnapshot(ctx, snapshot)
+	if snapshot.IsCurrent() && page.After != "" {
+		revision, err := graphCursorRevision(page.After, "edges")
+		if err != nil {
+			return nil, domain.PageInfo{}, err
+		}
+		snapshot.Revision = &revision
+	}
+	view, err := s.View(ctx, snapshot)
 	if err != nil {
 		return nil, domain.PageInfo{}, err
 	}
-	return listEdges(ctx, s.db, revision, filter, page)
+	predicate := EdgePredicate{Types: filter.Types}
+	if filter.From != nil {
+		predicate.FromIDs = []domain.EntityID{*filter.From}
+	}
+	if filter.To != nil {
+		predicate.ToIDs = []domain.EntityID{*filter.To}
+	}
+	return view.ScanEdges(ctx, predicate, page)
 }
 
 // ListNodes returns all current nodes visible inside the write transaction.
@@ -273,108 +317,6 @@ func (tx *WriteTx) ListEdges() ([]domain.Edge, error) {
 	return edges, nil
 }
 
-func listNodes(ctx context.Context, db queryer, revision domain.Revision, filter NodeFilter, page domain.Page) ([]domain.Node, domain.PageInfo, error) {
-	limit, err := pageLimit(page.Limit)
-	if err != nil {
-		return nil, domain.PageInfo{}, err
-	}
-	after, err := decodeOptionalCursor(page.After)
-	if err != nil {
-		return nil, domain.PageInfo{}, err
-	}
-	rows, err := db.QueryContext(ctx, `
-		SELECT id, labels, properties, body, valid_from, valid_to
-		FROM node_versions
-		WHERE valid_from <= ? AND (valid_to IS NULL OR valid_to > ?) AND id > ?
-		ORDER BY id`, int64(revision), int64(revision), after)
-	if err != nil {
-		return nil, domain.PageInfo{}, fmt.Errorf("list nodes: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	wanted := normalizeLabels(filter.Labels)
-	nodes := make([]domain.Node, 0, limit+1)
-	for rows.Next() {
-		node, err := scanNode(rows)
-		if err != nil {
-			return nil, domain.PageInfo{}, err
-		}
-		if hasLabels(node.Labels, wanted) {
-			nodes = append(nodes, node)
-			if len(nodes) > limit {
-				break
-			}
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, domain.PageInfo{}, err
-	}
-	if err := rows.Close(); err != nil {
-		return nil, domain.PageInfo{}, fmt.Errorf("close node rows: %w", err)
-	}
-	var pageInfo domain.PageInfo
-	if len(nodes) > limit {
-		nodes = nodes[:limit]
-		pageInfo.Next = encodeCursor(string(nodes[len(nodes)-1].ID))
-	}
-	return nodes, pageInfo, nil
-}
-
-func listEdges(ctx context.Context, db queryer, revision domain.Revision, filter EdgeFilter, page domain.Page) ([]domain.Edge, domain.PageInfo, error) {
-	limit, err := pageLimit(page.Limit)
-	if err != nil {
-		return nil, domain.PageInfo{}, err
-	}
-	after, err := decodeOptionalCursor(page.After)
-	if err != nil {
-		return nil, domain.PageInfo{}, err
-	}
-	query := `SELECT id, from_id, type, to_id, position, properties, valid_from, valid_to
-		FROM edge_versions
-		WHERE valid_from <= ? AND (valid_to IS NULL OR valid_to > ?) AND id > ?`
-	args := []any{int64(revision), int64(revision), after}
-	if filter.From != nil {
-		query += " AND from_id = ?"
-		args = append(args, string(*filter.From))
-	}
-	if filter.To != nil {
-		query += " AND to_id = ?"
-		args = append(args, string(*filter.To))
-	}
-	query += " ORDER BY id"
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, domain.PageInfo{}, fmt.Errorf("list edges: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	types := append([]string(nil), filter.Types...)
-	slices.Sort(types)
-	edges := make([]domain.Edge, 0, limit+1)
-	for rows.Next() {
-		edge, err := scanEdge(rows)
-		if err != nil {
-			return nil, domain.PageInfo{}, err
-		}
-		if len(types) == 0 || slices.Contains(types, edge.Type) {
-			edges = append(edges, edge)
-			if len(edges) > limit {
-				break
-			}
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, domain.PageInfo{}, err
-	}
-	if err := rows.Close(); err != nil {
-		return nil, domain.PageInfo{}, fmt.Errorf("close edge rows: %w", err)
-	}
-	var pageInfo domain.PageInfo
-	if len(edges) > limit {
-		edges = edges[:limit]
-		pageInfo.Next = encodeCursor(string(edges[len(edges)-1].ID))
-	}
-	return edges, pageInfo, nil
-}
-
 func scanNode(row rowScanner) (domain.Node, error) {
 	var rawID string
 	var labelsData, propertiesData []byte
@@ -389,11 +331,11 @@ func scanNode(row rowScanner) (domain.Node, error) {
 	}
 	labels, err := decodeLabels(labelsData)
 	if err != nil {
-		return domain.Node{}, err
+		return domain.Node{}, fmt.Errorf("%w: node %s labels: %v", ErrCorrupt, rawID, err)
 	}
 	properties, err := decodeProperties(propertiesData)
 	if err != nil {
-		return domain.Node{}, err
+		return domain.Node{}, fmt.Errorf("%w: node %s properties: %v", ErrCorrupt, rawID, err)
 	}
 	node.ID = domain.EntityID(rawID)
 	node.Labels = labels
@@ -420,7 +362,7 @@ func scanEdge(row rowScanner) (domain.Edge, error) {
 	}
 	properties, err := decodeProperties(propertiesData)
 	if err != nil {
-		return domain.Edge{}, err
+		return domain.Edge{}, fmt.Errorf("%w: edge %s properties: %v", ErrCorrupt, rawID, err)
 	}
 	edge.ID = domain.EntityID(rawID)
 	edge.From = domain.EntityID(fromID)
@@ -447,24 +389,8 @@ func pageLimit(limit int) (int, error) {
 	return limit, nil
 }
 
-func hasLabels(labels, wanted []string) bool {
-	for _, label := range wanted {
-		if !slices.Contains(labels, label) {
-			return false
-		}
-	}
-	return true
-}
-
 func encodeCursor(value string) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(value))
-}
-
-func decodeOptionalCursor(cursor string) (string, error) {
-	if cursor == "" {
-		return "", nil
-	}
-	return decodeCursor(cursor)
 }
 
 func decodeCursor(cursor string) (string, error) {
