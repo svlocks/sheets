@@ -188,14 +188,15 @@ func makeDSN(path string, busy time.Duration) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("resolve database path: %w", err)
 		}
-		slash := filepath.ToSlash(absolute)
-		// A Windows drive path ("C:/x") serializes as file://C:/x, which
-		// SQLite reads as a URI authority and rejects. Anchor it so Go emits
-		// file:///C:/x.
-		if len(slash) >= 3 && slash[0] != '/' && slash[1] == ':' && slash[2] == '/' {
-			slash = "/" + slash
+		path = (&url.URL{Scheme: "file", Path: filepath.ToSlash(absolute)}).String()
+		// Go serializes a Path that begins with a drive letter (Windows) as
+		// file://C:/x, which SQLite's URI parser reads as an "authority" and
+		// rejects. Rewrite drive-letter paths to the opaque form file:C:/x,
+		// which carries no authority. All other paths keep the authority-free
+		// file:/... form that already percent-encodes reserved characters.
+		if parsed, err := url.Parse(path); err == nil && parsed.Host != "" && len(parsed.Host) == 2 && parsed.Host[1] == ':' {
+			path = "file:" + parsed.Host + filepath.ToSlash(parsed.Path)
 		}
-		path = (&url.URL{Scheme: "file", Path: slash}).String()
 	}
 	uri, err := url.Parse(path)
 	if err != nil {

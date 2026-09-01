@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -97,8 +98,12 @@ func TestMakeDSNAnchorsRelativeFileURIButPreservesMemoryURI(t *testing.T) {
 }
 
 func TestMakeDSNAnchorsWindowsDriveWithoutAuthority(t *testing.T) {
-	// Drive-letter paths would otherwise serialize as file://C:/x, which
-	// SQLite's URI parser reads as an "invalid uri authority: C:".
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows drive-letter URI behavior is only reproducible on Windows")
+	}
+	// Drive-letter paths must not serialize as file://C:/x, which SQLite's
+	// URI parser reads as an "invalid uri authority: C:". They should use the
+	// opaque form file:C:/x instead.
 	dsn, err := makeDSN("C:/work/sheets.db", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -110,8 +115,8 @@ func TestMakeDSNAnchorsWindowsDriveWithoutAuthority(t *testing.T) {
 	if uri.Host != "" {
 		t.Fatalf("drive path produced an authority %q: %s", uri.Host, dsn)
 	}
-	if uri.Path == "" || uri.Path[0] != '/' {
-		t.Fatalf("drive path not anchored with a leading slash: %s", dsn)
+	if uri.Opaque == "" {
+		t.Fatalf("drive path did not use opaque form: %s", dsn)
 	}
 }
 
