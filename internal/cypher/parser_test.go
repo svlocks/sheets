@@ -125,6 +125,45 @@ func TestExpressionsAndProcedureCalls(t *testing.T) {
 	}
 }
 
+func TestPatternComprehensionRetainsBindingsPredicateProjectionAndSpan(t *testing.T) {
+	source := "MATCH (n) RETURN [p = (n)-[r:T]->(b) WHERE b.active | [p, r.name, b.name]] AS values"
+	document, err := Parse(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := document.Statements[0].(*QueryStatement)
+	projection := query.Clauses[1].(*ProjectionClause)
+	comprehension, ok := projection.Items[0].Expression.(*PatternComprehension)
+	if !ok {
+		t.Fatalf("expression = %T, want *PatternComprehension", projection.Items[0].Expression)
+	}
+	if comprehension.Variable.Name != "p" || len(comprehension.Pattern.Nodes) != 2 || len(comprehension.Pattern.Relationships) != 1 {
+		t.Fatalf("pattern comprehension = %#v", comprehension)
+	}
+	if comprehension.Pattern.Nodes[0].Variable.Name != "n" || comprehension.Pattern.Nodes[1].Variable.Name != "b" || comprehension.Pattern.Relationships[0].Variable.Name != "r" {
+		t.Fatalf("pattern bindings = %#v", comprehension.Pattern)
+	}
+	if _, ok := comprehension.Where.(*PropertyExpression); !ok {
+		t.Fatalf("WHERE = %T, want *PropertyExpression", comprehension.Where)
+	}
+	if list, ok := comprehension.Projection.(*ListLiteral); !ok || len(list.Elements) != 3 {
+		t.Fatalf("projection = %#v", comprehension.Projection)
+	}
+	span := comprehension.Location()
+	if got := source[span.Start.Offset:span.End.Offset]; got != "[p = (n)-[r:T]->(b) WHERE b.active | [p, r.name, b.name]]" {
+		t.Fatalf("span text = %q", got)
+	}
+
+	document, err = Parse("RETURN [(a)-->(b) | b]")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unnamed := document.Statements[0].(*QueryStatement).Clauses[0].(*ProjectionClause).Items[0].Expression.(*PatternComprehension)
+	if unnamed.Variable.Name != "" {
+		t.Fatalf("unnamed path variable = %#v", unnamed.Variable)
+	}
+}
+
 func FuzzParseNeverPanics(f *testing.F) {
 	for _, source := range []string{
 		"MATCH (n:Task)-[:CHILD*0..]->(m) RETURN n, m",
@@ -197,6 +236,27 @@ func TestUnionAndRelationshipTypeAlternatives(t *testing.T) {
 	relationship := query.Clauses[0].(*MatchClause).Patterns[0].Element.Relationships[0]
 	if len(relationship.Types) != 2 || relationship.Length == nil || !relationship.Length.Exact {
 		t.Fatalf("relationship alternatives/length missing: %#v", relationship)
+	}
+}
+
+func TestBidirectionalRelationshipAndMutatingExistsBindForSemanticValidation(t *testing.T) {
+	document, err := Parse("MATCH (a)<-[:R]->(b) RETURN a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := document.Statements[0].(*QueryStatement)
+	relationship := query.Clauses[0].(*MatchClause).Patterns[0].Element.Relationships[0]
+	if relationship.Direction != Bidirectional {
+		t.Fatalf("direction = %v, want Bidirectional", relationship.Direction)
+	}
+
+	document, err = Parse("MATCH (n) WHERE EXISTS { MATCH (n)-->(m) SET m.x = 1 } RETURN n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exists := document.Statements[0].(*QueryStatement).Clauses[0].(*MatchClause).Where.(*ExistsSubquery)
+	if exists.Subquery == nil || !exists.Subquery.IsMutation() {
+		t.Fatalf("mutating EXISTS AST = %#v", exists)
 	}
 }
 

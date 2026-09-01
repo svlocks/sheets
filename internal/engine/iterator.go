@@ -743,7 +743,7 @@ func (w *iteratorWorkingSet) scanAdjacent(frontier []domain.Node, relationship c
 				return nil, err
 			}
 			result = append(result, edges...)
-		case cypher.Undirected:
+		case cypher.Undirected, cypher.Bidirectional:
 			edges, err := w.scanEdgesForIDs(predicate, ids, true, "undirected outgoing relationship", predicates.pushdown)
 			if err != nil {
 				return nil, err
@@ -989,12 +989,12 @@ func nodeIDSet(nodes []domain.Node) map[domain.EntityID]struct{} {
 
 func edgeTargets(edge domain.Edge, direction cypher.Direction, current map[domain.EntityID]struct{}) []domain.EntityID {
 	var result []domain.EntityID
-	if direction == cypher.Outgoing || direction == cypher.Undirected {
+	if direction == cypher.Outgoing || direction == cypher.Undirected || direction == cypher.Bidirectional {
 		if _, ok := current[edge.From]; ok {
 			result = append(result, edge.To)
 		}
 	}
-	if direction == cypher.Incoming || direction == cypher.Undirected {
+	if direction == cypher.Incoming || direction == cypher.Undirected || direction == cypher.Bidirectional {
 		if _, ok := current[edge.To]; ok {
 			result = append(result, edge.From)
 		}
@@ -1128,6 +1128,8 @@ func graphExpressionFallbackReason(query *cypher.QueryStatement) string {
 			reason = "EXISTS subquery requires a full snapshot"
 		case *cypher.PatternExpression:
 			reason = "pattern expression requires a full snapshot"
+		case *cypher.PatternComprehension:
+			reason = "pattern comprehension requires a full snapshot"
 		case *cypher.FunctionInvocation:
 			name := strings.ToLower(expression.Name.String())
 			if (name == "shortestpath" || name == "allshortestpaths") && len(expression.Arguments) == 1 {

@@ -315,6 +315,10 @@ const (
 	Undirected Direction = iota
 	Outgoing
 	Incoming
+	// Bidirectional is the syntactically valid <--> form. Matching traverses it
+	// in either direction, while mutation validation rejects it because
+	// creation needs exactly one direction.
+	Bidirectional
 )
 
 // RelationshipPattern matches a relationship adjacent to a pattern node.
@@ -520,6 +524,19 @@ type ListComprehension struct {
 
 func (*ListComprehension) expressionNode()  {}
 func (e *ListComprehension) Location() Span { return e.Span }
+
+// PatternComprehension represents [path = (a)-->(b) WHERE predicate |
+// projection]. Variable is empty when the path itself is not named.
+type PatternComprehension struct {
+	Span       Span
+	Variable   Identifier
+	Pattern    PatternElement
+	Where      Expression
+	Projection Expression
+}
+
+func (*PatternComprehension) expressionNode()  {}
+func (e *PatternComprehension) Location() Span { return e.Span }
 
 // ListPredicate represents all/any/none/single(variable IN list WHERE test).
 type ListPredicate struct {

@@ -145,11 +145,15 @@ func matchPattern(graph *memoryGraph, evaluator evaluator, input []row, pattern 
 const internalPathKey = "\x00sheets.path"
 const expressionPathKey = "\x00sheets.expression-path"
 
-func (e *queryExecution) evaluatePattern(element cypher.PatternElement, values row) ([]Path, error) {
-	matched, err := matchPattern(e.graph, e.evaluator, []row{cloneRow(values)}, cypher.PatternPart{
-		Variable: cypher.Identifier{Name: expressionPathKey},
+func (e *queryExecution) evaluatePatternRows(element cypher.PatternElement, variable cypher.Identifier, values row) ([]row, error) {
+	return matchPattern(e.graph, e.evaluator, []row{cloneRow(values)}, cypher.PatternPart{
+		Variable: variable,
 		Element:  element,
 	})
+}
+
+func (e *queryExecution) evaluatePattern(element cypher.PatternElement, values row) ([]Path, error) {
+	matched, err := e.evaluatePatternRows(element, cypher.Identifier{Name: expressionPathKey}, values)
 	if err != nil {
 		return nil, err
 	}
@@ -583,12 +587,12 @@ type adjacentEdge struct {
 
 func adjacentEdges(graph *memoryGraph, node domain.EntityID, direction cypher.Direction) []adjacentEdge {
 	result := make([]adjacentEdge, 0, len(graph.outgoing[node])+len(graph.incoming[node]))
-	if direction == cypher.Outgoing || direction == cypher.Undirected {
+	if direction == cypher.Outgoing || direction == cypher.Undirected || direction == cypher.Bidirectional {
 		for _, edge := range graph.outgoing[node] {
 			result = append(result, adjacentEdge{edge: edge, next: edge.To})
 		}
 	}
-	if direction == cypher.Incoming || direction == cypher.Undirected {
+	if direction == cypher.Incoming || direction == cypher.Undirected || direction == cypher.Bidirectional {
 		for _, edge := range graph.incoming[node] {
 			result = append(result, adjacentEdge{edge: edge, next: edge.From})
 		}

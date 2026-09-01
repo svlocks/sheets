@@ -59,6 +59,8 @@ func setExpressionSpan(expression Expression, span Span) bool {
 		expression.Span = span
 	case *ListComprehension:
 		expression.Span = span
+	case *PatternComprehension:
+		expression.Span = span
 	case *ListPredicate:
 		expression.Span = span
 	case *ReduceExpression:
@@ -359,7 +361,7 @@ func (b *cstBinder) bindAtom(ctx parsergen.IOC_AtomContext) (Expression, error) 
 	case ctx.OC_ListComprehension() != nil:
 		return b.bindListComprehension(ctx.OC_ListComprehension())
 	case ctx.OC_PatternComprehension() != nil:
-		return nil, b.unsupported(ctx.OC_PatternComprehension(), "pattern comprehension", "the executor has no pattern-comprehension value semantics")
+		return b.bindPatternComprehension(ctx.OC_PatternComprehension())
 	case ctx.OC_Quantifier() != nil:
 		return b.bindQuantifier(ctx.OC_Quantifier())
 	case ctx.OC_Reduce() != nil:
@@ -518,10 +520,10 @@ func (b *cstBinder) bindMapLiteral(ctx parsergen.IOC_MapLiteralContext) (Express
 func (b *cstBinder) bindFunctionInvocation(ctx parsergen.IOC_FunctionInvocationContext) (Expression, error) {
 	name := b.bindFunctionName(ctx.OC_FunctionName())
 	normalized := strings.ToLower(name.String())
-	if !catalogFunctionName(name) || !supportedFunction(normalized) {
+	if !catalogFunctionName(name) {
 		return nil, b.unsupported(ctx, "function invocation", "function "+name.String()+" is not in sheets's supported function catalog")
 	}
-	if ctx.DISTINCT() != nil && !aggregateFunction(normalized) {
+	if ctx.DISTINCT() != nil && IsSupportedFunction(normalized) && !aggregateFunction(normalized) {
 		return nil, b.unsupported(ctx, "DISTINCT scalar function", "DISTINCT is implemented only for aggregate functions")
 	}
 	invocation := &FunctionInvocation{Span: b.span(ctx), Name: name, Distinct: ctx.DISTINCT() != nil}
@@ -552,11 +554,10 @@ func catalogFunctionName(name QualifiedName) bool {
 	return true
 }
 
-// supportedFunction mirrors the executor's deliberately finite built-in
-// catalog. Keeping the capability decision here prevents arbitrary official-
-// grammar function names from binding successfully and failing only after a
-// query has started executing.
-func supportedFunction(name string) bool {
+// IsSupportedFunction reports whether name belongs to the runtime built-in
+// catalog. Unknown syntactically valid names still bind so semantic validation
+// can report UnknownFunction before query execution begins.
+func IsSupportedFunction(name string) bool {
 	switch name {
 	case "count", "collect", "sum", "avg", "min", "max", "stdev", "stdevp", "percentilecont", "percentiledisc",
 		"coalesce", "id", "elementid", "labels", "type", "properties", "keys", "body", "nodes", "relationships",
@@ -639,6 +640,29 @@ func (b *cstBinder) bindListComprehension(ctx parsergen.IOC_ListComprehensionCon
 	}
 	if projection := ctx.OC_Expression(); projection != nil {
 		result.Projection, err = b.bindExpression(projection)
+	}
+	return result, err
+}
+
+func (b *cstBinder) bindPatternComprehension(ctx parsergen.IOC_PatternComprehensionContext) (Expression, error) {
+	pattern, err := b.bindRelationshipsPattern(ctx.OC_RelationshipsPattern())
+	if err != nil {
+		return nil, err
+	}
+	result := &PatternComprehension{Span: b.span(ctx), Pattern: pattern}
+	if variable := ctx.OC_Variable(); variable != nil {
+		result.Variable = b.bindVariableIdentifier(variable)
+	}
+	if where := ctx.OC_Where(); where != nil {
+		result.Where, err = b.bindExpression(where.OC_Expression())
+		if err != nil {
+			return nil, err
+		}
+	}
+	if projection := ctx.OC_Expression(); projection != nil {
+		result.Projection, err = b.bindExpression(projection)
+	} else {
+		return nil, binderInvariant(ctx, "pattern comprehension has no projection")
 	}
 	return result, err
 }
@@ -732,9 +756,6 @@ func (b *cstBinder) bindExistentialSubquery(ctx parsergen.IOC_ExistentialSubquer
 	}
 	if err != nil {
 		return nil, err
-	}
-	if query.IsMutation() {
-		return nil, b.unsupported(ctx, "mutating EXISTS subquery", "EXISTS is evaluated without graph writes")
 	}
 	return &ExistsSubquery{Span: b.span(ctx), Subquery: query}, nil
 }

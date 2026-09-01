@@ -32,6 +32,7 @@ type evaluator struct {
 	group          []row
 	graph          *memoryGraph
 	pattern        func(cypher.PatternElement, row) ([]Path, error)
+	patternRows    func(cypher.PatternElement, cypher.Identifier, row) ([]row, error)
 	subquery       func(*cypher.QueryStatement, row) (bool, error)
 	shortest       func(cypher.PatternElement, row, bool) (any, error)
 	paths          *pathExpansionBudget
@@ -163,6 +164,8 @@ func (e evaluator) expression(expression cypher.Expression, values row) (any, er
 		return e.caseExpression(expression, values)
 	case *cypher.ListComprehension:
 		return e.listComprehension(expression, values)
+	case *cypher.PatternComprehension:
+		return e.patternComprehension(expression, values)
 	case *cypher.ListPredicate:
 		return e.listPredicate(expression, values)
 	case *cypher.ReduceExpression:
@@ -771,6 +774,42 @@ func (e evaluator) listComprehension(expression *cypher.ListComprehension, value
 			if err != nil {
 				return nil, err
 			}
+		}
+		result = append(result, value)
+	}
+	return result, nil
+}
+
+func (e evaluator) patternComprehension(expression *cypher.PatternComprehension, values row) (any, error) {
+	if e.patternRows == nil {
+		return nil, evalError(expression, "pattern comprehension requires a match context")
+	}
+	matches, err := e.patternRows(expression.Pattern, expression.Variable, values)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]any, 0, len(matches))
+	for _, match := range matches {
+		if err := e.ctx.Err(); err != nil {
+			return nil, err
+		}
+		if expression.Where != nil {
+			predicate, err := e.expression(expression.Where, match)
+			if err != nil {
+				return nil, err
+			}
+			if predicate != nil {
+				if _, ok := predicate.(bool); !ok {
+					return nil, evalError(expression.Where, "pattern comprehension predicate must be boolean")
+				}
+			}
+			if predicate != true {
+				continue
+			}
+		}
+		value, err := e.expression(expression.Projection, match)
+		if err != nil {
+			return nil, err
 		}
 		result = append(result, value)
 	}
@@ -1631,72 +1670,6 @@ func equalValues(left, right any) bool {
 		return true
 	}
 	return reflect.DeepEqual(left, right)
-}
-
-func compareValues(left, right any) (int, bool) {
-	if comparison, numeric, unordered := compareNumbers(left, right); numeric {
-		return comparison, !unordered
-	}
-	switch left := left.(type) {
-	case string:
-		right, ok := right.(string)
-		if !ok {
-			return 0, false
-		}
-		return strings.Compare(left, right), true
-	case bool:
-		right, ok := right.(bool)
-		if !ok {
-			return 0, false
-		}
-		return compareBool(left, right), true
-	case time.Time:
-		switch right := right.(type) {
-		case time.Time:
-			return compareLegacyTimes(left, right), true
-		case temporal.DateTime:
-			return compareLegacyTimeDateTime(left, right), true
-		}
-		return 0, false
-	case temporal.Date:
-		right, ok := right.(temporal.Date)
-		return left.Compare(right), ok
-	case temporal.LocalTime:
-		right, ok := right.(temporal.LocalTime)
-		return left.Compare(right), ok
-	case temporal.Time:
-		right, ok := right.(temporal.Time)
-		return left.Compare(right), ok
-	case temporal.LocalDateTime:
-		right, ok := right.(temporal.LocalDateTime)
-		return left.Compare(right), ok
-	case temporal.DateTime:
-		switch right := right.(type) {
-		case temporal.DateTime:
-			return left.Compare(right), true
-		case time.Time:
-			return -compareLegacyTimeDateTime(right, left), true
-		}
-		return 0, false
-	case temporal.Duration:
-		switch right := right.(type) {
-		case temporal.Duration:
-			return left.CompareForOrder(right), true
-		case time.Duration:
-			return left.CompareForOrder(legacyDuration(right)), true
-		}
-		return 0, false
-	case time.Duration:
-		switch right := right.(type) {
-		case time.Duration:
-			return compare(int64(left), int64(right)), true
-		case temporal.Duration:
-			return legacyDuration(left).CompareForOrder(right), true
-		}
-		return 0, false
-	default:
-		return 0, false
-	}
 }
 
 func containsValue(expression cypher.Expression, collection, needle any) (any, error) {

@@ -120,12 +120,26 @@ func TestM23CompileTimeProjectionAndPatternErrors(t *testing.T) {
 		{"MATCH (a)-[r]->()-[r]->(a) RETURN r", "relationship variable"},
 		{"MATCH (a) WITH a, count(*) RETURN a", "must be aliased"},
 		{"MATCH (n) WHERE (n) RETURN n", "expects a boolean"},
+		{"MATCH (a) RETURN foo(a)", "unknown function foo"},
+		{"CREATE (a)<-[:R]->(b)", "must have a direction"},
+		{"MATCH (n) WHERE EXISTS { MATCH (n)-->(m) SET m.x = 1 } RETURN n", "EXISTS subquery cannot contain updating clauses"},
+		{"MATCH (a) RETURN [(a)-->(b) WHERE 1 | b]", "expects a boolean"},
+		{"MATCH p = (a)-->(b) RETURN [p = (a)-->(b) | p]", "already bound"},
 	} {
 		executor, _ := testEngine(t)
 		_, err := executor.Execute(context.Background(), app.ExecuteRequest{Query: test.query})
 		if err == nil || !strings.Contains(err.Error(), test.want) {
 			t.Fatalf("compile error for %q = %v, want %q", test.query, err, test.want)
 		}
+	}
+}
+
+func TestM23BidirectionalMatchTraversesBothDirections(t *testing.T) {
+	executor, _ := testEngine(t)
+	execute(t, executor, "CREATE (a:A)-[:R]->(b:B), (b)-[:R]->(a)", nil)
+	result := execute(t, executor, "MATCH (a:A)<-[:R]->(b:B) RETURN a, b", nil)
+	if len(result.Results[0].Rows) != 2 {
+		t.Fatalf("bidirectional relationship rows = %#v, want both directed edges", result.Results[0].Rows)
 	}
 }
 

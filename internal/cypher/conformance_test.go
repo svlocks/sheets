@@ -16,21 +16,9 @@ func TestTCKCapabilityCases(t *testing.T) {
 		{name: "match", query: "MATCH (n) RETURN n"},
 		{name: "return", query: "MATCH (n) RETURN n"},
 		{name: "comparison", query: "RETURN null = null AS value"},
-		{
-			name:        "pattern_comprehension",
-			query:       "MATCH (n) RETURN [p = (n)-->() | p] AS list",
-			unsupported: "pattern comprehension",
-		},
-		{
-			name:        "bidirectional_relationship",
-			query:       "CREATE (a)<-[:FOO]->(b)",
-			unsupported: "bidirectional relationship pattern",
-		},
-		{
-			name:        "unsupported_function",
-			query:       "RETURN foo(-1)",
-			unsupported: "function invocation",
-		},
+		{name: "pattern_comprehension", query: "MATCH (n) RETURN [p = (n)-->() | p] AS list"},
+		{name: "bidirectional_relationship", query: "CREATE (a)<-[:FOO]->(b)"},
+		{name: "unknown_function", query: "RETURN foo(-1)"},
 		{
 			name:        "unsupported_procedure",
 			query:       "CALL test.my.proc()",
@@ -122,7 +110,7 @@ func TestOfficialUnicodeWhitespaceCommentsAndEscapes(t *testing.T) {
 }
 
 func TestRecognizedUnsupportedDoesNotHideLaterStatements(t *testing.T) {
-	document, err := Parse("RETURN [(a)-->() | a]; RETURN 2")
+	document, err := Parse("CALL test.my.proc(); RETURN 2")
 	if err == nil {
 		t.Fatal("Parse() succeeded")
 	}
@@ -136,14 +124,14 @@ func TestRecognizedUnsupportedDoesNotHideLaterStatements(t *testing.T) {
 }
 
 func TestUnsupportedFeatureSpanIsTheExactRecognizedConstruct(t *testing.T) {
-	source := "RETURN 1; RETURN [p = (n)-->() | p] AS paths; RETURN 3"
+	source := "RETURN 1; CALL test.my.proc(); RETURN 3"
 	document, err := Parse(source)
 	var unsupported *UnsupportedFeatureError
 	if !errors.As(err, &unsupported) {
 		t.Fatalf("error = %T %v, want unsupported feature", err, err)
 	}
 	span := unsupported.Location()
-	if got := source[span.Start.Offset:span.End.Offset]; got != "[p = (n)-->() | p]" {
+	if got := source[span.Start.Offset:span.End.Offset]; got != "CALL test.my.proc()" {
 		t.Fatalf("unsupported span = %q (%#v)", got, span)
 	}
 	if len(document.Statements) != 2 {
@@ -154,9 +142,9 @@ func TestUnsupportedFeatureSpanIsTheExactRecognizedConstruct(t *testing.T) {
 func TestMalformedAmbiguousInputsAreRejected(t *testing.T) {
 	for _, source := range []string{
 		"RETURN CASE WHEN true THEN 1",
-		"MATCH (a)<-[:R]->(b) RETURN a",
+		"MATCH (a)-[:R]-> RETURN a",
 		"RETURN [x IN [1, 2] WHERE | x]",
-		"RETURN EXISTS { CREATE () }",
+		"RETURN EXISTS { MATCH (n) RETURN }",
 		"RETURN 1 /* unterminated",
 	} {
 		t.Run(source, func(t *testing.T) {

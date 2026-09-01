@@ -1,9 +1,12 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -205,6 +208,75 @@ RETURN length(shortestPath((a)-[:BLOCKS*]->(c))) AS distance,
        size(relationships(shortestPath((a)-[:BLOCKS*]->(c)))) AS edges`, nil)
 	if got := result.Results[0].Rows; len(got) != 1 || got[0][0] != int64(1) || got[0][1] != int64(1) {
 		t.Fatalf("pattern result = %#v", got)
+	}
+}
+
+func TestEnginePatternComprehensions(t *testing.T) {
+	engine, _ := testEngine(t)
+	execute(t, engine, `
+CREATE (a:X {name:'a'})-[ab:T {kind:'keep'}]->(b:Y {name:'b'}),
+       (b)-[:T]->(c:Y {name:'c'}),
+       (a)-[:OTHER]->(c),
+       (:X {name:'empty'})`, nil)
+
+	result := execute(t, engine, `
+MATCH (a:X {name:'a'})
+RETURN [p = (a)-[r]->(b) WHERE r.kind = 'keep' | [length(p), type(r), b.name]] AS matches`, nil)
+	wantMatches := []any{[]any{int64(1), "T", "b"}}
+	if got := result.Results[0].Rows[0][0]; !reflect.DeepEqual(got, wantMatches) {
+		t.Fatalf("filtered projection = %#v, want %#v", got, wantMatches)
+	}
+
+	result = execute(t, engine, `
+MATCH (a:X)
+RETURN a.name AS name, size([(a)-[:T|OTHER]->() | 1]) AS degree
+ORDER BY name`, nil)
+	if want := [][]any{{"a", int64(2)}, {"empty", int64(0)}}; !reflect.DeepEqual(result.Results[0].Rows, want) {
+		t.Fatalf("degree rows = %#v, want %#v", result.Results[0].Rows, want)
+	}
+
+	result = execute(t, engine, `
+MATCH (a:X)-->(b)
+WITH [p = (a)-->() | p] AS paths, count(b) AS matches
+RETURN size(paths), matches`, nil)
+	if want := [][]any{{int64(2), int64(2)}}; !reflect.DeepEqual(result.Results[0].Rows, want) {
+		t.Fatalf("grouped comprehension rows = %#v, want %#v", result.Results[0].Rows, want)
+	}
+
+	result = execute(t, engine, `
+MATCH (a:X {name:'a'})
+RETURN [(a)-->(b) WHERE null | b] AS matches`, nil)
+	if want := []any{}; !reflect.DeepEqual(result.Results[0].Rows[0][0], want) {
+		t.Fatalf("null-filtered comprehension = %#v, want empty list", result.Results[0].Rows[0][0])
+	}
+
+	result = execute(t, engine, `
+MATCH (a:X {name:'a'}), (c:Y {name:'c'})
+RETURN [p = (a)-[*]->(c) | length(p)] AS lengths`, nil)
+	lengths, ok := result.Results[0].Rows[0][0].([]any)
+	if !ok {
+		t.Fatalf("variable-length result = %#v", result.Results[0].Rows[0][0])
+	}
+	slices.SortFunc(lengths, func(left, right any) int {
+		return cmp.Compare(left.(int64), right.(int64))
+	})
+	if want := []any{int64(1), int64(2)}; !reflect.DeepEqual(lengths, want) {
+		t.Fatalf("variable-length paths = %#v, want %#v", lengths, want)
+	}
+
+	result = execute(t, engine, `
+MATCH p = (a:X {name:'a'})-->(b)
+RETURN [x IN nodes(p) | size([(x)-->(:Y) | 1])] AS degrees
+ORDER BY degrees`, nil)
+	if len(result.Results[0].Rows) != 2 {
+		t.Fatalf("nested comprehension rows = %#v", result.Results[0].Rows)
+	}
+
+	_, err := engine.Execute(context.Background(), app.ExecuteRequest{
+		Query: "MATCH (a:X) RETURN [(a)-->(b) | b.name] AS names, b",
+	})
+	if err == nil || !strings.Contains(err.Error(), `variable "b" is not defined`) {
+		t.Fatalf("local variable leaked from comprehension: %v", err)
 	}
 }
 

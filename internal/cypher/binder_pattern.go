@@ -107,9 +107,8 @@ func (b *cstBinder) bindNodeLabels(ctx parsergen.IOC_NodeLabelsContext) []Identi
 func (b *cstBinder) bindRelationshipPattern(ctx parsergen.IOC_RelationshipPatternContext) (RelationshipPattern, error) {
 	relationship := RelationshipPattern{Span: b.span(ctx), Direction: Undirected}
 	if ctx.OC_LeftArrowHead() != nil && ctx.OC_RightArrowHead() != nil {
-		return RelationshipPattern{}, b.unsupported(ctx, "bidirectional relationship pattern", "a single relationship cannot point both left and right")
-	}
-	if ctx.OC_LeftArrowHead() != nil {
+		relationship.Direction = Bidirectional
+	} else if ctx.OC_LeftArrowHead() != nil {
 		relationship.Direction = Incoming
 	} else if ctx.OC_RightArrowHead() != nil {
 		relationship.Direction = Outgoing

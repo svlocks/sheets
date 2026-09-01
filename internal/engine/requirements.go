@@ -87,7 +87,7 @@ func expressionRequiresGraph(expression cypher.Expression) bool {
 	switch expression := expression.(type) {
 	case nil, *cypher.Literal, *cypher.Variable, *cypher.Parameter:
 		return false
-	case *cypher.PatternExpression, *cypher.ExistsSubquery:
+	case *cypher.PatternExpression, *cypher.PatternComprehension, *cypher.ExistsSubquery:
 		return true
 	case *cypher.UnaryExpression:
 		return expressionRequiresGraph(expression.Expression)

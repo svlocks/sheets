@@ -88,7 +88,7 @@ func (e *queryExecution) createPattern(values row, pattern cypher.PatternPart) (
 		if len(relationship.Types) != 1 {
 			return nil, fmt.Errorf("CREATE relationships require exactly one type")
 		}
-		if relationship.Direction == cypher.Undirected {
+		if relationship.Direction == cypher.Undirected || relationship.Direction == cypher.Bidirectional {
 			return nil, fmt.Errorf("CREATE relationships must have a direction")
 		}
 		if relationship.Variable.Name != "" {

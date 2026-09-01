@@ -19,12 +19,12 @@
     },
     {
       "id": "expressions/pattern/Pattern2.feature::[1] Return a pattern comprehension",
-      "expected": "typed_unsupported",
+      "expected": "bound",
       "test": "internal/cypher:TestTCKCapabilityCases/pattern_comprehension"
     },
     {
       "id": "clauses/create/Create2.feature::[20] Fail when creating a relationship with two directions",
-      "expected": "typed_unsupported",
+      "expected": "bound",
       "test": "internal/cypher:TestTCKCapabilityCases/bidirectional_relationship"
     },
     {

@@ -219,6 +219,9 @@ func validateMutationPatterns(patterns []cypher.PatternPart, create bool) error 
 			if len(relationship.Types) != 1 {
 				return semanticSpanError(relationship.Span, "CREATE and MERGE relationships require exactly one type")
 			}
+			if relationship.Direction == cypher.Bidirectional {
+				return semanticSpanError(relationship.Span, "CREATE and MERGE relationships must have a direction")
+			}
 			if create && relationship.Direction == cypher.Undirected {
 				return semanticSpanError(relationship.Span, "CREATE relationships must have a direction")
 			}
@@ -537,6 +540,16 @@ func validateAggregateExpressionPart( //nolint:gocyclo
 			return err
 		}
 		return validateAggregateExpressionPart(source, expression.Projection, scope, insideAggregate, projection, inner)
+	case *cypher.PatternComprehension:
+		if projection && !insideAggregate {
+			return semanticError(expression, "expressions outside an aggregate must be projected as simple grouping keys")
+		}
+		inner := cloneNames(locals)
+		addPatternExpressionLocalNames(inner, expression)
+		if err := validateAggregateExpressionPart(source, expression.Where, scope, insideAggregate, projection, inner); err != nil {
+			return err
+		}
+		return validateAggregateExpressionPart(source, expression.Projection, scope, insideAggregate, projection, inner)
 	case *cypher.ListPredicate:
 		if err := validateAggregateExpressionPart(source, expression.List, scope, insideAggregate, projection, locals); err != nil {
 			return err
@@ -636,6 +649,10 @@ func visitExpression(expression cypher.Expression, visit func(cypher.Expression)
 		visitExpression(expression.List, visit)
 		visitExpression(expression.Where, visit)
 		visitExpression(expression.Projection, visit)
+	case *cypher.PatternComprehension:
+		visitPatternElementExpressions(expression.Pattern, visit)
+		visitExpression(expression.Where, visit)
+		visitExpression(expression.Projection, visit)
 	case *cypher.ListPredicate:
 		visitExpression(expression.List, visit)
 		visitExpression(expression.Where, visit)
@@ -643,6 +660,19 @@ func visitExpression(expression cypher.Expression, visit func(cypher.Expression)
 		visitExpression(expression.Initial, visit)
 		visitExpression(expression.List, visit)
 		visitExpression(expression.Expression, visit)
+	}
+}
+
+func visitPatternElementExpressions(element cypher.PatternElement, visit func(cypher.Expression) bool) {
+	for _, node := range element.Nodes {
+		visitExpression(node.Properties, visit)
+	}
+	for _, relationship := range element.Relationships {
+		visitExpression(relationship.Properties, visit)
+		if relationship.Length != nil {
+			visitExpression(relationship.Length.Lower, visit)
+			visitExpression(relationship.Length.Upper, visit)
+		}
 	}
 }
 
@@ -777,7 +807,7 @@ func validateNonAggregateExpression(source string, expression cypher.Expression,
 	if err := validateExpression(source, expression, scope); err != nil {
 		return err
 	}
-	allowPattern := context == "MATCH WHERE" || context == "WITH WHERE" || context == "YIELD WHERE"
+	allowPattern := context == "MATCH WHERE" || context == "WITH WHERE" || context == "YIELD WHERE" || context == "pattern comprehension WHERE"
 	if err := validatePatternPlacement(expression, allowPattern); err != nil {
 		return err
 	}
@@ -847,6 +877,9 @@ func validateExpression(source string, expression cypher.Expression, scope varia
 		}
 	case *cypher.FunctionInvocation:
 		name := strings.ToLower(expression.Name.String())
+		if !cypher.IsSupportedFunction(name) {
+			return semanticError(expression, "unknown function %s", expression.Name.String())
+		}
 		for _, argument := range expression.Arguments {
 			if pattern, ok := argument.(*cypher.PatternExpression); ok && (name == "shortestpath" || name == "allshortestpaths") {
 				inner := cloneScope(scope)
@@ -900,6 +933,25 @@ func validateExpression(source string, expression cypher.Expression, scope varia
 			return err
 		}
 		return validateExpression(source, expression.Projection, inner)
+	case *cypher.PatternComprehension:
+		if len(expression.Pattern.Relationships) == 0 {
+			return semanticError(expression, "pattern comprehension must contain at least one relationship")
+		}
+		part := cypher.PatternPart{Variable: expression.Variable, Element: expression.Pattern}
+		if err := validateRelationshipUniqueness([]cypher.PatternPart{part}); err != nil {
+			return err
+		}
+		inner := cloneScope(scope)
+		if err := bindPatternVariables(inner, []cypher.PatternPart{part}); err != nil {
+			return err
+		}
+		if err := validatePatterns(source, []cypher.PatternPart{part}, inner, false); err != nil {
+			return err
+		}
+		if err := validateNonAggregateExpression(source, expression.Where, inner, "pattern comprehension WHERE"); err != nil {
+			return err
+		}
+		return validateNonAggregateExpression(source, expression.Projection, inner, "pattern comprehension projection")
 	case *cypher.ListPredicate:
 		if err := validateExpression(source, expression.List, scope); err != nil {
 			return err
@@ -927,6 +979,9 @@ func validateExpression(source string, expression cypher.Expression, scope varia
 		}
 		return validatePatterns(source, []cypher.PatternPart{{Element: expression.Pattern}}, scope, false)
 	case *cypher.ExistsSubquery:
+		if statementMutates(expression.Subquery) {
+			return semanticError(expression, "EXISTS subquery cannot contain updating clauses")
+		}
 		outer := cloneScope(scope)
 		_, _, err := validateQuerySemantics(source, expression.Subquery, func([]cypher.Clause) variableScope {
 			return cloneScope(outer)
@@ -1169,6 +1224,11 @@ func validatePatternPlacement(expression cypher.Expression, allowed bool) error 
 				return err
 			}
 		}
+	case *cypher.PatternComprehension:
+		if err := validatePatternPlacement(expression.Where, true); err != nil {
+			return err
+		}
+		return validatePatternPlacement(expression.Projection, false)
 	case *cypher.ListPredicate:
 		if err := validatePatternPlacement(expression.List, allowed); err != nil {
 			return err
@@ -1259,6 +1319,12 @@ func validateAggregateShape(expression cypher.Expression, insideAggregate bool) 
 		for _, inner := range []cypher.Expression{expression.Where, expression.Projection} {
 			if containsAggregate(inner) {
 				return semanticError(inner, "aggregate functions are not allowed inside a list comprehension")
+			}
+		}
+	case *cypher.PatternComprehension:
+		for _, inner := range []cypher.Expression{expression.Where, expression.Projection} {
+			if containsAggregate(inner) {
+				return semanticError(inner, "aggregate functions are not allowed inside a pattern comprehension")
 			}
 		}
 	case *cypher.ListPredicate:
@@ -1396,7 +1462,7 @@ func expressionKind(expression cypher.Expression, scope variableScope) variableK
 		return variableBoolean
 	case *cypher.PropertyExpression, *cypher.IndexExpression, *cypher.Parameter:
 		return variableUnknown
-	case *cypher.SliceExpression, *cypher.ListLiteral, *cypher.ListComprehension:
+	case *cypher.SliceExpression, *cypher.ListLiteral, *cypher.ListComprehension, *cypher.PatternComprehension:
 		return variableList
 	case *cypher.MapLiteral:
 		return variableMap
@@ -1469,6 +1535,13 @@ func listElementKind(expression cypher.Expression, scope variableScope) variable
 			return expressionKind(expression.Projection, inner)
 		}
 		return listElementKind(expression.List, scope)
+	case *cypher.PatternComprehension:
+		inner := cloneScope(scope)
+		part := cypher.PatternPart{Variable: expression.Variable, Element: expression.Pattern}
+		if err := bindPatternVariables(inner, []cypher.PatternPart{part}); err != nil {
+			return variableUnknown
+		}
+		return expressionKind(expression.Projection, inner)
 	}
 	return variableUnknown
 }
@@ -1508,6 +1581,22 @@ func addPatternElementVariables(scope variableScope, element cypher.PatternEleme
 			} else {
 				scope[relationship.Variable.Name] = variableRelationship
 			}
+		}
+	}
+}
+
+func addPatternExpressionLocalNames(names map[string]struct{}, expression *cypher.PatternComprehension) {
+	if expression.Variable.Name != "" {
+		names[expression.Variable.Name] = struct{}{}
+	}
+	for _, node := range expression.Pattern.Nodes {
+		if node.Variable.Name != "" {
+			names[node.Variable.Name] = struct{}{}
+		}
+	}
+	for _, relationship := range expression.Pattern.Relationships {
+		if relationship.Variable.Name != "" {
+			names[relationship.Variable.Name] = struct{}{}
 		}
 	}
 }

@@ -74,6 +74,7 @@ func executeQuery(
 	execution.evaluator.rows = &rowBudget{limit: defaultQueryRows}
 	execution.evaluator.graph = graph
 	execution.evaluator.pattern = execution.evaluatePattern
+	execution.evaluator.patternRows = execution.evaluatePatternRows
 	execution.evaluator.subquery = execution.evaluateExistsSubquery
 	execution.evaluator.shortest = execution.evaluateShortestPattern
 	primary, err := execution.clauses(query.Clauses, []row{{}})
@@ -653,6 +654,8 @@ func containsAggregate(expression cypher.Expression) bool {
 		return containsAggregate(expression.List) ||
 			containsAggregate(expression.Where) ||
 			containsAggregate(expression.Projection)
+	case *cypher.PatternComprehension:
+		return containsAggregate(expression.Where) || containsAggregate(expression.Projection)
 	case *cypher.ListPredicate:
 		return containsAggregate(expression.List) || containsAggregate(expression.Where)
 	case *cypher.ReduceExpression:
