@@ -306,6 +306,10 @@ func TestTemporalIndexedEqualityAcrossProcess(t *testing.T) {
 	database := openTestStore(t, path)
 	defer func() { _ = database.Close() }()
 	date, _ := temporal.ParseDate("2026-08-31")
+	historical, err := temporal.ParseDateTime("1818-07-21T21:40:32.142[Europe/Stockholm]")
+	if err != nil || historical.OffsetSeconds() != 72*60+12 {
+		t.Fatalf("historical temporal = %s, %v", historical, err)
+	}
 	view, err := database.View(context.Background(), domain.Snapshot{})
 	if err != nil {
 		t.Fatal(err)
@@ -313,6 +317,25 @@ func TestTemporalIndexedEqualityAcrossProcess(t *testing.T) {
 	nodes, _, err := view.ScanNodes(context.Background(), NodePredicate{Properties: domain.Properties{"date": date}}, domain.Page{})
 	if err != nil || len(nodes) != 1 {
 		t.Fatalf("cross-process temporal lookup = %#v, %v", nodes, err)
+	}
+	nodes, _, err = view.ScanNodes(context.Background(), NodePredicate{Properties: domain.Properties{"historical": historical}}, domain.Page{})
+	if err != nil || len(nodes) != 1 {
+		t.Fatalf("cross-process historical temporal lookup = %#v, %v", nodes, err)
+	}
+	stored, ok := nodes[0].Properties["historical"].(temporal.DateTime)
+	if !ok || !stored.Equal(historical) {
+		t.Fatalf("cross-process historical temporal = %#v (%T)", nodes[0].Properties["historical"], nodes[0].Properties["historical"])
+	}
+	raw := openRawSQLite(t, path)
+	defer func() { _ = raw.Close() }()
+	var kind string
+	var key []byte
+	if err := raw.QueryRow("SELECT kind, value FROM node_property_index WHERE key='historical'").Scan(&kind, &key); err != nil {
+		t.Fatal(err)
+	}
+	const historicalIndexKey = `{"k":"zoned_datetime","s":"Af////7jIsHkCHa/gAEAABDsABBFdXJvcGUvU3RvY2tob2xt"}`
+	if kind != "zoned_datetime" || string(key) != historicalIndexKey {
+		t.Fatalf("cross-process historical index key = %q/%s", kind, key)
 	}
 }
 
@@ -327,8 +350,13 @@ func TestTemporalWriterHelper(t *testing.T) {
 		os.Exit(2)
 	}
 	date, _ := temporal.ParseDate("2026-08-31")
+	historical, err := temporal.ParseDateTime("1818-07-21T21:40:32.142[Europe/Stockholm]")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(3)
+	}
 	_, err = database.Write(context.Background(), RevisionMeta{}, func(tx *WriteTx) error {
-		_, err := tx.CreateNode(NodeInput{Properties: domain.Properties{"date": date}})
+		_, err := tx.CreateNode(NodeInput{Properties: domain.Properties{"date": date, "historical": historical}})
 		return err
 	})
 	if err != nil {

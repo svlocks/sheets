@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	_ "time/tzdata"
 	"unicode/utf8"
 )
 
@@ -244,17 +243,14 @@ type ZoneDatabase interface {
 	LoadLocation(name string) (*time.Location, error)
 }
 
-// GoZoneDatabase uses time.LoadLocation. The package-level time/tzdata import
-// guarantees a database fallback tied to the pinned Go toolchain.
+// GoZoneDatabase is retained for source compatibility. It resolves from the
+// same deterministic archive as PinnedZoneDatabase and does not consult the
+// host timezone database.
 type GoZoneDatabase struct{}
 
 // LoadLocation implements ZoneDatabase.
 func (GoZoneDatabase) LoadLocation(name string) (*time.Location, error) {
-	location, err := time.LoadLocation(name)
-	if err != nil {
-		return nil, fmt.Errorf("%w: load timezone %q: %v", ErrInvalid, name, err)
-	}
-	return location, nil
+	return (PinnedZoneDatabase{}).LoadLocation(name)
 }
 
 // DateTime is an absolute nanosecond-precision instant plus its exact timezone
@@ -268,7 +264,7 @@ type DateTime struct {
 // NewDateTime constructs a DateTime from local fields and either Z/a numeric
 // offset or an IANA zone name.
 func NewDateTime(local LocalDateTime, timezone string) (DateTime, error) {
-	return NewDateTimeWithDatabase(local, timezone, GoZoneDatabase{})
+	return NewDateTimeWithDatabase(local, timezone, PinnedZoneDatabase{})
 }
 
 // NewDateTimeWithDatabase is NewDateTime with an explicit timezone provider.
@@ -283,7 +279,7 @@ func NewDateTimeWithDatabase(local LocalDateTime, timezone string, database Zone
 // explicitly supplied offset. This disambiguates overlaps and rejects an
 // offset that does not match the zone rules at the requested local instant.
 func NewDateTimeWithNamedOffset(local LocalDateTime, name string, offsetSeconds int) (DateTime, error) {
-	return NewDateTimeWithNamedOffsetAndDatabase(local, name, offsetSeconds, GoZoneDatabase{})
+	return NewDateTimeWithNamedOffsetAndDatabase(local, name, offsetSeconds, PinnedZoneDatabase{})
 }
 
 // NewDateTimeWithNamedOffsetAndDatabase is the provider-injected variant.
@@ -445,7 +441,7 @@ func restoreDateTime(epochSecond, nanosecond int64, zone Zone) (DateTime, error)
 // DateTimeFromEpoch constructs an epoch-relative DateTime. Numeric epochs
 // default to UTC when timezone is empty.
 func DateTimeFromEpoch(epochSecond, nanosecond int64, timezone string) (DateTime, error) {
-	return DateTimeFromEpochWithDatabase(epochSecond, nanosecond, timezone, GoZoneDatabase{})
+	return DateTimeFromEpochWithDatabase(epochSecond, nanosecond, timezone, PinnedZoneDatabase{})
 }
 
 // DateTimeFromEpochWithDatabase is the provider-injected variant.
@@ -626,7 +622,7 @@ func (d DateTime) Microsecond() int { return d.LocalTime().Microsecond() }
 // adds the elapsed-seconds group on the instant timeline. Named-zone results
 // are resolved with the current ZoneDatabase rules.
 func (d DateTime) Add(duration Duration) (DateTime, error) {
-	return d.AddWithDatabase(duration, GoZoneDatabase{})
+	return d.AddWithDatabase(duration, PinnedZoneDatabase{})
 }
 
 // AddWithDatabase is the provider-injected variant of Add.

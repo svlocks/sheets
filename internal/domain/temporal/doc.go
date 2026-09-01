@@ -2,11 +2,9 @@
 // openCypher M23 date/time proposal.  The values are immutable, comparable Go
 // structs and deliberately do not use time.Local.
 //
-// Named-zone construction uses Go's IANA timezone loader.  The time/tzdata
-// import makes the timezone database shipped with the pinned Go toolchain
-// available on systems without a zoneinfo installation.  A resolved offset is
-// retained in every DateTime value, so decoding, equality, indexing, accessors,
-// and formatting do not change when the host timezone database changes.  New
-// named-zone construction and calendar arithmetic use the rules available to
-// the running binary and can therefore reflect a newer timezone database.
+// Default named-zone construction uses a complete, checksum-pinned IANA archive
+// from the Go distribution identified by PinnedTZDBVersion. It never consults
+// ZONEINFO or host files. A resolved offset is retained in every DateTime value,
+// so decoding, equality, indexing, accessors, and formatting also remain stable.
+// Applications may inject a different ZoneDatabase explicitly where required.
 package temporal

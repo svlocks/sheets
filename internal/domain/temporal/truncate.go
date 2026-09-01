@@ -87,7 +87,7 @@ func (d LocalDateTime) Truncate(unit string) (LocalDateTime, error) {
 // Truncate truncates local fields and resolves the resulting instant in the
 // same timezone representation.
 func (d DateTime) Truncate(unit string) (DateTime, error) {
-	return d.TruncateWithDatabase(unit, GoZoneDatabase{})
+	return d.TruncateWithDatabase(unit, PinnedZoneDatabase{})
 }
 
 // TruncateWithDatabase is the provider-injected variant of Truncate.

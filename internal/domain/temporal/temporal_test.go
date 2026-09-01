@@ -277,7 +277,7 @@ func TestDateTimeNamedZonesDSTAndNegativeEpoch(t *testing.T) {
 		"2015-07-21T21:40:32.142+0100":                    "2015-07-21T21:40:32.142+01:00",
 		"2015-W30-2T214032.142Z":                          "2015-07-21T21:40:32.142Z",
 		"2015-07-21T21:40:32.142[Europe/London]":          "2015-07-21T21:40:32.142+01:00[Europe/London]",
-		"1818-07-21T21:40:32.142[Europe/Stockholm]":       "1818-07-21T21:40:32.142+00:53:28[Europe/Stockholm]",
+		"1818-07-21T21:40:32.142[Europe/Stockholm]":       "1818-07-21T21:40:32.142+01:12:12[Europe/Stockholm]",
 		"2015-07-21T21:40:32.142+02:00[Europe/Stockholm]": "2015-07-21T21:40:32.142+02:00[Europe/Stockholm]",
 	}
 	for input, expected := range tests {
