@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 
@@ -177,5 +178,41 @@ func TestRenderPropagatesWriterErrors(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "writer failed") {
 			t.Errorf("Render(%s) error = %v; want writer failure", format, err)
 		}
+	}
+}
+
+func TestMachineFormatsUseStableEmptyArraysAndTaggedNonFiniteFloats(t *testing.T) {
+	batch := app.BatchResult{Results: []app.Result{{Rows: [][]any{{
+		math.NaN(), math.Inf(1), math.Inf(-1), map[string]any{"nested": math.NaN()},
+	}}}}}
+	var output bytes.Buffer
+	if err := Render(&output, "json", batch); err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{
+		`"columns": []`,
+		`"$float": "NaN"`,
+		`"$float": "+Infinity"`,
+		`"$float": "-Infinity"`,
+	} {
+		if !strings.Contains(output.String(), fragment) {
+			t.Fatalf("JSON output %q lacks %q", output.String(), fragment)
+		}
+	}
+
+	output.Reset()
+	if err := Render(&output, "json", app.BatchResult{Results: []app.Result{{}}}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"columns": []`) || !strings.Contains(output.String(), `"rows": []`) {
+		t.Fatalf("empty JSON shape = %s", output.String())
+	}
+
+	output.Reset()
+	if err := Render(&output, "jsonl", batch); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"$float":"NaN"`) {
+		t.Fatalf("JSONL output = %s", output.String())
 	}
 }

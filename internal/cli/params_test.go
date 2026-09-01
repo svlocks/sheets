@@ -70,3 +70,18 @@ func TestParameterInputRejectsTrailingJSON(t *testing.T) {
 		t.Fatal("trailing JSON was accepted")
 	}
 }
+
+func TestParameterInputPreservesIntegerPrecisionAndRejectsOverflow(t *testing.T) {
+	params, err := (parameterInput{Values: []string{"exact=9007199254740993"}}).load(strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := params["exact"]; got != int64(9007199254740993) {
+		t.Fatalf("exact integer = %#v (%T)", got, got)
+	}
+	for _, value := range []string{"too_big=9223372036854775808", "too_small=-9223372036854775809"} {
+		if _, err := (parameterInput{Values: []string{value}}).load(strings.NewReader("")); err == nil || !strings.Contains(err.Error(), "signed 64-bit") {
+			t.Fatalf("overflow %q error = %v", value, err)
+		}
+	}
+}

@@ -291,18 +291,26 @@ func (e *commandEnvironment) statusCommand() *cobra.Command {
 		Short: "Show project and current graph statistics",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) (runErr error) {
-			found, database, executor, err := e.open(command.Context())
+			found, database, _, err := e.open(command.Context())
 			if err != nil {
 				return err
 			}
 			defer func() { runErr = errors.Join(runErr, database.Close()) }()
-			snapshot, err := executor.Snapshot(command.Context(), domain.Snapshot{})
+			view, err := database.View(command.Context(), domain.Snapshot{})
+			if err != nil {
+				return err
+			}
+			nodes, err := view.CountNodes(command.Context(), store.NodePredicate{})
+			if err != nil {
+				return err
+			}
+			edges, err := view.CountEdges(command.Context(), store.EdgePredicate{})
 			if err != nil {
 				return err
 			}
 			batch := app.BatchResult{Results: []app.Result{{
 				Columns: []string{"root", "revision", "nodes", "relationships"},
-				Rows:    [][]any{{found.Root, snapshot.Revision, len(snapshot.Nodes), len(snapshot.Edges)}},
+				Rows:    [][]any{{found.Root, view.Revision(), nodes, edges}},
 			}}}
 			parsed, err := ParseFormat(format)
 			if err != nil {

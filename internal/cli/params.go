@@ -125,12 +125,17 @@ func normalizeMap(input map[string]any) (map[string]any, error) {
 func normalizeJSONValue(value any) (any, error) {
 	switch value := value.(type) {
 	case json.Number:
-		if integer, err := strconv.ParseInt(value.String(), 10, 64); err == nil {
+		raw := value.String()
+		if !strings.ContainsAny(raw, ".eE") {
+			integer, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("integer %q is outside Cypher's signed 64-bit range", raw)
+			}
 			return integer, nil
 		}
-		decimal, err := strconv.ParseFloat(value.String(), 64)
+		decimal, err := strconv.ParseFloat(raw, 64)
 		if err != nil {
-			return nil, fmt.Errorf("invalid number %q", value)
+			return nil, fmt.Errorf("invalid number %q", raw)
 		}
 		return decimal, nil
 	case []any:

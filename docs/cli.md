@@ -49,6 +49,11 @@ sheets query \
   'MATCH (n {status: $status}) RETURN n LIMIT $limit'
 ```
 
+JSON integers must fit Cypher's signed 64-bit range. Values outside it are
+rejected instead of being rounded through `float64`. A query argument and
+`--file` are mutually exclusive, and query text plus parameters cannot both
+claim stdin.
+
 For a larger request, keep both surfaces out of shell quoting:
 
 ```sh
@@ -65,10 +70,18 @@ a write transaction.
 - `table` is deterministic, escapes control characters, and includes mutation
   counters and the committed revision.
 - `json` is one `{"results":[...],"revision":N}` envelope. Each result has
-  ordered `columns` and positional `rows`, so duplicate or unusual Cypher
-  column names remain representable.
+  ordered `columns` and positional `rows`; both are present as arrays even when
+  empty.
 - `jsonl` emits independently consumable `row`, `result`, `summary`, `page`,
-  and `revision` records with zero-based statement indexes.
+  and `revision` records with zero-based statement indexes. Records are written
+  incrementally, although the current executor materializes each query result
+  before rendering it.
+
+IEEE results which JSON cannot represent use tagged objects:
+`{"$float":"NaN"}`, `{"$float":"+Infinity"}`, or
+`{"$float":"-Infinity"}`. Normal finite numbers remain JSON numbers. Machine
+formats never use terminal styling; data goes to stdout and diagnostics go to
+stderr. An early-closing pipe is a successful exit with no diagnostic.
 
 ## History and status
 
@@ -79,7 +92,8 @@ sheets status  [--output FORMAT]
 
 History is ordered from oldest to newest and uses opaque keyset cursors. Status
 reports the discovered root, current revision, node count, and relationship
-count.
+count without materializing the graph. The same timeline is available through
+`CALL sheets.revisions(limit, afterCursor)` for graph-language-only clients.
 
 ## TUI, help, and completions
 

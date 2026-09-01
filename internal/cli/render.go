@@ -14,6 +14,7 @@ import (
 
 	"github.com/svlocks/sheets/internal/app"
 	"github.com/svlocks/sheets/internal/domain"
+	"github.com/svlocks/sheets/internal/engine"
 )
 
 // Format is a supported command output format.
@@ -61,19 +62,18 @@ func Render(w io.Writer, format string, batch app.BatchResult) error {
 		return err
 	}
 
-	var output bytes.Buffer
 	switch parsed {
 	case FormatTable:
+		var output bytes.Buffer
 		err = renderTable(&output, batch)
+		if err == nil {
+			_, err = io.Copy(w, &output)
+		}
 	case FormatJSON:
-		err = renderJSON(&output, batch)
+		err = renderJSON(w, batch)
 	case FormatJSONL:
-		err = renderJSONL(&output, batch)
+		err = renderJSONL(w, batch)
 	}
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(w, &output)
 	if err != nil {
 		return fmt.Errorf("write %s output: %w", parsed, err)
 	}
@@ -81,9 +81,48 @@ func Render(w io.Writer, format string, batch app.BatchResult) error {
 }
 
 func renderJSON(w io.Writer, batch app.BatchResult) error {
+	normalized := jsonBatch{
+		Results:  make([]jsonResult, len(batch.Results)),
+		Revision: batch.Revision,
+	}
+	for index, result := range batch.Results {
+		columns := result.Columns
+		if columns == nil {
+			columns = []string{}
+		}
+		rows := make([][]any, len(result.Rows))
+		for rowIndex, row := range result.Rows {
+			rows[rowIndex] = make([]any, len(row))
+			for columnIndex, value := range row {
+				rows[rowIndex][columnIndex] = jsonValue(value)
+			}
+		}
+		normalized.Results[index] = jsonResult{
+			Columns: columns,
+			Rows:    rows,
+			Summary: result.Summary,
+			Page:    result.Page,
+		}
+	}
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
-	return encoder.Encode(batch)
+	return encoder.Encode(normalized)
+}
+
+type jsonBatch struct {
+	Results  []jsonResult     `json:"results"`
+	Revision *domain.Revision `json:"revision,omitempty"`
+}
+
+type jsonResult struct {
+	Columns []string         `json:"columns"`
+	Rows    [][]any          `json:"rows"`
+	Summary app.Summary      `json:"summary"`
+	Page    *domain.PageInfo `json:"page,omitempty"`
+}
+
+type taggedFloat struct {
+	Float string `json:"$float"`
 }
 
 // JSONL records deliberately use a small envelope so a consumer can process
@@ -130,9 +169,9 @@ func renderJSONL(w io.Writer, batch app.BatchResult) error {
 			}
 		} else {
 			for _, row := range result.Rows {
-				values := row
-				if values == nil {
-					values = []any{}
+				values := make([]any, len(row))
+				for index, value := range row {
+					values[index] = jsonValue(value)
 				}
 				if err := writeJSONLine(w, jsonlRow{
 					Type: "row", Statement: statement, Columns: columns, Values: values,
@@ -158,6 +197,61 @@ func renderJSONL(w io.Writer, batch app.BatchResult) error {
 		}
 	}
 	return nil
+}
+
+// JSON has no representation for IEEE NaN or infinities. Cypher arithmetic
+// can produce them, so machine formats use an explicit, unambiguous tagged
+// object instead of failing after the query has already run.
+func jsonValue(value any) any {
+	switch value := value.(type) {
+	case float64:
+		switch {
+		case math.IsNaN(value):
+			return taggedFloat{Float: "NaN"}
+		case math.IsInf(value, 1):
+			return taggedFloat{Float: "+Infinity"}
+		case math.IsInf(value, -1):
+			return taggedFloat{Float: "-Infinity"}
+		default:
+			return value
+		}
+	case float32:
+		return jsonValue(float64(value))
+	case []any:
+		result := make([]any, len(value))
+		for index, item := range value {
+			result[index] = jsonValue(item)
+		}
+		return result
+	case map[string]any:
+		result := make(map[string]any, len(value))
+		for key, item := range value {
+			result[key] = jsonValue(item)
+		}
+		return result
+	case domain.Properties:
+		result := make(map[string]any, len(value))
+		for key, item := range value {
+			result[key] = jsonValue(item)
+		}
+		return result
+	case domain.Node:
+		value.Properties = jsonValue(value.Properties).(map[string]any)
+		return value
+	case domain.Edge:
+		value.Properties = jsonValue(value.Properties).(map[string]any)
+		return value
+	case engine.PathValue:
+		for index := range value.Nodes {
+			value.Nodes[index] = jsonValue(value.Nodes[index]).(domain.Node)
+		}
+		for index := range value.Relationships {
+			value.Relationships[index] = jsonValue(value.Relationships[index]).(domain.Edge)
+		}
+		return value
+	default:
+		return value
+	}
 }
 
 func writeJSONLine(w io.Writer, record any) error {
